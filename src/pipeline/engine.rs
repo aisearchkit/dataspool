@@ -276,9 +276,9 @@ impl Pipeline {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pipeline::WriteResult;
     use crate::pipeline::record::Record;
     use crate::pipeline::traits::FilterTransform;
-    use crate::pipeline::WriteResult;
     use async_trait::async_trait;
     use serde_json::json;
 

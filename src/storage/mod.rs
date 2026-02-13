@@ -21,5 +21,5 @@
 pub mod kv;
 pub mod rocksdb;
 
-pub use kv::{cf, ColumnFamily, KvStore, WriteBatch};
+pub use kv::{ColumnFamily, KvStore, WriteBatch, cf};
 pub use rocksdb::RocksDbStore;

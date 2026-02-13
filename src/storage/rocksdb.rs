@@ -18,11 +18,11 @@
 
 //! RocksDB storage implementation
 
-use super::kv::{cf, ColumnFamily, KvStore, WriteBatch};
+use super::kv::{ColumnFamily, KvStore, WriteBatch, cf};
 use crate::error::{Result, StorageError};
 use async_trait::async_trait;
 use bytes::Bytes;
-use rocksdb::{ColumnFamilyDescriptor, Options, DB};
+use rocksdb::{ColumnFamilyDescriptor, DB, Options};
 use std::path::Path;
 use std::sync::Arc;
 use tokio::task;

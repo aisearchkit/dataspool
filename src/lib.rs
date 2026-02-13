@@ -26,6 +26,7 @@ pub mod config;
 pub mod error;
 pub mod pipeline;
 pub mod storage;
+pub mod task;
 pub mod types;
 
 pub use config::DatspoolConfig;
@@ -33,5 +34,6 @@ pub use error::{ConfigError, DatspoolError, DriverError, RaftError, Result, Stor
 pub use pipeline::{
     Pipeline, PipelineConfig, PipelineStats, Record, RecordBatch, Sink, Source, Transform,
 };
-pub use storage::{cf, ColumnFamily, KvStore, RocksDbStore, WriteBatch};
+pub use storage::{ColumnFamily, KvStore, RocksDbStore, WriteBatch, cf};
+pub use task::{ShardGenerator, ShardMeta, ShardingStrategy, TaskMeta, TaskPriority, TaskStore};
 pub use types::{NodeId, NodeRole, NodeStatus, ShardId, ShardState, TaskId, TaskState, TaskStats};

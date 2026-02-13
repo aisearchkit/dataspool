@@ -1,11 +1,11 @@
 [package]
 name = "dataspool"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 license = "AGPL-3.0-or-later"
 authors = ["Dataspool Contributors"]
 description = "Hybrid-mode data migration and orchestration platform"
-repository = "https://github.com/yourusername/Dataspool"
+repository = "https://github.com/aisearchkit/dataspool"
 keywords = ["data-migration", "elasticsearch", "raft", "distributed-systems"]
 categories = ["database", "command-line-utilities"]
 

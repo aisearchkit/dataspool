@@ -30,7 +30,7 @@ use serde::{Deserialize, Serialize};
 /// - MySQL: primary key value or binlog position
 /// - Files: byte offset
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "type", content = "value", rename_all = "snake_case")]
 pub enum OffsetValue {
     /// Document count (for ES Scroll API)
     DocumentCount(u64),
