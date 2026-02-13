@@ -21,10 +21,10 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use aws_sdk_s3::Client as S3Client;
 use aws_sdk_s3::primitives::ByteStream;
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::arrow::ArrowWriter;
-use parquet::file::properties::WriterProperties;
+use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::basic::Compression;
+use parquet::file::properties::WriterProperties;
 
 use crate::error::{DatspoolError, Result};
 
@@ -97,43 +97,49 @@ impl S3Store {
         match response {
             Ok(output) => {
                 // Write to temporary file
-                let temp_file = tempfile::NamedTempFile::new()
-                    .map_err(|e| DatspoolError::Storage(
-                        crate::error::StorageError::ReadFailed(e.to_string())
-                    ))?;
+                let temp_file = tempfile::NamedTempFile::new().map_err(|e| {
+                    DatspoolError::Storage(crate::error::StorageError::ReadFailed(e.to_string()))
+                })?;
 
-                let body = output.body.collect().await
-                    .map_err(|e| DatspoolError::Storage(
-                        crate::error::StorageError::ReadFailed(e.to_string())
-                    ))?;
+                let body = output.body.collect().await.map_err(|e| {
+                    DatspoolError::Storage(crate::error::StorageError::ReadFailed(e.to_string()))
+                })?;
 
-                std::fs::write(temp_file.path(), body.into_bytes())
-                    .map_err(|e| DatspoolError::Storage(
-                        crate::error::StorageError::ReadFailed(e.to_string())
-                    ))?;
+                std::fs::write(temp_file.path(), body.into_bytes()).map_err(|e| {
+                    DatspoolError::Storage(crate::error::StorageError::ReadFailed(e.to_string()))
+                })?;
 
                 // Parse Parquet
-                let file = std::fs::File::open(temp_file.path())
-                    .map_err(|e| DatspoolError::Storage(
-                        crate::error::StorageError::ReadFailed(e.to_string())
-                    ))?;
+                let file = std::fs::File::open(temp_file.path()).map_err(|e| {
+                    DatspoolError::Storage(crate::error::StorageError::ReadFailed(e.to_string()))
+                })?;
 
                 let reader = ParquetRecordBatchReaderBuilder::try_new(file)
-                    .map_err(|e| DatspoolError::Storage(
-                        crate::error::StorageError::ReadFailed(e.to_string())
-                    ))?
+                    .map_err(|e| {
+                        DatspoolError::Storage(crate::error::StorageError::ReadFailed(
+                            e.to_string(),
+                        ))
+                    })?
                     .build()
-                    .map_err(|e| DatspoolError::Storage(
-                        crate::error::StorageError::ReadFailed(e.to_string())
-                    ))?;
+                    .map_err(|e| {
+                        DatspoolError::Storage(crate::error::StorageError::ReadFailed(
+                            e.to_string(),
+                        ))
+                    })?;
 
                 let mut doc_ids = Vec::new();
                 for batch in reader {
-                    let batch = batch.map_err(|e| DatspoolError::Storage(
-                        crate::error::StorageError::ReadFailed(e.to_string())
-                    ))?;
+                    let batch = batch.map_err(|e| {
+                        DatspoolError::Storage(crate::error::StorageError::ReadFailed(
+                            e.to_string(),
+                        ))
+                    })?;
 
-                    let col = batch.column(0).as_any().downcast_ref::<StringArray>().unwrap();
+                    let col = batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .unwrap();
                     for i in 0..col.len() {
                         if !col.is_null(i) {
                             doc_ids.push(col.value(i).to_string());
@@ -149,7 +155,7 @@ impl S3Store {
                 Ok(None)
             }
             Err(e) => Err(DatspoolError::Storage(
-                crate::error::StorageError::ReadFailed(format!("S3 error: {}", e))
+                crate::error::StorageError::ReadFailed(format!("S3 error: {}", e)),
             )),
         }
     }
@@ -157,46 +163,41 @@ impl S3Store {
     /// Upload document IDs to S3 as Parquet
     pub async fn put(&self, task_id: String, chunk_id: u32, doc_ids: Vec<String>) -> Result<()> {
         // Build Parquet file in memory
-        let temp_file = tempfile::NamedTempFile::new()
-            .map_err(|e| DatspoolError::Storage(
-                crate::error::StorageError::WriteFailed(e.to_string())
-            ))?;
+        let temp_file = tempfile::NamedTempFile::new().map_err(|e| {
+            DatspoolError::Storage(crate::error::StorageError::WriteFailed(e.to_string()))
+        })?;
 
         let schema = Schema::new(vec![Field::new("doc_id", DataType::Utf8, false)]);
         let doc_id_array = StringArray::from(doc_ids.clone());
-        let batch = RecordBatch::try_new(
-            Arc::new(schema.clone()),
-            vec![Arc::new(doc_id_array)],
-        ).map_err(|e| DatspoolError::Storage(
-            crate::error::StorageError::WriteFailed(e.to_string())
-        ))?;
+        let batch = RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(doc_id_array)])
+            .map_err(|e| {
+                DatspoolError::Storage(crate::error::StorageError::WriteFailed(e.to_string()))
+            })?;
 
-        let file = std::fs::File::create(temp_file.path())
-            .map_err(|e| DatspoolError::Storage(
-                crate::error::StorageError::WriteFailed(e.to_string())
-            ))?;
+        let file = std::fs::File::create(temp_file.path()).map_err(|e| {
+            DatspoolError::Storage(crate::error::StorageError::WriteFailed(e.to_string()))
+        })?;
 
         let props = WriterProperties::builder()
             .set_compression(Compression::SNAPPY)
             .build();
 
-        let mut writer = ArrowWriter::try_new(file, Arc::new(schema), Some(props))
-            .map_err(|e| DatspoolError::Storage(
-                crate::error::StorageError::WriteFailed(e.to_string())
-            ))?;
+        let mut writer =
+            ArrowWriter::try_new(file, Arc::new(schema), Some(props)).map_err(|e| {
+                DatspoolError::Storage(crate::error::StorageError::WriteFailed(e.to_string()))
+            })?;
 
-        writer.write(&batch)
-            .map_err(|e| DatspoolError::Storage(
-                crate::error::StorageError::WriteFailed(e.to_string())
-            ))?;
+        writer.write(&batch).map_err(|e| {
+            DatspoolError::Storage(crate::error::StorageError::WriteFailed(e.to_string()))
+        })?;
 
-        writer.close()
-            .map_err(|e| DatspoolError::Storage(
-                crate::error::StorageError::WriteFailed(e.to_string())
-            ))?;
+        writer.close().map_err(|e| {
+            DatspoolError::Storage(crate::error::StorageError::WriteFailed(e.to_string()))
+        })?;
 
         // Upload to S3
-        self.upload_file(temp_file.path(), &task_id, chunk_id).await?;
+        self.upload_file(temp_file.path(), &task_id, chunk_id)
+            .await?;
 
         Ok(())
     }
@@ -206,11 +207,9 @@ impl S3Store {
         let s3_key = self.s3_key(task_id, chunk_id);
         let client = self.client().await?;
 
-        let body = ByteStream::from_path(local_path)
-            .await
-            .map_err(|e| DatspoolError::Storage(
-                crate::error::StorageError::WriteFailed(e.to_string())
-            ))?;
+        let body = ByteStream::from_path(local_path).await.map_err(|e| {
+            DatspoolError::Storage(crate::error::StorageError::WriteFailed(e.to_string()))
+        })?;
 
         info!("Uploading to s3://{}/{}", self.bucket, s3_key);
 
@@ -222,11 +221,17 @@ impl S3Store {
             .content_type("application/octet-stream")
             .send()
             .await
-            .map_err(|e| DatspoolError::Storage(
-                crate::error::StorageError::WriteFailed(format!("S3 upload error: {}", e))
-            ))?;
+            .map_err(|e| {
+                DatspoolError::Storage(crate::error::StorageError::WriteFailed(format!(
+                    "S3 upload error: {}",
+                    e
+                )))
+            })?;
 
-        info!("Uploaded {} bytes to S3", std::fs::metadata(local_path).unwrap().len());
+        info!(
+            "Uploaded {} bytes to S3",
+            std::fs::metadata(local_path).unwrap().len()
+        );
         Ok(())
     }
 

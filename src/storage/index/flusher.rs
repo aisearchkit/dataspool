@@ -19,7 +19,7 @@ use tokio::sync::mpsc::Receiver;
 use tokio::time;
 use tracing::{debug, info, warn};
 
-use super::{IndexEntry, TieredIndexStore, TieredConfig};
+use super::{IndexEntry, TieredConfig, TieredIndexStore};
 use crate::error::Result;
 use crate::storage::KvStore;
 
@@ -45,8 +45,10 @@ impl<S: KvStore + 'static> Flusher<S> {
 
     /// Start background flush loop
     pub async fn run(mut self) -> Result<()> {
-        info!("Starting index flusher (batch_size={}, interval={}s)", 
-              self.config.flush_batch_size, self.config.flush_interval_secs);
+        info!(
+            "Starting index flusher (batch_size={}, interval={}s)",
+            self.config.flush_batch_size, self.config.flush_interval_secs
+        );
 
         let mut buffer: HashMap<String, Vec<String>> = HashMap::new();
         let mut total_count = 0usize;
@@ -122,16 +124,14 @@ impl<S: KvStore + 'static> Flusher<S> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::IndexQueue;
+    use super::*;
     use tempfile::tempdir;
 
     #[tokio::test]
     async fn test_flusher_batch() {
         let temp_dir = tempdir().unwrap();
-        let metadata_store = Arc::new(
-            crate::storage::RocksDbStore::open(temp_dir.path()).unwrap()
-        );
+        let metadata_store = Arc::new(crate::storage::RocksDbStore::open(temp_dir.path()).unwrap());
 
         let config = TieredConfig {
             flush_batch_size: 3,
@@ -140,23 +140,24 @@ mod tests {
         };
 
         let store = Arc::new(TieredIndexStore::new(config.clone(), metadata_store));
-        
+
         let mut queue = IndexQueue::new(10);
         let receiver = queue.take_receiver().unwrap();
-        
+
         let flusher = Flusher::new(config, store.clone(), receiver);
 
         // Spawn flusher
-        let handle = tokio::spawn(async move {
-            flusher.run().await
-        });
+        let handle = tokio::spawn(async move { flusher.run().await });
 
         // Send data
         for i in 0..5 {
-            queue.send(IndexEntry {
-                task_id: "task-1".to_string(),
-                doc_ids: vec![format!("doc-{}", i)],
-            }).await.unwrap();
+            queue
+                .send(IndexEntry {
+                    task_id: "task-1".to_string(),
+                    doc_ids: vec![format!("doc-{}", i)],
+                })
+                .await
+                .unwrap();
         }
 
         // Wait a bit for flush

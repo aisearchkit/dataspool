@@ -2,21 +2,21 @@
 
 //! Hybrid tiered index storage (Memory + SSD + S3)
 
-mod memory;
-mod ssd;
-mod s3;
-mod tiered;
-mod queue;
 mod eviction;
 mod flusher;
+mod memory;
+mod queue;
+mod s3;
+mod ssd;
+mod tiered;
 
-pub use memory::MemoryCache;
-pub use ssd::SsdStore;
-pub use s3::S3Store;
-pub use tiered::TieredIndexStore;
-pub use queue::{IndexQueue, IndexEntry};
-pub use eviction::{EvictionManager, FileMetadata, FileLocation};
+pub use eviction::{EvictionManager, FileLocation, FileMetadata};
 pub use flusher::Flusher;
+pub use memory::MemoryCache;
+pub use queue::{IndexEntry, IndexQueue};
+pub use s3::S3Store;
+pub use ssd::SsdStore;
+pub use tiered::TieredIndexStore;
 
 /// Configuration for tiered index storage
 #[derive(Debug, Clone)]

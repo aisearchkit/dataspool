@@ -2,9 +2,9 @@
 
 //! LRU eviction mechanism for L2 → L3 migration
 
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::time::SystemTime;
-use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 use crate::error::Result;
@@ -42,14 +42,14 @@ impl<S: KvStore> EvictionManager<S> {
         let key = Self::metadata_key(&meta.task_id, meta.chunk_id);
         let value = serde_json::to_string(meta)
             .map_err(|e| crate::error::DatspoolError::Internal(e.to_string()))?;
-        
+
         self.store.put(key.as_bytes(), value.as_bytes()).await?;
         Ok(())
     }
 
     pub async fn get_metadata(&self, task_id: &str, chunk_id: u32) -> Result<Option<FileMetadata>> {
         let key = Self::metadata_key(task_id, chunk_id);
-        
+
         match self.store.get(key.as_bytes()).await? {
             Some(bytes) => {
                 let meta: FileMetadata = serde_json::from_slice(&bytes)
@@ -74,20 +74,25 @@ impl<S: KvStore> EvictionManager<S> {
         Ok(candidates)
     }
 
-    pub async fn evict_to_l3(&self, task_id: &str, chunk_id: u32, s3_key: String) -> Result<Option<PathBuf>> {
+    pub async fn evict_to_l3(
+        &self,
+        task_id: &str,
+        chunk_id: u32,
+        s3_key: String,
+    ) -> Result<Option<PathBuf>> {
         if let Some(mut meta) = self.get_metadata(task_id, chunk_id).await? {
             let local_path = meta.local_path.clone();
-            
+
             meta.location = FileLocation::L3;
             meta.s3_key = Some(s3_key);
             meta.local_path = None;
-            
+
             self.put_metadata(&meta).await?;
-            
+
             info!("Evicted {}:{} to L3", task_id, chunk_id);
             return Ok(local_path);
         }
-        
+
         Ok(None)
     }
 

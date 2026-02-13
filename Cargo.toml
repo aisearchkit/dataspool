@@ -57,6 +57,12 @@ aws-config = "1.8.14"
 parquet = "57.3.0"
 arrow = "57.3.0"
 
+# HTTP client for search engine APIs (ES/OpenSearch compatible)
+reqwest = { version = "0.11", features = ["json", "rustls-tls"], default-features = false }
+url = "2.5"
+
+tempfile = "3.12"
+
 [dev-dependencies]
 tempfile = "3.12"
 
