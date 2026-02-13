@@ -1,23 +1,22 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-//
-// Dataspool - Hybrid-mode data migration and orchestration platform
-// Copyright (C) 2026 Dataspool Contributors
 
 //! Hybrid tiered index storage (Memory + SSD + S3)
 
 mod memory;
-mod queue;
-mod s3;
 mod ssd;
+mod s3;
 mod tiered;
+mod queue;
+mod eviction;
+mod flusher;
 
 pub use memory::MemoryCache;
-pub use queue::IndexQueue;
-pub use s3::S3Store;
 pub use ssd::SsdStore;
+pub use s3::S3Store;
 pub use tiered::TieredIndexStore;
-
-use crate::error::Result;
+pub use queue::{IndexQueue, IndexEntry};
+pub use eviction::{EvictionManager, FileMetadata, FileLocation};
+pub use flusher::Flusher;
 
 /// Configuration for tiered index storage
 #[derive(Debug, Clone)]
