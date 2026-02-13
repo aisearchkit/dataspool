@@ -16,6 +16,29 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-fn main() {
-    println!("Hello, world!");
+mod error;
+mod types;
+
+pub use error::{
+    ConfigError, DatspoolError, DriverError, RaftError, Result, StorageError,
+};
+pub use types::{
+    NodeId, NodeRole, NodeStatus, ShardId, ShardState, TaskId, TaskState, TaskStats,
+};
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    // Initialize tracing subscriber for structured logging
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .json()
+        .init();
+
+    tracing::info!("Starting Dataspool v{}", env!("CARGO_PKG_VERSION"));
+    tracing::info!("Hybrid-mode data migration and orchestration platform");
+
+    Ok(())
 }
