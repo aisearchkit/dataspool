@@ -103,9 +103,39 @@ Dataspool UI 是一个基于 **React 19** 和 **TanStack Query** 构建的现代
 ```bash
 # 使用 pnpm（推荐）
 pnpm install
+```
 
-# 或使用 npm
-npm install
+### 项目结构
 
-# 或使用 yarn
-yarn install
+```bash
+dataspool-ui/
+├── src/
+│   ├── components/          # React 组件
+│   │   ├── ui/             # Radix UI 原子组件
+│   │   ├── cluster/        # 集群相关组件
+│   │   ├── task/           # 任务相关组件
+│   │   └── layout/         # 布局组件
+│   ├── hooks/              # 自定义 Hooks
+│   │   ├── useCluster.ts   # 集群状态 Hook
+│   │   ├── useTaskStream.ts # 任务流 Hook
+│   │   └── useRealtimeLog.ts # 实时日志 Hook
+│   ├── lib/                # 工具库
+│   │   ├── api/           # API 客户端（gRPC-Web）
+│   │   ├── query/         # TanStack Query 配置
+│   │   └── utils/         # 通用工具函数
+│   ├── pages/              # 路由页面
+│   │   ├── Dashboard/     # 仪表盘
+│   │   ├── Tasks/         # 任务管理
+│   │   ├── Nodes/         # 节点管理
+│   │   └── Settings/      # 系统设置
+│   ├── types/              # TypeScript 类型定义
+│   ├── App.tsx             # 应用入口
+│   ├── main.tsx            # React 19 入口
+│   └── styles/             # 全局样式
+├── public/                 # 静态资源
+├── proto/                  # Protobuf 定义文件
+├── .env.example            # 环境变量模板
+├── vite.config.ts          # Vite 配置
+├── tsconfig.json           # TypeScript 配置
+└── package.json
+```

@@ -34,6 +34,9 @@ openraft = { version = "0.9", features = ["serde"] }
 # Storage
 rocksdb = "0.22"
 
+# eloqstore for index storage (migration indexes, large-scale data)
+eloqstore = { git = "https://github.com/eloqdata/eloqstore", branch = "main" }
+
 # Networking
 tonic = "0.12"
 tonic-build = "0.12"
