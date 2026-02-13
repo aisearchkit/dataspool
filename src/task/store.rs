@@ -4,7 +4,7 @@
 //! Task and shard metadata storage
 
 use crate::error::Result;
-use crate::storage::KvStore;
+use crate::storage::{KvStore, cf};
 use crate::task::{ShardMeta, TaskMeta};
 use crate::types::{ShardId, ShardState, TaskId};
 
@@ -23,14 +23,14 @@ impl<S: KvStore> TaskStore<S> {
     pub async fn save_task(&self, task: &TaskMeta) -> Result<()> {
         let key = format!("task:{}", task.task_id);
         let value = serde_json::to_vec(task)?;
-        self.store.put_cf("META", key.as_bytes(), &value).await?;
+        self.store.put_cf(cf::META, key.as_bytes(), &value).await?;
         Ok(())
     }
 
     /// Get task metadata by ID
     pub async fn get_task(&self, task_id: &TaskId) -> Result<Option<TaskMeta>> {
         let key = format!("task:{}", task_id);
-        if let Some(value) = self.store.get_cf("META", key.as_bytes()).await? {
+        if let Some(value) = self.store.get_cf(cf::META, key.as_bytes()).await? {
             let task: TaskMeta = serde_json::from_slice(&value)?;
             Ok(Some(task))
         } else {
@@ -41,7 +41,7 @@ impl<S: KvStore> TaskStore<S> {
     /// List all tasks
     pub async fn list_tasks(&self) -> Result<Vec<TaskMeta>> {
         let prefix = b"task:";
-        let pairs = self.store.prefix_scan_cf("META", prefix).await?;
+        let pairs = self.store.prefix_scan_cf(cf::META, prefix).await?;
 
         let mut tasks = Vec::new();
         for (_key, value) in pairs {
@@ -55,7 +55,7 @@ impl<S: KvStore> TaskStore<S> {
     /// Delete task metadata
     pub async fn delete_task(&self, task_id: &TaskId) -> Result<()> {
         let key = format!("task:{}", task_id);
-        self.store.delete_cf("META", key.as_bytes()).await?;
+        self.store.delete_cf(cf::META, key.as_bytes()).await?;
         Ok(())
     }
 
@@ -63,12 +63,12 @@ impl<S: KvStore> TaskStore<S> {
     pub async fn save_shard(&self, shard: &ShardMeta) -> Result<()> {
         let key = format!("shard:{}", shard.shard_id);
         let value = serde_json::to_vec(shard)?;
-        self.store.put_cf("META", key.as_bytes(), &value).await?;
+        self.store.put_cf(cf::META, key.as_bytes(), &value).await?;
 
         // Also index by task_id for efficient lookup
         let task_index_key = format!("task_shard:{}:{}", shard.task_id, shard.shard_id);
         self.store
-            .put_cf("META", task_index_key.as_bytes(), b"")
+            .put_cf(cf::META, task_index_key.as_bytes(), b"")
             .await?;
 
         Ok(())
@@ -77,7 +77,7 @@ impl<S: KvStore> TaskStore<S> {
     /// Get shard metadata by ID
     pub async fn get_shard(&self, shard_id: &ShardId) -> Result<Option<ShardMeta>> {
         let key = format!("shard:{}", shard_id);
-        if let Some(value) = self.store.get_cf("META", key.as_bytes()).await? {
+        if let Some(value) = self.store.get_cf(cf::META, key.as_bytes()).await? {
             let shard: ShardMeta = serde_json::from_slice(&value)?;
             Ok(Some(shard))
         } else {
@@ -88,7 +88,10 @@ impl<S: KvStore> TaskStore<S> {
     /// List all shards for a task
     pub async fn list_task_shards(&self, task_id: &TaskId) -> Result<Vec<ShardMeta>> {
         let prefix = format!("task_shard:{}:", task_id);
-        let pairs = self.store.prefix_scan_cf("META", prefix.as_bytes()).await?;
+        let pairs = self
+            .store
+            .prefix_scan_cf(cf::META, prefix.as_bytes())
+            .await?;
 
         let mut shards = Vec::new();
         for (key, _value) in pairs {
@@ -96,7 +99,7 @@ impl<S: KvStore> TaskStore<S> {
             let key_str = String::from_utf8_lossy(&key);
             if let Some(shard_id_str) = key_str.split(':').nth(2) {
                 let shard_key = format!("shard:{}", shard_id_str);
-                if let Some(value) = self.store.get_cf("META", shard_key.as_bytes()).await? {
+                if let Some(value) = self.store.get_cf(cf::META, shard_key.as_bytes()).await? {
                     let shard: ShardMeta = serde_json::from_slice(&value)?;
                     shards.push(shard);
                 }
@@ -122,12 +125,12 @@ impl<S: KvStore> TaskStore<S> {
     /// Delete shard metadata
     pub async fn delete_shard(&self, shard: &ShardMeta) -> Result<()> {
         let key = format!("shard:{}", shard.shard_id);
-        self.store.delete_cf("META", key.as_bytes()).await?;
+        self.store.delete_cf(cf::META, key.as_bytes()).await?;
 
         // Also delete task index
         let task_index_key = format!("task_shard:{}:{}", shard.task_id, shard.shard_id);
         self.store
-            .delete_cf("META", task_index_key.as_bytes())
+            .delete_cf(cf::META, task_index_key.as_bytes())
             .await?;
 
         Ok(())
