@@ -16,10 +16,20 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-//! Storage layer for persistent data
+//! Storage layer abstraction
+//!
+//! This module provides storage abstractions for different data types:
+//! - `kv`: Key-value storage for system metadata (RocksDB)
+//! - `rocksdb`: RocksDB implementation for metadata
+//! - `index`: Index storage for migration data (eloqstore)
+//!
+//! **Note**: eloqstore integration is currently stubbed out with a mock
+//! implementation. Real eloqstore requires Ubuntu 24.04+ and C++ build tools.
 
+pub mod index;
 pub mod kv;
 pub mod rocksdb;
 
+pub use index::{IndexStore, IndexTable};
 pub use kv::{ColumnFamily, KvStore, WriteBatch, cf};
 pub use rocksdb::RocksDbStore;

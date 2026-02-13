@@ -35,7 +35,8 @@ openraft = { version = "0.9", features = ["serde"] }
 rocksdb = "0.22"
 
 # eloqstore for index storage (migration indexes, large-scale data)
-eloqstore = { git = "https://github.com/eloqdata/eloqstore", branch = "main" }
+# Requires Ubuntu 24.04+ with C++ build environment
+# eloqstore = { git = "https://github.com/eloqdata/eloqstore", branch = "main" }
 
 # Networking
 tonic = "0.12"
