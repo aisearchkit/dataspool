@@ -24,12 +24,16 @@
 
 pub mod config;
 pub mod error;
+pub mod pipeline;
 pub mod storage;
 pub mod types;
 
 pub use config::DatspoolConfig;
 pub use error::{
     ConfigError, DatspoolError, DriverError, RaftError, Result, StorageError,
+};
+pub use pipeline::{
+    Pipeline, PipelineConfig, PipelineStats, Record, RecordBatch, Sink, Source, Transform,
 };
 pub use storage::{cf, ColumnFamily, KvStore, RocksDbStore, WriteBatch};
 pub use types::{
