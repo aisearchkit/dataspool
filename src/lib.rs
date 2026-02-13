@@ -22,24 +22,24 @@
 //! high availability through Raft consensus and horizontal scalability
 //! through distributed task execution.
 
+pub mod agent;
+pub mod comms;
 pub mod config;
 pub mod error;
 pub mod pipeline;
+pub mod raft;
 pub mod storage;
 pub mod task;
 pub mod types;
-pub mod comms;
-pub mod raft;
-pub mod agent;
 
+pub use agent::{ShardClaimer, ShardExecutor, WorkerPool};
+pub use comms::{GrpcClient, GrpcServer};
 pub use config::DatspoolConfig;
 pub use error::{ConfigError, DatspoolError, DriverError, RaftError, Result, StorageError};
 pub use pipeline::{
     Pipeline, PipelineConfig, PipelineStats, Record, RecordBatch, Sink, Source, Transform,
 };
+pub use raft::{Command, RaftNode};
 pub use storage::{ColumnFamily, KvStore, RocksDbStore, WriteBatch, cf};
 pub use task::{ShardGenerator, ShardMeta, ShardingStrategy, TaskMeta, TaskPriority, TaskStore};
 pub use types::{NodeId, NodeRole, NodeStatus, ShardId, ShardState, TaskId, TaskState, TaskStats};
-pub use comms::{GrpcServer, GrpcClient};
-pub use raft::{Command, RaftNode};
-pub use agent::{WorkerPool, ShardClaimer, ShardExecutor};

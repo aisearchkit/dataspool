@@ -5,8 +5,8 @@
 
 //! Raft command definitions - all cluster state mutations
 
+use crate::task::{ShardMeta, TaskMeta};
 use serde::{Deserialize, Serialize};
-use crate::task::{TaskMeta, ShardMeta};
 
 /// Commands that can be proposed to the Raft log
 ///
@@ -15,78 +15,70 @@ use crate::task::{TaskMeta, ShardMeta};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Command {
     // ==================== Task Management ====================
-    
     /// Create a new task
     CreateTask {
         task: Box<TaskMeta>,
         shards: Vec<ShardMeta>,
     },
-    
+
     /// Update task state
     UpdateTaskState {
         task_id: String,
-        state: String,  // JSON-serialized TaskState
+        state: String, // JSON-serialized TaskState
     },
-    
+
     /// Delete a task (soft delete - mark as archived)
-    DeleteTask {
-        task_id: String,
-    },
-    
+    DeleteTask { task_id: String },
+
     // ==================== Shard Management ====================
-    
     /// Claim a shard (CAS operation)
     ClaimShard {
         shard_id: String,
         node_id: String,
-        expected_state: String,  // Must be "Pending"
+        expected_state: String, // Must be "Pending"
     },
-    
+
     /// Update shard progress
     UpdateShardProgress {
         shard_id: String,
         processed_records: u64,
-        offset: String,  // JSON-serialized OffsetValue
+        offset: String, // JSON-serialized OffsetValue
     },
-    
+
     /// Mark shard as completed
     CompleteShard {
         shard_id: String,
         total_records: u64,
     },
-    
+
     /// Mark shard as failed
     FailShard {
         shard_id: String,
         error_message: String,
     },
-    
+
     // ==================== Node Management ====================
-    
     /// Register a new node
     RegisterNode {
         node_id: String,
         address: String,
         tags: std::collections::HashMap<String, String>,
     },
-    
+
     /// Update node heartbeat
     UpdateNodeHeartbeat {
         node_id: String,
-        timestamp: i64,  // Unix timestamp
+        timestamp: i64, // Unix timestamp
     },
-    
+
     /// Mark node as offline
-    MarkNodeOffline {
-        node_id: String,
-    },
-    
+    MarkNodeOffline { node_id: String },
+
     // ==================== Configuration ====================
-    
     /// Update cluster configuration
     UpdateConfig {
         key: String,
-        value: String,  // JSON-serialized value
+        value: String, // JSON-serialized value
     },
 }
 
@@ -103,7 +95,9 @@ impl Command {
             Command::DeleteTask { task_id } => {
                 format!("DeleteTask({})", task_id)
             }
-            Command::ClaimShard { shard_id, node_id, .. } => {
+            Command::ClaimShard {
+                shard_id, node_id, ..
+            } => {
                 format!("ClaimShard({}, {})", shard_id, node_id)
             }
             Command::UpdateShardProgress { shard_id, .. } => {
@@ -142,12 +136,14 @@ mod tests {
             node_id: "node-1".to_string(),
             expected_state: "Pending".to_string(),
         };
-        
+
         let json = serde_json::to_string(&cmd).unwrap();
         let decoded: Command = serde_json::from_str(&json).unwrap();
-        
+
         match decoded {
-            Command::ClaimShard { shard_id, node_id, .. } => {
+            Command::ClaimShard {
+                shard_id, node_id, ..
+            } => {
                 assert_eq!(shard_id, "shard-1");
                 assert_eq!(node_id, "node-1");
             }
@@ -160,12 +156,12 @@ mod tests {
         let cmd = Command::CreateTask {
             task: Box::new(TaskMeta::new(
                 "Test Task".to_string(),
-                "{}".to_string(),  // source_config
-                "{}".to_string(),  // sink_config
+                "{}".to_string(), // source_config
+                "{}".to_string(), // sink_config
             )),
             shards: vec![],
         };
-        
+
         // task_id is generated, so we check the prefix
         assert!(cmd.description().starts_with("CreateTask("));
     }

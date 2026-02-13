@@ -5,8 +5,8 @@
 
 //! Shard claimer - acquires pending shards via Raft CAS
 
-use tracing::info;
 use crate::error::Result;
+use tracing::info;
 
 /// Shard claimer that uses Raft CAS to acquire pending shards
 pub struct ShardClaimer {
@@ -23,13 +23,13 @@ impl ShardClaimer {
     /// Returns Some(shard_id) if successful, None if no shards available
     pub async fn try_claim(&self) -> Result<Option<String>> {
         info!("Attempting to claim shard for node {}", self.node_id);
-        
-        // TODO: 
+
+        // TODO:
         // 1. Query TaskStore for pending shards
         // 2. Try to claim via Raft CAS (ClaimShard command)
         // 3. If successful, return shard_id
         // 4. If conflict, retry with next shard
-        
+
         // Placeholder - no shards available yet
         Ok(None)
     }

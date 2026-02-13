@@ -5,8 +5,8 @@
 
 //! Shard executor - runs data migration pipeline for a shard
 
-use tracing::{info, warn};
 use crate::error::Result;
+use tracing::{info, warn};
 
 /// Executes a shard using the data pipeline
 #[derive(Clone)]
@@ -26,7 +26,7 @@ impl ShardExecutor {
     /// Execute a shard
     pub async fn execute(&self, shard_id: &str) -> Result<()> {
         info!("Executing shard: {}", shard_id);
-        
+
         // TODO:
         // 1. Load shard metadata from TaskStore
         // 2. Create Source, Sink, Transforms from configs
@@ -34,7 +34,7 @@ impl ShardExecutor {
         // 4. Report progress periodically via gRPC
         // 5. Handle errors and retries
         // 6. Complete or fail shard via Raft
-        
+
         // Placeholder
         warn!("ShardExecutor.execute() not implemented yet");
         Ok(())

@@ -16,7 +16,7 @@ use tracing::info;
 pub struct RaftNetwork {
     #[allow(dead_code)]
     node_id: String,
-    peers: Arc<RwLock<HashMap<String, String>>>,  // node_id -> address
+    peers: Arc<RwLock<HashMap<String, String>>>, // node_id -> address
 }
 
 impl RaftNetwork {

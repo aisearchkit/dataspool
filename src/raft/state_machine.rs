@@ -8,9 +8,9 @@
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
+use super::Command;
 use crate::error::Result;
 use crate::storage::KvStore;
-use super::Command;
 
 /// Response from applying a command
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -39,13 +39,16 @@ impl<S: KvStore> MetaStateMachine<S> {
     /// Apply a single command to the state machine
     pub async fn apply_command(&mut self, cmd: Command) -> Result<CommandResponse> {
         info!("Applying command: {}", cmd.description());
-        
+
         match cmd {
-            Command::CreateTask { task, shards } => {
-                self.apply_create_task(task, shards).await
-            }
-            Command::ClaimShard { shard_id, node_id, expected_state } => {
-                self.apply_claim_shard(shard_id, node_id, expected_state).await
+            Command::CreateTask { task, shards } => self.apply_create_task(task, shards).await,
+            Command::ClaimShard {
+                shard_id,
+                node_id,
+                expected_state,
+            } => {
+                self.apply_claim_shard(shard_id, node_id, expected_state)
+                    .await
             }
             // TODO: Implement other commands
             _ => {

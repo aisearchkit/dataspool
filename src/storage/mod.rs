@@ -21,15 +21,11 @@
 //! This module provides storage abstractions for different data types:
 //! - `kv`: Key-value storage for system metadata (RocksDB)
 //! - `rocksdb`: RocksDB implementation for metadata
-//! - `index`: Index storage for migration data (eloqstore)
-//!
-//! **Note**: eloqstore integration is currently stubbed out with a mock
-//! implementation. Real eloqstore requires Ubuntu 24.04+ and C++ build tools.
+//! - `index`: Tiered index storage (Memory + SSD + S3)
 
 pub mod index;
 pub mod kv;
 pub mod rocksdb;
 
-pub use index::{IndexStore, IndexTable};
 pub use kv::{ColumnFamily, KvStore, WriteBatch, cf};
 pub use rocksdb::RocksDbStore;

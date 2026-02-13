@@ -5,10 +5,10 @@
 
 //! Raft node - high-level interface for consensus operations
 
-use tracing::info;
-use crate::error::Result;
 use super::{Command, MetaStateMachine, RaftNetwork};
+use crate::error::Result;
 use crate::storage::KvStore;
+use tracing::info;
 
 /// Raft node representing this instance in the cluster
 pub struct RaftNode<S: KvStore> {
@@ -41,7 +41,7 @@ impl<S: KvStore> RaftNode<S> {
     /// Check if this node is the Leader
     pub async fn is_leader(&self) -> bool {
         // TODO: Query openraft::Raft
-        true  // Single-node always leader
+        true // Single-node always leader
     }
 
     /// Get current Leader ID
@@ -60,7 +60,7 @@ mod tests {
     async fn test_raft_node_creation() {
         let temp_dir = tempfile::tempdir().unwrap();
         let store = RocksDbStore::open(temp_dir.path()).unwrap();
-        
+
         let node = RaftNode::new("node-1".to_string(), store);
         assert_eq!(node.node_id, "node-1");
         assert!(node.is_leader().await);

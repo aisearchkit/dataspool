@@ -5,13 +5,13 @@
 
 //! Agent worker pool - distributed task execution
 
-mod worker_pool;
-mod shard_claimer;
 mod executor;
+mod shard_claimer;
+mod worker_pool;
 
-pub use worker_pool::WorkerPool;
-pub use shard_claimer::ShardClaimer;
 pub use executor::ShardExecutor;
+pub use shard_claimer::ShardClaimer;
+pub use worker_pool::WorkerPool;
 
 use crate::error::Result;
 

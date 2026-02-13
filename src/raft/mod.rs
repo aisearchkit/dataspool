@@ -6,14 +6,14 @@
 //! Raft consensus layer - distributed metadata synchronization
 
 mod command;
-mod state_machine;
 mod network;
 mod node;
+mod state_machine;
 
 pub use command::Command;
-pub use state_machine::MetaStateMachine;
 pub use network::RaftNetwork;
 pub use node::RaftNode;
+pub use state_machine::MetaStateMachine;
 
 use openraft::Config;
 
@@ -21,9 +21,9 @@ use openraft::Config;
 pub fn default_raft_config() -> Config {
     Config {
         cluster_name: "dataspool".to_string(),
-        heartbeat_interval: 500,  // 500ms
-        election_timeout_min: 1500,  // 1.5s
-        election_timeout_max: 3000,  // 3s
+        heartbeat_interval: 500,    // 500ms
+        election_timeout_min: 1500, // 1.5s
+        election_timeout_max: 3000, // 3s
         ..Default::default()
     }
 }

@@ -34,10 +34,6 @@ openraft = { version = "0.9", features = ["serde"] }
 # Storage
 rocksdb = "0.22"
 
-# eloqstore for index storage (migration indexes, large-scale data)
-# Requires Ubuntu 24.04+ with C++ build environment
-# eloqstore = { git = "https://github.com/eloqdata/eloqstore", branch = "main" }
-
 # Networking
 tonic = "0.12"
 tonic-build = "0.12"
@@ -55,6 +51,11 @@ bytes = "1.7"
 parking_lot = "0.12"
 num_cpus = "1.16"
 hostname = "0.4"
+dashmap = "6.1.0"
+aws-sdk-s3 = "1.123.0"
+aws-config = "1.8.14"
+parquet = "57.3.0"
+arrow = "57.3.0"
 
 [dev-dependencies]
 tempfile = "3.12"

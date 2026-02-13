@@ -5,13 +5,13 @@
 
 //! Communication layer - gRPC server and client for cluster communication
 
+mod client;
 mod generated;
 mod server;
-mod client;
 
+pub use client::GrpcClient;
 pub use generated::*;
 pub use server::GrpcServer;
-pub use client::GrpcClient;
 
 use crate::error::Result;
 

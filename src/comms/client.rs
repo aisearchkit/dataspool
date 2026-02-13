@@ -8,8 +8,8 @@
 use tonic::transport::Channel;
 use tracing::info;
 
+use super::generated::{cluster, log, task};
 use crate::error::{DatspoolError, Result};
-use super::generated::{cluster, task, log};
 
 /// gRPC client for connecting to other Dataspool nodes
 pub struct GrpcClient {
@@ -22,10 +22,10 @@ impl GrpcClient {
     /// Connect to a remote node
     pub async fn connect(addr: &str) -> Result<Self> {
         info!("Connecting to gRPC server at {}", addr);
-        
+
         let endpoint = Channel::from_shared(format!("http://{}", addr))
             .map_err(|e| DatspoolError::Internal(format!("Invalid address: {}", e)))?;
-        
+
         let channel = endpoint
             .connect()
             .await
@@ -33,17 +33,17 @@ impl GrpcClient {
 
         Ok(Self {
             cluster_client: cluster::cluster_service_client::ClusterServiceClient::new(
-                channel.clone()
+                channel.clone(),
             ),
-            task_client: task::task_service_client::TaskServiceClient::new(
-                channel.clone()
-            ),
+            task_client: task::task_service_client::TaskServiceClient::new(channel.clone()),
             log_client: log::log_service_client::LogServiceClient::new(channel),
         })
     }
 
     /// Get cluster service client
-    pub fn cluster(&mut self) -> &mut cluster::cluster_service_client::ClusterServiceClient<Channel> {
+    pub fn cluster(
+        &mut self,
+    ) -> &mut cluster::cluster_service_client::ClusterServiceClient<Channel> {
         &mut self.cluster_client
     }
 

@@ -7,11 +7,11 @@
 
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tonic::{transport::Server, Request, Response, Status};
+use tonic::{Request, Response, Status, transport::Server};
 use tracing::{info, warn};
 
+use super::generated::{cluster, log, task};
 use crate::error::{DatspoolError, Result};
-use super::generated::{cluster, task, log};
 
 /// gRPC server that implements all Dataspool services
 pub struct GrpcServer {
@@ -33,22 +33,24 @@ impl GrpcServer {
 
     /// Start the gRPC server (blocking)
     pub async fn serve(self) -> Result<()> {
-        let addr = self.bind_addr.parse()
-            .map_err(|e| DatspoolError::Config(
-                crate::error::ConfigError::Invalid(format!("Invalid bind address {}: {}", self.bind_addr, e))
-            ))?;
+        let addr = self.bind_addr.parse().map_err(|e| {
+            DatspoolError::Config(crate::error::ConfigError::Invalid(format!(
+                "Invalid bind address {}: {}",
+                self.bind_addr, e
+            )))
+        })?;
 
         info!("Starting gRPC server on {}", addr);
 
         Server::builder()
             .add_service(cluster::cluster_service_server::ClusterServiceServer::new(
-                self.cluster_service.clone()
+                self.cluster_service.clone(),
             ))
             .add_service(task::task_service_server::TaskServiceServer::new(
-                self.task_service.clone()
+                self.task_service.clone(),
             ))
             .add_service(log::log_service_server::LogServiceServer::new(
-                self.log_service.clone()
+                self.log_service.clone(),
             ))
             .serve(addr)
             .await
@@ -70,8 +72,11 @@ impl cluster::cluster_service_server::ClusterService for Arc<RwLock<ClusterServi
         request: Request<cluster::RegisterNodeRequest>,
     ) -> std::result::Result<Response<cluster::RegisterNodeResponse>, Status> {
         let req = request.into_inner();
-        warn!("RegisterNode called (not implemented yet): node_id={}", req.node_id);
-        
+        warn!(
+            "RegisterNode called (not implemented yet): node_id={}",
+            req.node_id
+        );
+
         Ok(Response::new(cluster::RegisterNodeResponse {
             success: false,
             message: "Not implemented yet".to_string(),
@@ -84,8 +89,11 @@ impl cluster::cluster_service_server::ClusterService for Arc<RwLock<ClusterServi
         request: Request<cluster::HeartbeatRequest>,
     ) -> std::result::Result<Response<cluster::HeartbeatResponse>, Status> {
         let req = request.into_inner();
-        warn!("Heartbeat called (not implemented yet): node_id={}", req.node_id);
-        
+        warn!(
+            "Heartbeat called (not implemented yet): node_id={}",
+            req.node_id
+        );
+
         Ok(Response::new(cluster::HeartbeatResponse {
             accepted: false,
             leader_id: String::new(),
@@ -97,7 +105,7 @@ impl cluster::cluster_service_server::ClusterService for Arc<RwLock<ClusterServi
         _request: Request<cluster::ClusterInfoRequest>,
     ) -> std::result::Result<Response<cluster::ClusterInfoResponse>, Status> {
         warn!("GetClusterInfo called (not implemented yet)");
-        
+
         Ok(Response::new(cluster::ClusterInfoResponse {
             leader_id: String::new(),
             nodes: vec![],
@@ -119,7 +127,7 @@ impl task::task_service_server::TaskService for Arc<RwLock<TaskServiceImpl>> {
     ) -> std::result::Result<Response<task::CreateTaskResponse>, Status> {
         let req = request.into_inner();
         warn!("CreateTask called (not implemented yet): name={}", req.name);
-        
+
         Ok(Response::new(task::CreateTaskResponse {
             success: false,
             task_id: String::new(),
@@ -132,8 +140,11 @@ impl task::task_service_server::TaskService for Arc<RwLock<TaskServiceImpl>> {
         request: Request<task::GetTaskRequest>,
     ) -> std::result::Result<Response<task::GetTaskResponse>, Status> {
         let req = request.into_inner();
-        warn!("GetTask called (not implemented yet): task_id={}", req.task_id);
-        
+        warn!(
+            "GetTask called (not implemented yet): task_id={}",
+            req.task_id
+        );
+
         Err(Status::unimplemented("Not implemented yet"))
     }
 
@@ -142,8 +153,11 @@ impl task::task_service_server::TaskService for Arc<RwLock<TaskServiceImpl>> {
         request: Request<task::AssignShardRequest>,
     ) -> std::result::Result<Response<task::AssignShardResponse>, Status> {
         let req = request.into_inner();
-        warn!("AssignShard called (not implemented yet): shard_id={}", req.shard_id);
-        
+        warn!(
+            "AssignShard called (not implemented yet): shard_id={}",
+            req.shard_id
+        );
+
         Ok(Response::new(task::AssignShardResponse {
             success: false,
             message: "Not implemented yet".to_string(),
@@ -156,8 +170,11 @@ impl task::task_service_server::TaskService for Arc<RwLock<TaskServiceImpl>> {
         request: Request<task::ReportProgressRequest>,
     ) -> std::result::Result<Response<task::ReportProgressResponse>, Status> {
         let req = request.into_inner();
-        warn!("ReportProgress called (not implemented yet): shard_id={}", req.shard_id);
-        
+        warn!(
+            "ReportProgress called (not implemented yet): shard_id={}",
+            req.shard_id
+        );
+
         Ok(Response::new(task::ReportProgressResponse {
             accepted: false,
         }))
@@ -168,8 +185,11 @@ impl task::task_service_server::TaskService for Arc<RwLock<TaskServiceImpl>> {
         request: Request<task::CompleteShardRequest>,
     ) -> std::result::Result<Response<task::CompleteShardResponse>, Status> {
         let req = request.into_inner();
-        warn!("CompleteShard called (not implemented yet): shard_id={}", req.shard_id);
-        
+        warn!(
+            "CompleteShard called (not implemented yet): shard_id={}",
+            req.shard_id
+        );
+
         Ok(Response::new(task::CompleteShardResponse {
             success: false,
             has_next_shard: false,
@@ -182,8 +202,11 @@ impl task::task_service_server::TaskService for Arc<RwLock<TaskServiceImpl>> {
         request: Request<task::FailShardRequest>,
     ) -> std::result::Result<Response<task::FailShardResponse>, Status> {
         let req = request.into_inner();
-        warn!("FailShard called (not implemented yet): shard_id={}", req.shard_id);
-        
+        warn!(
+            "FailShard called (not implemented yet): shard_id={}",
+            req.shard_id
+        );
+
         Ok(Response::new(task::FailShardResponse {
             should_retry: false,
         }))
@@ -197,18 +220,22 @@ struct LogServiceImpl;
 
 #[tonic::async_trait]
 impl log::log_service_server::LogService for Arc<RwLock<LogServiceImpl>> {
-    type StreamLogsStream = tokio_stream::wrappers::ReceiverStream<
-        std::result::Result<log::LogEntry, Status>
-    >;
+    type StreamLogsStream =
+        tokio_stream::wrappers::ReceiverStream<std::result::Result<log::LogEntry, Status>>;
 
     async fn stream_logs(
         &self,
         request: Request<log::StreamLogsRequest>,
     ) -> std::result::Result<Response<Self::StreamLogsStream>, Status> {
         let req = request.into_inner();
-        warn!("StreamLogs called (not implemented yet): task_id={}", req.task_id);
-        
+        warn!(
+            "StreamLogs called (not implemented yet): task_id={}",
+            req.task_id
+        );
+
         let (_tx, rx) = tokio::sync::mpsc::channel(1);
-        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(rx)))
+        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
+            rx,
+        )))
     }
 }

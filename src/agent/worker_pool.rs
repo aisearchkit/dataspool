@@ -9,8 +9,8 @@ use std::sync::Arc;
 use tokio::sync::{RwLock, Semaphore};
 use tracing::{info, warn};
 
-use crate::error::{DatspoolError, Result};
 use super::{ShardClaimer, ShardExecutor};
+use crate::error::{DatspoolError, Result};
 
 /// Resource limits for the worker pool
 #[derive(Debug, Clone)]
@@ -36,7 +36,7 @@ impl WorkerPool {
             node_id: node_id.clone(),
             limits: ResourceLimits {
                 max_concurrent_tasks,
-                memory_limit_mb: 4096,  // Default 4GB
+                memory_limit_mb: 4096, // Default 4GB
             },
             semaphore: Arc::new(Semaphore::new(max_concurrent_tasks)),
             active_shards: Arc::new(RwLock::new(Vec::new())),
@@ -48,33 +48,40 @@ impl WorkerPool {
     /// Start the worker pool main loop
     pub async fn run(&mut self) -> Result<()> {
         info!("Starting worker pool on node {}", self.node_id);
-        
+
         loop {
             // Try to claim a shard if we have capacity
-            let permit = self.semaphore.clone().acquire_owned().await
+            let permit = self
+                .semaphore
+                .clone()
+                .acquire_owned()
+                .await
                 .map_err(|e| DatspoolError::Internal(format!("Semaphore error: {}", e)))?;
-            
+
             match self.claimer.try_claim().await {
                 Ok(Some(shard_id)) => {
                     info!("Claimed shard: {}", shard_id);
-                    
+
                     // Track active shard
                     self.active_shards.write().await.push(shard_id.clone());
-                    
+
                     // Spawn shard execution task
                     let executor = self.executor.clone();
                     let active_shards = self.active_shards.clone();
                     let shard_id_clone = shard_id.clone();
-                    
+
                     tokio::spawn(async move {
                         match executor.execute(&shard_id).await {
                             Ok(_) => info!("Shard {} completed", shard_id),
                             Err(e) => warn!("Shard {} failed: {}", shard_id, e),
                         }
-                        
+
                         // Remove from active shards
-                        active_shards.write().await.retain(|id| id != &shard_id_clone);
-                        drop(permit);  // Release semaphore
+                        active_shards
+                            .write()
+                            .await
+                            .retain(|id| id != &shard_id_clone);
+                        drop(permit); // Release semaphore
                     });
                 }
                 Ok(None) => {

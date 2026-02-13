@@ -22,14 +22,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build_server(true)
         .build_client(true)
         .compile_protos(
-            &[
-                "proto/cluster.proto",
-                "proto/task.proto",
-                "proto/log.proto",
-            ],
+            &["proto/cluster.proto", "proto/task.proto", "proto/log.proto"],
             &["proto"],
         )?;
-    
+
     println!("cargo:rerun-if-changed=proto/");
     Ok(())
 }
