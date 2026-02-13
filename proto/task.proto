@@ -1,0 +1,118 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Dataspool - Hybrid-mode data migration and orchestration platform
+
+syntax = "proto3";
+
+package dataspool.task;
+
+import "google/protobuf/timestamp.proto";
+
+// ==================== Task CRUD ====================
+
+message CreateTaskRequest {
+  string name = 1;
+  string source_config = 2;  // JSON-serialized SourceConfig
+  string sink_config = 3;    // JSON-serialized SinkConfig
+  string transform_config = 4;  // JSON-serialized TransformConfig
+  string sharding_strategy = 5;  // JSON-serialized ShardingStrategy
+  int32 priority = 6;  // 0=Low, 1=Normal, 2=High, 3=Critical
+  map<string, string> tags = 7;
+}
+
+message CreateTaskResponse {
+  bool success = 1;
+  string task_id = 2;
+  string message = 3;
+}
+
+message GetTaskRequest {
+  string task_id = 1;
+}
+
+message GetTaskResponse {
+  TaskInfo task = 1;
+  repeated ShardInfo shards = 2;
+}
+
+message TaskInfo {
+  string task_id = 1;
+  string name = 2;
+  string state = 3;  // Pending, Running, Completed, Failed
+  google.protobuf.Timestamp created_at = 4;
+  google.protobuf.Timestamp started_at = 5;
+  google.protobuf.Timestamp completed_at = 6;
+  uint64 total_shards = 7;
+  uint64 completed_shards = 8;
+  uint64 failed_shards = 9;
+  uint64 processed_records = 10;
+}
+
+message ShardInfo {
+  string shard_id = 1;
+  string task_id = 2;
+  string state = 3;
+  string assigned_node = 4;
+  uint64 processed_records = 5;
+  uint64 total_records = 6;
+}
+
+// ==================== Task Control ====================
+
+message AssignShardRequest {
+  string shard_id = 1;
+  string node_id = 2;
+}
+
+message AssignShardResponse {
+  bool success = 1;
+  string message = 2;
+  string shard_config = 3;  // JSON-serialized shard parameters
+}
+
+message ReportProgressRequest {
+  string shard_id = 1;
+  string node_id = 2;
+  uint64 processed_records = 3;
+  uint64 total_records = 4;
+  string offset = 5;  // JSON-serialized OffsetValue
+}
+
+message ReportProgressResponse {
+  bool accepted = 1;
+}
+
+message CompleteShardRequest {
+  string shard_id = 1;
+  string node_id = 2;
+  uint64 total_records = 3;
+}
+
+message CompleteShardResponse {
+  bool success = 1;
+  bool has_next_shard = 2;
+  string next_shard_id = 3;
+}
+
+message FailShardRequest {
+  string shard_id = 1;
+  string node_id = 2;
+  string error_message = 3;
+}
+
+message FailShardResponse {
+  bool should_retry = 1;
+}
+
+// ==================== Service Definition ====================
+
+service TaskService {
+  // Task CRUD
+  rpc CreateTask(CreateTaskRequest) returns (CreateTaskResponse);
+  rpc GetTask(GetTaskRequest) returns (GetTaskResponse);
+  
+  // Task execution (called by Agents)
+  rpc AssignShard(AssignShardRequest) returns (AssignShardResponse);
+  rpc ReportProgress(ReportProgressRequest) returns (ReportProgressResponse);
+  rpc CompleteShard(CompleteShardRequest) returns (CompleteShardResponse);
+  rpc FailShard(FailShardRequest) returns (FailShardResponse);
+}

@@ -1,0 +1,87 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Dataspool - Hybrid-mode data migration and orchestration platform
+
+syntax = "proto3";
+
+package dataspool.cluster;
+
+// ==================== Node Management ====================
+
+// Node registration request
+message RegisterNodeRequest {
+  string node_id = 1;
+  string address = 2;  // IP:port
+  map<string, string> tags = 3;  // agent tags (datacenter, rack, etc.)
+  ResourceCapacity capacity = 4;
+}
+
+message ResourceCapacity {
+  uint32 cpu_cores = 1;
+  uint64 memory_mb = 2;
+  uint32 max_concurrent_tasks = 3;
+}
+
+message RegisterNodeResponse {
+  bool success = 1;
+  string message = 2;
+  string leader_id = 3;  // Redirect to leader if not leader
+}
+
+// Node heartbeat
+message HeartbeatRequest {
+  string node_id = 1;
+  NodeStatus status = 2;
+  ResourceUsage usage = 3;
+}
+
+message NodeStatus {
+  enum State {
+    UNKNOWN = 0;
+    READY = 1;
+    BUSY = 2;
+    DRAINING = 3;
+    OFFLINE = 4;
+  }
+  State state = 1;
+  uint64 uptime_seconds = 2;
+}
+
+message ResourceUsage {
+  uint32 active_tasks = 1;
+  uint64 memory_used_mb = 2;
+  double cpu_usage_percent = 3;
+}
+
+message HeartbeatResponse {
+  bool accepted = 1;
+  string leader_id = 2;
+}
+
+// Cluster info
+message ClusterInfoRequest {}
+
+message ClusterInfoResponse {
+  string leader_id = 1;
+  repeated NodeInfo nodes = 2;
+  uint32 term = 3;  // Raft term
+}
+
+message NodeInfo {
+  string node_id = 1;
+  string address = 2;
+  NodeStatus status = 3;
+  ResourceCapacity capacity = 4;
+  ResourceUsage usage = 5;
+  map<string, string> tags = 6;
+}
+
+// ==================== Service Definition ====================
+
+service ClusterService {
+  // Node lifecycle
+  rpc RegisterNode(RegisterNodeRequest) returns (RegisterNodeResponse);
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+  
+  // Cluster state queries
+  rpc GetClusterInfo(ClusterInfoRequest) returns (ClusterInfoResponse);
+}

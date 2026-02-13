@@ -1,0 +1,35 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Dataspool - Hybrid-mode data migration and orchestration platform
+
+syntax = "proto3";
+
+package dataspool.log;
+
+import "google/protobuf/timestamp.proto";
+
+// ==================== Log Streaming ====================
+
+message StreamLogsRequest {
+  string task_id = 1;
+  string shard_id = 2;  // Optional: filter by shard
+  string level = 3;     // Optional: DEBUG, INFO, WARN, ERROR
+  google.protobuf.Timestamp since = 4;  // Optional: start time
+}
+
+message LogEntry {
+  google.protobuf.Timestamp timestamp = 1;
+  string level = 2;
+  string target = 3;  // Module name (e.g., "dataspool::agent::worker")
+  string message = 4;
+  string node_id = 5;
+  string task_id = 6;
+  string shard_id = 7;
+  map<string, string> fields = 8;  // Additional structured fields
+}
+
+// ==================== Service Definition ====================
+
+service LogService {
+  // Server-streaming: client opens stream, server pushes log entries
+  rpc StreamLogs(StreamLogsRequest) returns (stream LogEntry);
+}

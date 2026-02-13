@@ -460,6 +460,7 @@ dependencies = [
  "openraft",
  "parking_lot",
  "prost",
+ "prost-types",
  "rocksdb",
  "serde",
  "serde_json",
