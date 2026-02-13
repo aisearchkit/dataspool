@@ -16,9 +16,11 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+mod config;
 mod error;
 mod types;
 
+pub use config::DatspoolConfig;
 pub use error::{
     ConfigError, DatspoolError, DriverError, RaftError, Result, StorageError,
 };
