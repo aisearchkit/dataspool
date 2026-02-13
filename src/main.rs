@@ -21,12 +21,8 @@ mod error;
 mod types;
 
 pub use config::DatspoolConfig;
-pub use error::{
-    ConfigError, DatspoolError, DriverError, RaftError, Result, StorageError,
-};
-pub use types::{
-    NodeId, NodeRole, NodeStatus, ShardId, ShardState, TaskId, TaskState, TaskStats,
-};
+pub use error::{ConfigError, DatspoolError, DriverError, RaftError, Result, StorageError};
+pub use types::{NodeId, NodeRole, NodeStatus, ShardId, ShardState, TaskId, TaskState, TaskStats};
 
 #[tokio::main]
 async fn main() -> Result<()> {

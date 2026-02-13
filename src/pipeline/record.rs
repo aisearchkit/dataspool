@@ -200,7 +200,7 @@ mod tests {
     #[test]
     fn test_record_serialization() {
         let record = Record::with_id("123", "test", json!({"key": "value"}));
-        
+
         let bytes = record.to_bytes().unwrap();
         let deserialized = Record::from_bytes(&bytes).unwrap();
 
@@ -231,10 +231,13 @@ mod tests {
             count: u32,
         }
 
-        let record = Record::new("test", json!({
-            "field": "value",
-            "count": 10
-        }));
+        let record = Record::new(
+            "test",
+            json!({
+                "field": "value",
+                "count": 10
+            }),
+        );
 
         let data: TestData = record.get_payload_as().unwrap();
         assert_eq!(data.field, "value");

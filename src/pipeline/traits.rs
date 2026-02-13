@@ -19,7 +19,7 @@
 //! Data source, transformation, and sink traits for pipeline
 
 use super::record::{Record, RecordBatch};
-use crate::error::{DriverError, Result};
+use crate::error::Result;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
@@ -34,22 +34,19 @@ use serde::{Deserialize, Serialize};
 pub enum OffsetValue {
     /// Document count (for ES Scroll API)
     DocumentCount(u64),
-    
+
     /// Primary key value (for MySQL, PostgreSQL)
     PrimaryKey(serde_json::Value),
-    
+
     /// Byte offset in file
     ByteOffset(u64),
-    
+
     /// MySQL Binlog position
-    BinlogPosition {
-        file: String,
-        position: u64,
-    },
-    
+    BinlogPosition { file: String, position: u64 },
+
     /// MongoDB resume token
     ResumeToken(String),
-    
+
     /// Custom offset (driver-specific)
     Custom(serde_json::Value),
 }
@@ -125,13 +122,13 @@ pub trait Sink: Send + Sync {
 pub struct WriteResult {
     /// Number of successfully written records
     pub success_count: usize,
-    
+
     /// Number of failed records
     pub failed_count: usize,
-    
+
     /// Total bytes written
     pub bytes_written: u64,
-    
+
     /// Errors encountered (if any)
     pub errors: Vec<String>,
 }
@@ -271,7 +268,7 @@ mod tests {
     fn test_noop_transform() {
         let transform = NoOpTransform;
         let record = Record::new("test", json!({"key": "value"}));
-        
+
         let result = transform.transform(record.clone()).unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(result[0], record);
@@ -284,11 +281,14 @@ mod tests {
             ("foo".to_string(), "bar".to_string()),
         ]);
 
-        let record = Record::new("test", json!({
-            "old_name": "value1",
-            "foo": "value2",
-            "unchanged": "value3"
-        }));
+        let record = Record::new(
+            "test",
+            json!({
+                "old_name": "value1",
+                "foo": "value2",
+                "unchanged": "value3"
+            }),
+        );
 
         let result = transform.transform(record).unwrap();
         assert_eq!(result.len(), 1);
@@ -303,7 +303,11 @@ mod tests {
     #[test]
     fn test_filter_transform() {
         let transform = FilterTransform::new(|record: &Record| {
-            record.payload.get("keep").and_then(|v| v.as_bool()).unwrap_or(false)
+            record
+                .payload
+                .get("keep")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
         });
 
         let keep_record = Record::new("test", json!({"keep": true}));

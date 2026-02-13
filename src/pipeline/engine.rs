@@ -19,7 +19,7 @@
 //! Pipeline execution engine
 
 use super::record::RecordBatch;
-use super::traits::{OffsetValue, Sink, Source, Transform, WriteResult};
+use super::traits::{OffsetValue, Sink, Source, Transform};
 use crate::error::Result;
 use std::sync::Arc;
 use std::time::Instant;
@@ -29,22 +29,22 @@ use std::time::Instant;
 pub struct PipelineStats {
     /// Total records read from source
     pub records_read: u64,
-    
+
     /// Total records written to sink
     pub records_written: u64,
-    
+
     /// Total bytes read
     pub bytes_read: u64,
-    
+
     /// Total bytes written
     pub bytes_written: u64,
-    
+
     /// Number of failed records
     pub records_failed: u64,
-    
+
     /// Total execution time in milliseconds
     pub duration_ms: u64,
-    
+
     /// Current offset position
     pub current_offset: Option<OffsetValue>,
 }
@@ -97,10 +97,10 @@ impl ProgressCallback for NoOpCallback {
 pub struct PipelineConfig {
     /// Number of records to process per batch
     pub batch_size: usize,
-    
+
     /// Checkpoint offset every N records
     pub checkpoint_interval: u64,
-    
+
     /// Maximum number of consecutive errors before failing
     pub max_consecutive_errors: u32,
 }
@@ -128,11 +128,7 @@ pub struct Pipeline {
 
 impl Pipeline {
     /// Create a new pipeline
-    pub fn new(
-        source: Box<dyn Source>,
-        sink: Box<dyn Sink>,
-        config: PipelineConfig,
-    ) -> Self {
+    pub fn new(source: Box<dyn Source>, sink: Box<dyn Sink>, config: PipelineConfig) -> Self {
         Self {
             source,
             transforms: Vec::new(),
@@ -172,11 +168,12 @@ impl Pipeline {
         );
 
         // Get estimated total count for progress tracking
-        let total_count = self.source.estimate_count().await?;
+        let _total_count = self.source.estimate_count().await?;
 
         loop {
             // Read batch from source
-            let (batch, new_offset) = self.source
+            let (batch, new_offset) = self
+                .source
                 .read_batch(&current_offset, self.config.batch_size)
                 .await?;
 
@@ -263,7 +260,7 @@ impl Pipeline {
 
         for transform in &self.transforms {
             let mut transformed = Vec::with_capacity(records.len());
-            
+
             for record in records {
                 let result = transform.transform(record)?;
                 transformed.extend(result);
@@ -280,7 +277,8 @@ impl Pipeline {
 mod tests {
     use super::*;
     use crate::pipeline::record::Record;
-    use crate::pipeline::traits::{NoOpTransform, FilterTransform};
+    use crate::pipeline::traits::FilterTransform;
+    use crate::pipeline::WriteResult;
     use async_trait::async_trait;
     use serde_json::json;
 
@@ -312,7 +310,10 @@ mod tests {
         ) -> Result<(RecordBatch, OffsetValue)> {
             let remaining = self.total_records - self.records_generated;
             if remaining == 0 {
-                return Ok((RecordBatch::new(), OffsetValue::DocumentCount(self.records_generated as u64)));
+                return Ok((
+                    RecordBatch::new(),
+                    OffsetValue::DocumentCount(self.records_generated as u64),
+                ));
             }
 
             let count = remaining.min(batch_size);
@@ -349,7 +350,9 @@ mod tests {
 
     impl MockSink {
         fn new() -> Self {
-            Self { records: Vec::new() }
+            Self {
+                records: Vec::new(),
+            }
         }
     }
 
@@ -392,8 +395,8 @@ mod tests {
 
         assert_eq!(stats.records_read, 100);
         assert_eq!(stats.records_written, 100);
-        // Throughput might be 0 if execution is too fast
-        assert!(stats.duration_ms >= 0);
+        // Duration is always >= 0 for u64, just verify it exists
+        assert!(stats.duration_ms < u64::MAX);
     }
 
     #[tokio::test]
@@ -412,7 +415,7 @@ mod tests {
         }));
 
         let mut pipeline = Pipeline::new(source, sink, config).add_transform(transform);
-        
+
         let stats = pipeline.run(OffsetValue::initial()).await.unwrap();
 
         assert_eq!(stats.records_read, 100);
@@ -421,10 +424,10 @@ mod tests {
 
     #[test]
     fn test_pipeline_stats() {
-        let mut stats = PipelineStats {
+        let stats = PipelineStats {
             records_read: 1000,
             bytes_read: 1024 * 1024, // 1 MB
-            duration_ms: 1000, // 1 second
+            duration_ms: 1000,       // 1 second
             ..Default::default()
         };
 

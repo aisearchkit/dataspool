@@ -53,14 +53,13 @@ impl RocksDbStore {
             .iter()
             .map(|&name| {
                 let mut cf_opts = Options::default();
-                
+
                 // Optimize for different CF workloads
                 match name {
                     cf::RAFT => {
                         // Raft CF: sequential writes, range scans
-                        cf_opts.set_prefix_extractor(
-                            rocksdb::SliceTransform::create_fixed_prefix(8)
-                        );
+                        cf_opts
+                            .set_prefix_extractor(rocksdb::SliceTransform::create_fixed_prefix(8));
                     }
                     cf::OFFSET => {
                         // Offset CF: frequent updates
@@ -83,9 +82,9 @@ impl RocksDbStore {
 
     /// Get column family handle
     fn get_cf_handle(&self, cf: ColumnFamily) -> Result<&rocksdb::ColumnFamily> {
-        self.db
-            .cf_handle(cf)
-            .ok_or_else(|| StorageError::DatabaseError(format!("Column family not found: {}", cf)).into())
+        self.db.cf_handle(cf).ok_or_else(|| {
+            StorageError::DatabaseError(format!("Column family not found: {}", cf)).into()
+        })
     }
 }
 
@@ -112,9 +111,10 @@ impl KvStore for RocksDbStore {
         let key = key.to_vec();
 
         let result = task::spawn_blocking(move || {
-            let cf_handle = db.cf_handle(&cf_name)
-                .ok_or_else(|| StorageError::DatabaseError(format!("Column family not found: {}", cf_name)))?;
-            
+            let cf_handle = db.cf_handle(&cf_name).ok_or_else(|| {
+                StorageError::DatabaseError(format!("Column family not found: {}", cf_name))
+            })?;
+
             db.get_cf(cf_handle, &key)
                 .map_err(|e| StorageError::ReadFailed(e.to_string()))
                 .map(|opt| opt.map(Bytes::from))
@@ -145,9 +145,10 @@ impl KvStore for RocksDbStore {
         let value = value.to_vec();
 
         task::spawn_blocking(move || {
-            let cf_handle = db.cf_handle(&cf_name)
-                .ok_or_else(|| StorageError::DatabaseError(format!("Column family not found: {}", cf_name)))?;
-            
+            let cf_handle = db.cf_handle(&cf_name).ok_or_else(|| {
+                StorageError::DatabaseError(format!("Column family not found: {}", cf_name))
+            })?;
+
             db.put_cf(cf_handle, &key, &value)
                 .map_err(|e| StorageError::WriteFailed(e.to_string()).into())
         })
@@ -173,9 +174,10 @@ impl KvStore for RocksDbStore {
         let key = key.to_vec();
 
         task::spawn_blocking(move || {
-            let cf_handle = db.cf_handle(&cf_name)
-                .ok_or_else(|| StorageError::DatabaseError(format!("Column family not found: {}", cf_name)))?;
-            
+            let cf_handle = db.cf_handle(&cf_name).ok_or_else(|| {
+                StorageError::DatabaseError(format!("Column family not found: {}", cf_name))
+            })?;
+
             db.delete_cf(cf_handle, &key)
                 .map_err(|e| StorageError::WriteFailed(e.to_string()).into())
         })
@@ -188,7 +190,8 @@ impl KvStore for RocksDbStore {
         let mut rocksdb_batch = rocksdb::WriteBatch::default();
 
         // Pre-collect CF handles we need
-        let cf_names: Vec<_> = batch.operations()
+        let _cf_names: Vec<_> = batch
+            .operations()
             .iter()
             .filter_map(|op| match op {
                 super::kv::BatchOperation::Put { cf: Some(cf), .. } => Some(*cf),
@@ -233,7 +236,10 @@ impl KvStore for RocksDbStore {
 
         task::spawn_blocking(move || {
             let mut result = Vec::new();
-            let iter = db.iterator(rocksdb::IteratorMode::From(&prefix, rocksdb::Direction::Forward));
+            let iter = db.iterator(rocksdb::IteratorMode::From(
+                &prefix,
+                rocksdb::Direction::Forward,
+            ));
 
             for item in iter {
                 let (key, value) = item.map_err(|e| StorageError::ReadFailed(e.to_string()))?;
@@ -249,19 +255,16 @@ impl KvStore for RocksDbStore {
         .map_err(|e| StorageError::DatabaseError(format!("Task join error: {}", e)))?
     }
 
-    async fn prefix_scan_cf(
-        &self,
-        cf: ColumnFamily,
-        prefix: &[u8],
-    ) -> Result<Vec<(Bytes, Bytes)>> {
+    async fn prefix_scan_cf(&self, cf: ColumnFamily, prefix: &[u8]) -> Result<Vec<(Bytes, Bytes)>> {
         let db = self.db.clone();
         let cf_name = cf.to_string();
         let prefix = prefix.to_vec();
 
         task::spawn_blocking(move || {
-            let cf_handle = db.cf_handle(&cf_name)
-                .ok_or_else(|| StorageError::DatabaseError(format!("Column family not found: {}", cf_name)))?;
-            
+            let cf_handle = db.cf_handle(&cf_name).ok_or_else(|| {
+                StorageError::DatabaseError(format!("Column family not found: {}", cf_name))
+            })?;
+
             let mut result = Vec::new();
             let iter = db.iterator_cf(
                 cf_handle,
@@ -292,7 +295,6 @@ impl KvStore for RocksDbStore {
 }
 
 // Make BatchOperation public for use in RocksDB implementation
-pub(super) use super::kv::BatchOperation;
 
 #[cfg(test)]
 mod tests {
@@ -325,7 +327,10 @@ mod tests {
         let (store, _temp_dir) = create_test_store().await;
 
         // Put in META column family
-        store.put_cf(cf::META, b"task:123", b"task_data").await.unwrap();
+        store
+            .put_cf(cf::META, b"task:123", b"task_data")
+            .await
+            .unwrap();
         let value = store.get_cf(cf::META, b"task:123").await.unwrap();
         assert_eq!(value.unwrap().as_ref(), b"task_data");
 
@@ -345,9 +350,17 @@ mod tests {
 
         store.write_batch(batch).await.unwrap();
 
-        assert_eq!(store.get(b"key1").await.unwrap().unwrap().as_ref(), b"value1");
         assert_eq!(
-            store.get_cf(cf::META, b"key2").await.unwrap().unwrap().as_ref(),
+            store.get(b"key1").await.unwrap().unwrap().as_ref(),
+            b"value1"
+        );
+        assert_eq!(
+            store
+                .get_cf(cf::META, b"key2")
+                .await
+                .unwrap()
+                .unwrap()
+                .as_ref(),
             b"value2"
         );
     }
@@ -371,7 +384,7 @@ mod tests {
         let (store, _temp_dir) = create_test_store().await;
 
         assert!(!store.exists(b"key1").await.unwrap());
-        
+
         store.put(b"key1", b"value1").await.unwrap();
         assert!(store.exists(b"key1").await.unwrap());
 

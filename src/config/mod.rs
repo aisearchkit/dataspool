@@ -220,16 +220,15 @@ impl DatspoolConfig {
     pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self> {
         let content = std::fs::read_to_string(path.as_ref())
             .map_err(|e| ConfigError::LoadFailed(e.to_string()))?;
-        
-        let mut config: Self = serde_yaml::from_str(&content)
-            .map_err(ConfigError::from)?;
-        
+
+        let mut config: Self = serde_yaml::from_str(&content).map_err(ConfigError::from)?;
+
         // Apply environment variable overrides
         config.apply_env_overrides()?;
-        
+
         // Validate configuration
         config.validate()?;
-        
+
         Ok(config)
     }
 
@@ -237,12 +236,14 @@ impl DatspoolConfig {
     fn apply_env_overrides(&mut self) -> Result<()> {
         // Example: DATASPOOL_SERVER_HTTP_PORT overrides server.http_port
         if let Ok(port) = std::env::var("DATASPOOL_SERVER_HTTP_PORT") {
-            self.server.http_port = port.parse()
+            self.server.http_port = port
+                .parse()
                 .map_err(|e| ConfigError::Invalid(format!("Invalid HTTP port: {}", e)))?;
         }
 
         if let Ok(port) = std::env::var("DATASPOOL_SERVER_GRPC_PORT") {
-            self.server.grpc_port = port.parse()
+            self.server.grpc_port = port
+                .parse()
                 .map_err(|e| ConfigError::Invalid(format!("Invalid gRPC port: {}", e)))?;
         }
 
@@ -346,13 +347,13 @@ observability:
   log_level: "debug"
   log_format: "json"
 "#;
-        
+
         let mut file = tempfile::NamedTempFile::new().unwrap();
         file.write_all(yaml.as_bytes()).unwrap();
         file.flush().unwrap();
-        
+
         let config = DatspoolConfig::from_file(file.path()).unwrap();
-        
+
         assert_eq!(config.node.name, "test-node");
         assert_eq!(config.server.grpc_port, 50051);
         assert_eq!(config.cluster.peers.len(), 2);
@@ -391,7 +392,7 @@ observability:
         };
 
         assert!(config.validate().is_err());
-        
+
         config.node.name = "test".to_string();
         assert!(config.validate().is_ok());
     }

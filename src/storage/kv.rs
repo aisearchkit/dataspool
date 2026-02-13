@@ -18,7 +18,7 @@
 
 //! Key-Value storage abstraction layer
 
-use crate::error::{Result, StorageError};
+use crate::error::Result;
 use async_trait::async_trait;
 use bytes::Bytes;
 
@@ -56,11 +56,7 @@ pub trait KvStore: Send + Sync {
     async fn prefix_scan(&self, prefix: &[u8]) -> Result<Vec<(Bytes, Bytes)>>;
 
     /// Create iterator over specific column family with prefix
-    async fn prefix_scan_cf(
-        &self,
-        cf: ColumnFamily,
-        prefix: &[u8],
-    ) -> Result<Vec<(Bytes, Bytes)>>;
+    async fn prefix_scan_cf(&self, cf: ColumnFamily, prefix: &[u8]) -> Result<Vec<(Bytes, Bytes)>>;
 
     /// Check if key exists
     async fn exists(&self, key: &[u8]) -> Result<bool>;
@@ -103,12 +99,7 @@ impl WriteBatch {
     }
 
     /// Add put operation to specific column family
-    pub fn put_cf(
-        &mut self,
-        cf: ColumnFamily,
-        key: impl Into<Bytes>,
-        value: impl Into<Bytes>,
-    ) {
+    pub fn put_cf(&mut self, cf: ColumnFamily, key: impl Into<Bytes>, value: impl Into<Bytes>) {
         self.operations.push(BatchOperation::Put {
             cf: Some(cf),
             key: key.into(),
