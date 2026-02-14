@@ -1,0 +1,116 @@
+# Dataspool Cluster Configuration
+# This file configures both Control Plane and Agent Plane in hybrid mode
+
+# ==================== Node Configuration ====================
+node:
+  # Human-readable node name
+  name: "dataspool-node-1"
+  
+  # Node ID (leave empty for auto-generation based on hostname)
+  # Will be persisted in data directory after first start
+  id: ""
+
+# ==================== Cluster Configuration ====================
+cluster:
+  # List of peer nodes (including this node)
+  # Used for Raft consensus
+  peers:
+    - "192.168.1.10:50051"
+    - "192.168.1.11:50051"
+    - "192.168.1.12:50051"
+  
+  # Raft election timeout (3-6s recommended)
+  election_timeout: "5s"
+  
+  # Raft heartbeat interval (500ms recommended)
+  heartbeat_interval: "500ms"
+
+# ==================== Server Configuration ====================
+server:
+  # gRPC port for inter-node communication
+  grpc_port: 50051
+  
+  # HTTP port for REST API and UI
+  http_port: 8080
+  
+  # Bind address (0.0.0.0 for all interfaces)
+  bind_addr: "0.0.0.0"
+  
+  # TLS configuration (recommended for production)
+  tls:
+    enabled: false
+    cert_file: "/etc/dataspool/certs/server.crt"
+    key_file: "/etc/dataspool/certs/server.key"
+    ca_file: "/etc/dataspool/certs/ca.crt"
+
+# ==================== Agent Configuration ====================
+agent:
+  # Enable agent plane (set to false for control-only nodes)
+  enabled: true
+  
+  # Resource limits
+  resources:
+    # Maximum concurrent shards (default: CPU cores)
+    max_concurrent_tasks: 8
+    
+    # Memory limit in MB (stop accepting shards when exceeded)
+    memory_limit_mb: 4096
+    
+    # Read rate limit in MB/sec (0 = unlimited)
+    read_rate_limit_mb_per_sec: 100
+  
+  # Agent tags for shard assignment filtering
+  tags:
+    - "prod"
+    - "region-us-west"
+
+# ==================== Storage Configuration ====================
+storage:
+  # Data directory for RocksDB, Raft log, and checkpoints
+  data_dir: "/var/lib/dataspool"
+  
+  # Storage engine (rocksdb or sled)
+  engine: "rocksdb"
+
+# ==================== Authentication Configuration ====================
+auth:
+  # JWT secret for API authentication (set via env var in production)
+  jwt_secret: ""  # Use DATASPOOL_JWT_SECRET env var
+  
+  # Token expiration time
+  token_expiry: "24h"
+  
+  # API keys for programmatic access
+  api_keys:
+    # - "key-1-xxxxxxxxxx"
+    # - "key-2-yyyyyyyyyy"
+
+# ==================== Observability Configuration ====================
+observability:
+  # Log level (trace, debug, info, warn, error)
+  log_level: "info"
+  
+  # Log format (json or text)
+  log_format: "json"
+  
+  # Enable Prometheus metrics endpoint
+  metrics_enabled: true
+  
+  # Distributed tracing configuration
+  tracing:
+    enabled: false
+    endpoint: "http://localhost:4317"  # OpenTelemetry collector
+
+# ==================== Environment Variable Overrides ====================
+#
+# Any configuration can be overridden via environment variables using the pattern:
+# DATASPOOL_<PATH_IN_UPPERCASE>
+#
+# Examples:
+#   DATASPOOL_SERVER_HTTP_PORT=9090
+#   DATASPOOL_SERVER_GRPC_PORT=50052
+#   DATASPOOL_JWT_SECRET=your-secret-key
+#   DATASPOOL_AGENT_RESOURCES_MAX_CONCURRENT_TASKS=16
+#   DATASPOOL_OBSERVABILITY_LOG_LEVEL=debug
+#
+# Sensitive values (passwords, secrets) should ALWAYS use env vars, never hardcoded!

@@ -1,0 +1,81 @@
+# Example Task Configuration
+# This file demonstrates how to define a data migration task
+
+# Task metadata
+task:
+  name: "migrate-logs-2024"
+  description: "Migrate application logs from old cluster to new cluster"
+  
+# Source configuration
+source:
+  type: "document"
+  config:
+    urls:
+      - "https://old-cluster.example.com:9200"
+    username: "readonly_user"
+    password: "${ES_SOURCE_PASSWORD}"  # From environment variable
+    index_pattern: "logs-2024-*"
+    query: |
+      {
+        "query": {
+          "range": {
+            "@timestamp": {
+              "gte": "2024-01-01",
+              "lt": "2024-02-01"
+            }
+          }
+        }
+      }
+    batch_size: 5000
+    scroll_timeout: "5m"
+    api_mode: "pit"  # or "scroll" for older versions
+
+# Sink configuration
+sink:
+  type: "document"
+  config:
+    urls:
+      - "https://new-cluster.example.com:9200"
+    username: "admin"
+    password: "${ES_SINK_PASSWORD}"
+    index_name: "logs-2024-migrated"
+    bulk_size: 1000
+    bulk_timeout: "30s"
+    refresh: "false"  # Don't refresh after each bulk
+
+# Optional: Data transformations
+transforms:
+  - type: "rename_field"
+    config:
+      from: "old_field"
+      to: "new_field"
+  
+  - type: "filter"
+    config:
+      condition: "level == 'ERROR' OR level == 'WARN'"
+
+# Sharding strategy
+sharding:
+  strategy: "by_date_range"
+  config:
+    field: "@timestamp"
+    interval: "1d"  # One shard per day
+
+# Resource limits
+resources:
+  max_concurrent_shards: 10
+  memory_limit_mb: 2048
+  read_rate_limit_mb_per_sec: 50
+
+# Retry policy
+retry:
+  max_attempts: 3
+  backoff:
+    strategy: "exponential"
+    initial_delay: "1s"
+    max_delay: "60s"
+
+# Target agent filtering (optional)
+agent_tags:
+  - "region-us-west"
+  - "prod"
