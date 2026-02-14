@@ -20,12 +20,14 @@
 //!
 //! Pluggable driver architecture for different data sources:
 //! - Document stores (ES/OpenSearch/compatible engines)
-//! - Relational databases (MySQL, PostgreSQL) - TODO
+//! - Relational databases (MySQL, PostgreSQL)
 //! - NoSQL databases (MongoDB) - TODO
 //! - Object storage (S3/MinIO snapshots) - TODO
 
 pub mod document;
 pub mod factory;
+pub mod mysql;
 
 pub use document::{DocumentConfig, DocumentSink, DocumentSource};
 pub use factory::{SinkConfig, SourceConfig, TaskConfig, create_sink, create_source};
+pub use mysql::{MysqlConfig, MysqlSink, MysqlSource};
