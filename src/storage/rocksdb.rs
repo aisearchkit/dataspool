@@ -28,6 +28,7 @@ use std::sync::Arc;
 use tokio::task;
 
 /// RocksDB-based storage implementation
+#[derive(Clone)]
 pub struct RocksDbStore {
     db: Arc<DB>,
 }

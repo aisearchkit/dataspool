@@ -131,11 +131,11 @@ mod tests {
     #[test]
     fn test_worker_pool_creation() {
         let dir = tempdir().unwrap();
-        let db = Arc::new(RocksDbStore::open(dir.path()).unwrap());
+        let db = RocksDbStore::open(dir.path()).unwrap();
         let task_store = Arc::new(TaskStore::new(db.clone()));
         
         let index_config = TieredConfig::default();
-        let index_store = Arc::new(RwLock::new(TieredIndexStore::new(index_config, db.clone())));
+        let index_store = Arc::new(RwLock::new(TieredIndexStore::new(index_config, Arc::new(db))));
         
         let pool = WorkerPool::new("node-1".to_string(), 4, task_store, index_store).unwrap();
         assert_eq!(pool.node_id, "node-1");

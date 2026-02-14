@@ -173,11 +173,11 @@ mod tests {
     #[test]
     fn test_executor_creation() {
         let dir = tempdir().unwrap();
-        let db = Arc::new(RocksDbStore::open(dir.path()).unwrap());
+        let db = RocksDbStore::open(dir.path()).unwrap();
         let task_store = Arc::new(TaskStore::new(db.clone()));
         
         let index_config = TieredConfig::default();
-        let index_store = Arc::new(RwLock::new(TieredIndexStore::new(index_config, db.clone())));
+        let index_store = Arc::new(RwLock::new(TieredIndexStore::new(index_config, Arc::new(db))));
         
         let executor = ShardExecutor::new(task_store, index_store);
         assert_eq!(executor.batch_size, 1000);
@@ -186,11 +186,11 @@ mod tests {
     #[tokio::test]
     async fn test_executor_with_batch_size() {
         let dir = tempdir().unwrap();
-        let db = Arc::new(RocksDbStore::open(dir.path()).unwrap());
+        let db = RocksDbStore::open(dir.path()).unwrap();
         let task_store = Arc::new(TaskStore::new(db.clone()));
         
         let index_config = TieredConfig::default();
-        let index_store = Arc::new(RwLock::new(TieredIndexStore::new(index_config, db.clone())));
+        let index_store = Arc::new(RwLock::new(TieredIndexStore::new(index_config, Arc::new(db))));
         
         let executor = ShardExecutor::new(task_store, index_store).with_batch_size(5000);
         assert_eq!(executor.batch_size, 5000);
