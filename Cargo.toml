@@ -73,3 +73,6 @@ tempfile = "3.12"
 
 [build-dependencies]
 tonic-build = "0.12"
+
+# HTTP client for license validation
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
