@@ -11,6 +11,9 @@ use tracing::{info, warn};
 
 use super::{ShardClaimer, ShardExecutor};
 use crate::error::{DatspoolError, Result};
+use crate::storage::index::TieredIndexStore;
+use crate::storage::kv::KvStore;
+use crate::task::store::TaskStore;
 
 /// Resource limits for the worker pool
 #[derive(Debug, Clone)]
@@ -21,17 +24,22 @@ pub struct ResourceLimits {
 }
 
 /// Worker pool that manages concurrent shard execution
-pub struct WorkerPool {
+pub struct WorkerPool<S: KvStore> {
     node_id: String,
     limits: ResourceLimits,
     semaphore: Arc<Semaphore>,
     active_shards: Arc<RwLock<Vec<String>>>,
     claimer: ShardClaimer,
-    executor: ShardExecutor,
+    executor: ShardExecutor<S>,
 }
 
-impl WorkerPool {
-    pub fn new(node_id: String, max_concurrent_tasks: usize) -> Result<Self> {
+impl<S: KvStore + Clone + 'static> WorkerPool<S> {
+    pub fn new(
+        node_id: String,
+        max_concurrent_tasks: usize,
+        task_store: Arc<TaskStore<S>>,
+        index_store: Arc<RwLock<TieredIndexStore<S>>>,
+    ) -> Result<Self> {
         Ok(Self {
             node_id: node_id.clone(),
             limits: ResourceLimits {
@@ -41,7 +49,7 @@ impl WorkerPool {
             semaphore: Arc::new(Semaphore::new(max_concurrent_tasks)),
             active_shards: Arc::new(RwLock::new(Vec::new())),
             claimer: ShardClaimer::new(node_id.clone()),
-            executor: ShardExecutor::new(),
+            executor: ShardExecutor::new(task_store, index_store),
         })
     }
 
@@ -72,7 +80,15 @@ impl WorkerPool {
 
                     tokio::spawn(async move {
                         match executor.execute(&shard_id).await {
-                            Ok(_) => info!("Shard {} completed", shard_id),
+                            Ok(stats) => {
+                                info!(
+                                    "Shard {} completed: {} docs read, {} docs written in {:?}",
+                                    shard_id,
+                                    stats.docs_read,
+                                    stats.docs_written,
+                                    stats.duration()
+                                );
+                            }
                             Err(e) => warn!("Shard {} failed: {}", shard_id, e),
                         }
 
@@ -108,10 +124,20 @@ impl WorkerPool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::rocksdb::RocksDbStore;
+    use crate::storage::index::TieredConfig;
+    use tempfile::tempdir;
 
     #[test]
     fn test_worker_pool_creation() {
-        let pool = WorkerPool::new("node-1".to_string(), 4).unwrap();
+        let dir = tempdir().unwrap();
+        let db = Arc::new(RocksDbStore::open(dir.path()).unwrap());
+        let task_store = Arc::new(TaskStore::new(db.clone()));
+        
+        let index_config = TieredConfig::default();
+        let index_store = Arc::new(RwLock::new(TieredIndexStore::new(index_config, db.clone())));
+        
+        let pool = WorkerPool::new("node-1".to_string(), 4, task_store, index_store).unwrap();
         assert_eq!(pool.node_id, "node-1");
         assert_eq!(pool.limits.max_concurrent_tasks, 4);
     }

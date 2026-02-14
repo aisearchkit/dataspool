@@ -7,9 +7,9 @@
 //! hybrid all-in-one architecture. Tasks are automatically split into shards
 //! for parallel execution across distributed worker pools.
 
-mod meta;
-mod shard;
-mod store;
+pub mod meta;
+pub mod shard;
+pub mod store;
 
 pub use meta::{TaskMeta, TaskPriority};
 pub use shard::{ShardGenerator, ShardMeta, ShardingStrategy};

@@ -9,13 +9,6 @@ mod executor;
 mod shard_claimer;
 mod worker_pool;
 
-pub use executor::ShardExecutor;
+pub use executor::{ShardExecutor, ExecutionStats};
 pub use shard_claimer::ShardClaimer;
-pub use worker_pool::WorkerPool;
-
-use crate::error::Result;
-
-/// Initialize the agent worker pool
-pub async fn init_agent(node_id: String, max_concurrent_tasks: usize) -> Result<WorkerPool> {
-    WorkerPool::new(node_id, max_concurrent_tasks)
-}
+pub use worker_pool::{WorkerPool, ResourceLimits};
