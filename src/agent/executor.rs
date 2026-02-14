@@ -71,27 +71,33 @@ impl<S: KvStore + Clone + 'static> ShardExecutor<S> {
     /// Execute a shard migration
     pub async fn execute(&self, shard_id: &str) -> Result<ExecutionStats> {
         info!("Executing shard: {}", shard_id);
+        
+        // TODO: Implement full shard execution
+        // Current limitation: We need a way to deserialize Source/Sink from shard config
+        // This requires a factory pattern or enum-based dispatch
+        
+        // For now, return placeholder stats
         let stats = ExecutionStats {
             start_time: Some(std::time::Instant::now()),
             end_time: Some(std::time::Instant::now()),
             ..Default::default()
         };
-
-        // TODO: Implement full shard execution
-        // 1. Parse shard_id from string
-        // 2. Load shard metadata from TaskStore  
-        // 3. Create Source/Sink from config
-        // 4. Run pipeline
-        // 5. Update progress
         
-        info!("Shard {} execution placeholder", shard_id);
+        info!("Shard {} execution completed (placeholder)", shard_id);
         
         Ok(stats)
     }
 
-    /// Execute pipeline for a shard (will be used when Source/Sink traits are ready)
+    /// Execute pipeline for a shard (will be used when Source/Sink factory is ready)
+    /// 
+    /// Example usage:
+    /// ```ignore
+    /// let source = create_source_from_config(&shard.source_config)?;
+    /// let sink = create_sink_from_config(&shard.sink_config)?;
+    /// let stats = executor.execute_pipeline_with_instances(&shard, source, sink).await?;
+    /// ```
     #[allow(dead_code)]
-    async fn execute_pipeline(
+    pub async fn execute_pipeline_with_instances(
         &self,
         shard: &ShardMeta,
         source: &mut dyn Source,

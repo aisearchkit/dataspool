@@ -25,3 +25,7 @@
 //! - Object storage (S3/MinIO snapshots) - TODO
 
 pub mod document;
+pub mod factory;
+
+pub use document::{DocumentConfig, DocumentSink, DocumentSource};
+pub use factory::{SinkConfig, SourceConfig, TaskConfig, create_sink, create_source};
