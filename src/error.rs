@@ -114,6 +114,9 @@ pub enum DriverError {
 
     #[error("Data error: {0}")]
     DataError(String),
+    
+    #[error("Feature not supported: {0}")]
+    Unsupported(String),
 
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),

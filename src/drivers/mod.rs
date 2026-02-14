@@ -19,15 +19,16 @@
 //! Data source and sink drivers
 //!
 //! Pluggable driver architecture for different data sources:
-//! - Document stores (ES/OpenSearch/compatible engines)
-//! - Relational databases (MySQL, PostgreSQL)
-//! - NoSQL databases (MongoDB) - TODO
-//! - Object storage (S3/MinIO snapshots) - TODO
+//! - **document**: Document databases (Elasticsearch, OpenSearch)
+//! - **relational**: Relational databases (MySQL, PostgreSQL, SQLite)
+//! - **nosql**: NoSQL databases (MongoDB, Redis - future)
+//! - **streaming**: Streaming platforms (Kafka, Pulsar, AutoMQ - future)
+//! - **object_storage**: Object storage (S3, MinIO, NFS - future)
 
 pub mod document;
 pub mod factory;
-pub mod mysql;
+pub mod relational;
 
 pub use document::{DocumentConfig, DocumentSink, DocumentSource};
-pub use factory::{SinkConfig, SourceConfig, TaskConfig, create_sink, create_source};
-pub use mysql::{MysqlConfig, MysqlSink, MysqlSource};
+pub use factory::{SinkConfig, SourceConfig};
+pub use relational::{DatabaseType, RelationalConfig, RelationalSink, RelationalSource, SslConfig};

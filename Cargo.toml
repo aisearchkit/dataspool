@@ -63,7 +63,7 @@ url = "2.5"
 
 tempfile = "3.12"
 base64 = "0.22.1"
-sqlx = { version = "0.8.6", features = ["runtime-tokio-rustls", "mysql"] }
+sqlx = { version = "0.8.6", features = ["runtime-tokio-rustls", "mysql", "postgres"] }
 
 [dev-dependencies]
 tempfile = "3.12"

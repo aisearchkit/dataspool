@@ -35,7 +35,6 @@ mod sink;
 mod config;
 pub mod local_reader;
 
-pub use source::DocumentSource;
-pub use sink::DocumentSink;
 pub use config::DocumentConfig;
-pub use local_reader::{LocalShardConfig, LocalShardReader};
+pub use sink::DocumentSink;
+pub use source::DocumentSource;

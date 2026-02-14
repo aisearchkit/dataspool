@@ -3,39 +3,43 @@
 // Dataspool - Hybrid-mode data migration and orchestration platform
 // Copyright (C) 2026 Dataspool Contributors
 
-//! MySQL sink implementation (placeholder)
+//! Relational database sink implementation (placeholder)
 
 use async_trait::async_trait;
 
-use super::config::MysqlConfig;
+use super::config::RelationalConfig;
 use crate::error::DatspoolError;
 use crate::pipeline::{RecordBatch, Sink};
 
-/// MySQL data sink (placeholder)
-pub struct MysqlSink {
+/// Relational database data sink (placeholder)
+pub struct RelationalSink {
     #[allow(dead_code)]
-    config: MysqlConfig,
+    config: RelationalConfig,
 }
 
-impl MysqlSink {
-    pub fn new(config: MysqlConfig) -> Result<Self, DatspoolError> {
+impl RelationalSink {
+    pub fn new(config: RelationalConfig) -> Result<Self, DatspoolError> {
         Ok(Self { config })
     }
 }
 
 #[async_trait]
-impl Sink for MysqlSink {
+impl Sink for RelationalSink {
     fn sink_type(&self) -> &str {
-        "mysql"
+        match self.config.db_type {
+            super::config::DatabaseType::Mysql => "relational:mysql",
+            super::config::DatabaseType::Postgresql => "relational:postgresql",
+            super::config::DatabaseType::Sqlite => "relational:sqlite",
+        }
     }
 
     async fn connect(&mut self) -> Result<(), DatspoolError> {
-        // TODO: Implement MySQL sink connection
+        // TODO: Implement relational database sink connection
         Ok(())
     }
 
     async fn write_batch(&mut self, _batch: RecordBatch) -> Result<crate::pipeline::WriteResult, DatspoolError> {
-        // TODO: Implement MySQL sink writes
+        // TODO: Implement relational database sink writes
         Ok(crate::pipeline::WriteResult::success(0, 0))
     }
 

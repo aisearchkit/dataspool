@@ -19,10 +19,15 @@ pub enum SourceConfig {
         #[serde(flatten)]
         config: super::document::DocumentConfig,
     },
+    /// Relational database (MySQL, PostgreSQL, SQLite)
+    Relational {
+        #[serde(flatten)]
+        config: super::relational::RelationalConfig,
+    },
     // Future drivers:
-    // Mysql { config: MysqlConfig },
-    // MongoDB { config: MongoConfig },
-    // Snapshot { config: SnapshotConfig },
+    // NoSql { config: NoSqlConfig }, // MongoDB, Redis, Cassandra
+    // Streaming { config: StreamingConfig }, // Kafka, Pulsar, AutoMQ
+    // ObjectStorage { config: ObjectStorageConfig }, // S3, MinIO, NFS
 }
 
 /// Sink driver type enumeration
@@ -34,9 +39,15 @@ pub enum SinkConfig {
         #[serde(flatten)]
         config: super::document::DocumentConfig,
     },
+    /// Relational database (MySQL, PostgreSQL, SQLite)
+    Relational {
+        #[serde(flatten)]
+        config: super::relational::RelationalConfig,
+    },
     // Future drivers:
-    // Mysql { config: MysqlConfig },
-    // MongoDB { config: MongoConfig },
+    // NoSql { config: NoSqlConfig }, // MongoDB, Redis, Cassandra
+    // Streaming { config: StreamingConfig }, // Kafka, Pulsar, AutoMQ
+    // ObjectStorage { config: ObjectStorageConfig }, // S3, MinIO, NFS
 }
 
 /// Create a Source instance from configuration
@@ -46,9 +57,13 @@ pub fn create_source(config: &SourceConfig) -> Result<Box<dyn Source>> {
             let source = super::document::DocumentSource::new(config.clone());
             Ok(Box::new(source))
         }
+        SourceConfig::Relational { config } => {
+            let source = super::relational::RelationalSource::new(config.clone())?;
+            Ok(Box::new(source))
+        }
         // Future implementations:
-        // SourceConfig::Mysql { config } => Ok(Box::new(MysqlSource::new(config.clone()))),
-        // SourceConfig::MongoDB { config } => Ok(Box::new(MongoSource::new(config.clone()))),
+        // SourceConfig::NoSql { config } => Ok(Box::new(NoSqlSource::new(config.clone())?)),
+        // SourceConfig::Streaming { config } => Ok(Box::new(StreamingSource::new(config.clone())?)),
     }
 }
 
@@ -60,9 +75,13 @@ pub fn create_sink(config: &SinkConfig) -> Result<Box<dyn Sink>> {
             let sink = super::document::DocumentSink::new(config.clone(), config.index.clone());
             Ok(Box::new(sink))
         }
+        SinkConfig::Relational { config } => {
+            let sink = super::relational::RelationalSink::new(config.clone())?;
+            Ok(Box::new(sink))
+        }
         // Future implementations:
-        // SinkConfig::Mysql { config } => Ok(Box::new(MysqlSink::new(config.clone()))),
-        // SinkConfig::MongoDB { config } => Ok(Box::new(MongoSink::new(config.clone()))),
+        // SinkConfig::NoSql { config } => Ok(Box::new(NoSqlSink::new(config.clone())?)),
+        // SinkConfig::Streaming { config } => Ok(Box::new(StreamingSink::new(config.clone())?)),
     }
 }
 
@@ -124,6 +143,7 @@ mod tests {
                 assert_eq!(config.urls, vec!["http://localhost:9200"]);
                 assert_eq!(config.index, "test-index");
             }
+            _ => panic!("Expected Document config"),
         }
     }
 
