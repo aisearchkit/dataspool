@@ -9,6 +9,7 @@ use std::sync::Arc;
 use tracing::{debug, info, warn};
 
 use crate::error::{DatspoolError, Result};
+use crate::raft::{Command, RaftNode};
 use crate::storage::kv::KvStore;
 use crate::task::store::TaskStore;
 use crate::types::{NodeId, ShardId, ShardState};
@@ -17,6 +18,7 @@ use crate::types::{NodeId, ShardId, ShardState};
 pub struct ShardClaimer<S: KvStore> {
     node_id: NodeId,
     task_store: Arc<TaskStore<S>>,
+    raft: Option<Arc<tokio::sync::Mutex<RaftNode<S>>>>, // Optional for single-node mode
     max_attempts: usize,
 }
 
@@ -25,6 +27,7 @@ impl<S: KvStore + Clone + 'static> Clone for ShardClaimer<S> {
         Self {
             node_id: self.node_id.clone(),
             task_store: self.task_store.clone(),
+            raft: self.raft.clone(),
             max_attempts: self.max_attempts,
         }
     }
@@ -35,7 +38,22 @@ impl<S: KvStore + Clone + 'static> ShardClaimer<S> {
         Self {
             node_id: NodeId::new(node_id),
             task_store,
+            raft: None, // Single-node mode without Raft
             max_attempts: 10, // Try up to 10 shards before giving up
+        }
+    }
+
+    /// Create with Raft integration for multi-node clusters
+    pub fn with_raft(
+        node_id: String,
+        task_store: Arc<TaskStore<S>>,
+        raft: Arc<tokio::sync::Mutex<RaftNode<S>>>,
+    ) -> Self {
+        Self {
+            node_id: NodeId::new(node_id),
+            task_store,
+            raft: Some(raft),
+            max_attempts: 10,
         }
     }
 
@@ -112,14 +130,6 @@ impl<S: KvStore + Clone + 'static> ShardClaimer<S> {
     ///
     /// Returns Ok(true) if successfully claimed, Ok(false) if already claimed
     async fn try_claim_shard(&self, shard_id: &ShardId) -> Result<bool> {
-        // TODO: Integrate with Raft for atomic CAS operation
-        // For now, we'll use a simple state transition in TaskStore
-        // In production, this should be:
-        // 1. Propose ClaimShard command to Raft
-        // 2. Wait for commit
-        // 3. Apply state machine update
-        // 4. Return success/failure
-
         // Load current shard state
         let shard = self.task_store.get_shard(shard_id).await?
             .ok_or_else(|| DatspoolError::Internal(format!("Shard not found: {}", shard_id)))?;
@@ -130,16 +140,72 @@ impl<S: KvStore + Clone + 'static> ShardClaimer<S> {
             return Ok(false);
         }
 
-        // Try to transition to Running
-        // In real implementation, this would be an atomic Raft proposal
+        // Use Raft if available, otherwise fallback to direct update
+        if let Some(raft) = &self.raft {
+            // Atomic CAS via Raft consensus
+            self.try_claim_via_raft(raft, shard_id).await
+        } else {
+            // Fallback: Direct update (NOT atomic in multi-node!)
+            self.try_claim_direct(shard_id).await
+        }
+    }
+
+    /// Claim shard via Raft propose (atomic, multi-node safe)
+    async fn try_claim_via_raft(
+        &self,
+        raft: &Arc<tokio::sync::Mutex<RaftNode<S>>>,
+        shard_id: &ShardId,
+    ) -> Result<bool> {
+        // Serialize expected state
+        let expected_state = serde_json::to_string(&ShardState::Pending)
+            .map_err(|e| DatspoolError::Serialization(e.to_string()))?;
+
+        // Create ClaimShard command
+        let cmd = Command::ClaimShard {
+            shard_id: shard_id.to_string(),
+            node_id: self.node_id.to_string(),
+            expected_state,
+        };
+
+        // Propose to Raft (will be replicated and applied)
+        let mut raft_locked = raft.lock().await;
+        match raft_locked.propose(cmd).await {
+            Ok(()) => {
+                info!("Raft proposal accepted for shard {}", shard_id);
+                
+                // Verify state changed to Running
+                // (In production, we'd check the proposal result directly)
+                drop(raft_locked); // Release lock before querying
+                let shard = self.task_store.get_shard(shard_id).await?
+                    .ok_or_else(|| DatspoolError::Internal("Shard disappeared".to_string()))?;
+                
+                Ok(matches!(shard.state, ShardState::Running { .. }))
+            }
+            Err(e) => {
+                warn!("Raft proposal failed for shard {}: {}", shard_id, e);
+                Ok(false) // CAS failed (likely already claimed)
+            }
+        }
+    }
+
+    /// Claim shard directly (NOT atomic, single-node only)
+    async fn try_claim_direct(&self, shard_id: &ShardId) -> Result<bool> {
         let now = chrono::Utc::now();
         let new_state = ShardState::Running {
             node_id: self.node_id.clone(),
             started_at: now,
         };
 
+        // Load shard again to minimize race window
+        let shard = self.task_store.get_shard(shard_id).await?
+            .ok_or_else(|| DatspoolError::Internal("Shard disappeared".to_string()))?;
+
+        // Double-check still pending
+        if !matches!(shard.state, ShardState::Pending) {
+            return Ok(false);
+        }
+
         // Update shard state (this is NOT atomic without Raft!)
-        // TODO: Replace with Raft CAS operation
         let mut updated_shard = shard.clone();
         updated_shard.state = new_state;
         updated_shard.updated_at = std::time::SystemTime::now();
