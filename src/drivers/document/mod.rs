@@ -28,11 +28,14 @@
 //! - Scroll API and Point-in-Time support
 //! - Bulk API for efficient writes
 //! - Configurable batch sizes and timeouts
+//! - Local shard reader for zero-network overhead (when colocated)
 
 mod source;
 mod sink;
 mod config;
+pub mod local_reader;
 
 pub use source::DocumentSource;
 pub use sink::DocumentSink;
 pub use config::DocumentConfig;
+pub use local_reader::{LocalShardConfig, LocalShardReader};
