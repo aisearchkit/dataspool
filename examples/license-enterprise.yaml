@@ -1,0 +1,44 @@
+# Dataspool License File Example
+#
+# This file demonstrates the license format for Dataspool.
+# In production, this should be encrypted and signed with RSA-2048.
+
+# License Metadata
+license_id: "ENT-2026-ACME-0001"
+organization: "Acme Corporation"
+tier: enterprise
+license_type: subscription
+
+# Licensed Features
+features:
+  - document_migration
+  - relational_migration
+  - streaming_migration
+  - no_sql_migration
+  - object_storage_migration
+  - local_shard_reader
+  - advanced_transforms
+  - multi_tenancy
+  - high_availability
+  - priority_support
+
+# Validity Period
+issued_at: "2026-01-01T00:00:00Z"
+expires_at: "2027-01-01T00:00:00Z"  # Annual renewal
+
+# Resource Limits
+max_nodes: 10          # Up to 10 nodes in cluster
+max_tasks_per_day: null  # Unlimited tasks
+
+# Node-locking (optional)
+# hardware_id: "SHA256:1234567890abcdef..."  # Uncomment for node-locked license
+
+# Signature (for production)
+# signature: "RSA2048:base64encoded..."
+
+# Additional Metadata
+metadata:
+  sales_order: "SO-2026-001"
+  account_manager: "sales@dataspool.io"
+  support_level: "platinum"
+  sla_response_time: "1h"

@@ -8,6 +8,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::error::{DatspoolError, Result};
+use crate::license::{Feature, LicenseManager};
 use crate::pipeline::{Sink, Source};
 
 /// Source driver type enumeration
@@ -51,7 +52,29 @@ pub enum SinkConfig {
 }
 
 /// Create a Source instance from configuration
+/// 
+/// **License Enforcement**: Checks if the requested driver is licensed
 pub fn create_source(config: &SourceConfig) -> Result<Box<dyn Source>> {
+    create_source_with_license(config, None)
+}
+
+/// Create a Source with explicit license manager
+pub fn create_source_with_license(
+    config: &SourceConfig,
+    license_manager: Option<&LicenseManager>,
+) -> Result<Box<dyn Source>> {
+    // Check license for the requested feature
+    if let Some(manager) = license_manager {
+        let feature = match config {
+            SourceConfig::Document { .. } => Feature::DocumentMigration,
+            SourceConfig::Relational { .. } => Feature::RelationalMigration,
+        };
+
+        manager.check_feature(feature).map_err(|e| {
+            DatspoolError::Configuration(format!("License check failed: {}", e))
+        })?;
+    }
+
     match config {
         SourceConfig::Document { config } => {
             let source = super::document::DocumentSource::new(config.clone());
@@ -61,17 +84,35 @@ pub fn create_source(config: &SourceConfig) -> Result<Box<dyn Source>> {
             let source = super::relational::RelationalSource::new(config.clone())?;
             Ok(Box::new(source))
         }
-        // Future implementations:
-        // SourceConfig::NoSql { config } => Ok(Box::new(NoSqlSource::new(config.clone())?)),
-        // SourceConfig::Streaming { config } => Ok(Box::new(StreamingSource::new(config.clone())?)),
     }
 }
 
 /// Create a Sink instance from configuration
+///
+/// **License Enforcement**: Checks if the requested driver is licensed
 pub fn create_sink(config: &SinkConfig) -> Result<Box<dyn Sink>> {
+    create_sink_with_license(config, None)
+}
+
+/// Create a Sink with explicit license manager
+pub fn create_sink_with_license(
+    config: &SinkConfig,
+    license_manager: Option<&LicenseManager>,
+) -> Result<Box<dyn Sink>> {
+    // Check license for the requested feature
+    if let Some(manager) = license_manager {
+        let feature = match config {
+            SinkConfig::Document { .. } => Feature::DocumentMigration,
+            SinkConfig::Relational { .. } => Feature::RelationalMigration,
+        };
+
+        manager.check_feature(feature).map_err(|e| {
+            DatspoolError::Configuration(format!("License check failed: {}", e))
+        })?;
+    }
+
     match config {
         SinkConfig::Document { config } => {
-            // Use the index from config as target_index
             let sink = super::document::DocumentSink::new(config.clone(), config.index.clone());
             Ok(Box::new(sink))
         }
@@ -79,9 +120,6 @@ pub fn create_sink(config: &SinkConfig) -> Result<Box<dyn Sink>> {
             let sink = super::relational::RelationalSink::new(config.clone())?;
             Ok(Box::new(sink))
         }
-        // Future implementations:
-        // SinkConfig::NoSql { config } => Ok(Box::new(NoSqlSink::new(config.clone())?)),
-        // SinkConfig::Streaming { config } => Ok(Box::new(StreamingSink::new(config.clone())?)),
     }
 }
 

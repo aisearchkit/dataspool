@@ -22,6 +22,9 @@ use thiserror::Error;
 #[derive(Error, Debug)]
 pub enum DatspoolError {
     #[error("Configuration error: {0}")]
+    Configuration(String),
+
+    #[error("Config parsing: {0}")]
     Config(#[from] ConfigError),
 
     #[error("Storage error: {0}")]
@@ -111,6 +114,9 @@ pub enum DriverError {
 
     #[error("Invalid query: {0}")]
     InvalidQuery(String),
+    
+    #[error("Query execution failed: {0}")]
+    QueryError(String),
 
     #[error("Data error: {0}")]
     DataError(String),

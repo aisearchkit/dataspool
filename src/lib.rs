@@ -27,6 +27,7 @@ pub mod comms;
 pub mod config;
 pub mod drivers;
 pub mod error;
+pub mod license;
 pub mod pipeline;
 pub mod raft;
 pub mod storage;

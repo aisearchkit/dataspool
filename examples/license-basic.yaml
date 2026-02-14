@@ -1,0 +1,26 @@
+# Dataspool Basic License
+#
+# Commercial license with relational database support
+
+license_id: "BASIC-2026-STARTUP-001"
+organization: "Startup Inc"
+tier: basic
+license_type: perpetual  # One-time purchase
+
+# Basic tier features
+features:
+  - document_migration    # Elasticsearch/OpenSearch
+  - relational_migration  # MySQL/PostgreSQL
+
+# Perpetual license (no expiration)
+issued_at: "2026-02-01T00:00:00Z"
+expires_at: null  # Never expires
+
+# Basic tier limits
+max_nodes: 3
+max_tasks_per_day: 500
+
+metadata:
+  purchase_date: "2026-02-01"
+  license_key: "BASIC-ABCD-EFGH-IJKL"
+  support_level: "community"  # Forum support only
