@@ -29,7 +29,7 @@ pub struct WorkerPool<S: KvStore> {
     limits: ResourceLimits,
     semaphore: Arc<Semaphore>,
     active_shards: Arc<RwLock<Vec<String>>>,
-    claimer: ShardClaimer,
+    claimer: ShardClaimer<S>,
     executor: ShardExecutor<S>,
 }
 
@@ -48,7 +48,7 @@ impl<S: KvStore + Clone + 'static> WorkerPool<S> {
             },
             semaphore: Arc::new(Semaphore::new(max_concurrent_tasks)),
             active_shards: Arc::new(RwLock::new(Vec::new())),
-            claimer: ShardClaimer::new(node_id.clone()),
+            claimer: ShardClaimer::new(node_id.clone(), task_store.clone()),
             executor: ShardExecutor::new(task_store, index_store),
         })
     }
