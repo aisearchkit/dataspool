@@ -19,7 +19,7 @@
 //! Document store sink implementation
 
 use super::config::DocumentConfig;
-use crate::error::{Error, Result};
+use crate::error::{DriverError, Result};
 use crate::pipeline::{RecordBatch, Sink, WriteResult};
 use async_trait::async_trait;
 use reqwest::{Client, ClientBuilder};
@@ -53,16 +53,25 @@ impl DocumentSink {
             .timeout(self.config.timeout())
             .danger_accept_invalid_certs(!self.config.verify_ssl);
 
-        // Basic auth
-        if let (Some(ref username), Some(ref password)) =
-            (&self.config.username, &self.config.password)
-        {
-            builder = builder.basic_auth(username, Some(password));
+        // Add Basic Auth as default header if configured
+        if let (Some(username), Some(password)) = (&self.config.username, &self.config.password) {
+            use base64::Engine;
+            let credentials = format!("{}:{}", username, password);
+            let encoded = base64::engine::general_purpose::STANDARD.encode(credentials.as_bytes());
+            
+            let mut headers = reqwest::header::HeaderMap::new();
+            let auth_value = format!("Basic {}", encoded);
+            headers.insert(
+                reqwest::header::AUTHORIZATION,
+                reqwest::header::HeaderValue::from_str(&auth_value)
+                    .map_err(|e| DriverError::ConnectionFailed(format!("Invalid auth header: {}", e)))?
+            );
+            builder = builder.default_headers(headers);
         }
 
         builder
             .build()
-            .map_err(|e| Error::Connection(format!("Failed to build HTTP client: {}", e)))
+            .map_err(|e| DriverError::ConnectionFailed(format!("Failed to build HTTP client: {}", e)).into())
     }
 
     /// Build bulk request body in NDJSON format
@@ -149,7 +158,7 @@ impl Sink for DocumentSink {
 
         let urls = self.config.parse_urls()?;
         if urls.is_empty() {
-            return Err(Error::Config("No document store URLs provided".to_string()));
+            return Err(DriverError::DataError("No document store URLs provided".to_string()).into());
         }
 
         self.base_url = urls[0].as_str().trim_end_matches('/').to_string();
@@ -162,13 +171,13 @@ impl Sink for DocumentSink {
             .get(&url)
             .send()
             .await
-            .map_err(|e| Error::Connection(format!("Failed to connect: {}", e)))?;
+            .map_err(|e| DriverError::ConnectionFailed(format!("Failed to connect: {}", e)))?;
 
         if !response.status().is_success() {
-            return Err(Error::Connection(format!(
+            return Err(DriverError::ConnectionFailed(format!(
                 "Connection failed: HTTP {}",
                 response.status()
-            )));
+            )).into());
         }
 
         self.client = Some(client);
@@ -181,7 +190,7 @@ impl Sink for DocumentSink {
         let client = self
             .client
             .as_ref()
-            .ok_or_else(|| Error::Connection("Not connected to document store".to_string()))?;
+            .ok_or_else(|| DriverError::ConnectionFailed("Not connected to document store".to_string()))?;
 
         if batch.is_empty() {
             return Ok(WriteResult::success(0, 0));
@@ -203,19 +212,19 @@ impl Sink for DocumentSink {
             .body(body)
             .send()
             .await
-            .map_err(|e| Error::DataSink(format!("Bulk request failed: {}", e)))?;
+            .map_err(|e| DriverError::DataError(format!("Bulk request failed: {}", e)))?;
 
         if !response.status().is_success() {
-            return Err(Error::DataSink(format!(
+            return Err(DriverError::DataError(format!(
                 "Bulk API failed: HTTP {}",
                 response.status()
-            )));
+            )).into());
         }
 
         let response_body: Value = response
             .json()
             .await
-            .map_err(|e| Error::DataSink(format!("Failed to parse bulk response: {}", e)))?;
+            .map_err(|e| DriverError::DataError(format!("Failed to parse bulk response: {}", e)))?;
 
         // Parse response
         let mut result = self.parse_bulk_response(&response_body, batch_size);

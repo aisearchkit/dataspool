@@ -25,6 +25,7 @@
 pub mod agent;
 pub mod comms;
 pub mod config;
+pub mod drivers;
 pub mod error;
 pub mod pipeline;
 pub mod raft;

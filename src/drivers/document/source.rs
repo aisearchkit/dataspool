@@ -19,7 +19,7 @@
 //! Document store source implementation
 
 use super::config::DocumentConfig;
-use crate::error::{Error, Result};
+use crate::error::{DatspoolError, DriverError, Result};
 use crate::pipeline::{OffsetValue, Record, RecordBatch, Source};
 use async_trait::async_trait;
 use reqwest::{Client, ClientBuilder};
@@ -83,16 +83,25 @@ impl DocumentSource {
             .timeout(self.config.timeout())
             .danger_accept_invalid_certs(!self.config.verify_ssl);
 
-        // Basic auth
-        if let (Some(ref username), Some(ref password)) =
-            (&self.config.username, &self.config.password)
-        {
-            builder = builder.basic_auth(username, Some(password));
+        // Add Basic Auth as default header if configured
+        if let (Some(username), Some(password)) = (&self.config.username, &self.config.password) {
+            use base64::Engine;
+            let credentials = format!("{}:{}", username, password);
+            let encoded = base64::engine::general_purpose::STANDARD.encode(credentials.as_bytes());
+            
+            let mut headers = reqwest::header::HeaderMap::new();
+            let auth_value = format!("Basic {}", encoded);
+            headers.insert(
+                reqwest::header::AUTHORIZATION,
+                reqwest::header::HeaderValue::from_str(&auth_value)
+                    .map_err(|e| DriverError::ConnectionFailed(format!("Invalid auth header: {}", e)))?
+            );
+            builder = builder.default_headers(headers);
         }
 
         builder
             .build()
-            .map_err(|e| Error::Connection(format!("Failed to build HTTP client: {}", e)))
+            .map_err(|e| DriverError::ConnectionFailed(format!("Failed to build HTTP client: {}", e)).into())
     }
 
     /// Detect version and select API mode
@@ -108,23 +117,23 @@ impl DocumentSource {
             .get(&url)
             .send()
             .await
-            .map_err(|e| Error::Connection(format!("Failed to connect: {}", e)))?;
+            .map_err(|e| DriverError::ConnectionFailed(format!("Failed to connect: {}", e)))?;
 
         if !response.status().is_success() {
-            return Err(Error::Connection(format!(
+            return Err(DriverError::ConnectionFailed(format!(
                 "Failed to get cluster info: HTTP {}",
                 response.status()
-            )));
+            )).into());
         }
 
         let body: Value = response
             .json()
             .await
-            .map_err(|e| Error::DataSource(format!("Failed to parse cluster info: {}", e)))?;
+            .map_err(|e| DriverError::DataError(format!("Failed to parse cluster info: {}", e)))?;
 
         let version_str = body["version"]["number"]
             .as_str()
-            .ok_or_else(|| Error::DataSource("Cannot detect version".to_string()))?;
+            .ok_or_else(|| DriverError::DataError("Cannot detect version".to_string()))?;
 
         info!("Detected version: {}", version_str);
 
@@ -179,23 +188,23 @@ impl DocumentSource {
             .json(&search_body)
             .send()
             .await
-            .map_err(|e| Error::DataSource(format!("Failed to init scroll: {}", e)))?;
+            .map_err(|e| DriverError::DataError(format!("Failed to init scroll: {}", e)))?;
 
         if !response.status().is_success() {
-            return Err(Error::DataSource(format!(
+            return Err(DriverError::DataError(format!(
                 "Scroll init failed: HTTP {}",
                 response.status()
-            )));
+            )).into());
         }
 
         let body: Value = response
             .json()
             .await
-            .map_err(|e| Error::DataSource(format!("Failed to parse scroll response: {}", e)))?;
+            .map_err(|e| DriverError::DataError(format!("Failed to parse scroll response: {}", e)))?;
 
         let scroll_id = body["_scroll_id"]
             .as_str()
-            .ok_or_else(|| Error::DataSource("No _scroll_id in response".to_string()))?
+            .ok_or_else(|| DriverError::DataError("No _scroll_id in response".to_string()))?
             .to_string();
 
         // Extract total count
@@ -228,19 +237,19 @@ impl DocumentSource {
             }))
             .send()
             .await
-            .map_err(|e| Error::DataSource(format!("Failed to continue scroll: {}", e)))?;
+            .map_err(|e| DriverError::DataError(format!("Failed to continue scroll: {}", e)))?;
 
         if !response.status().is_success() {
-            return Err(Error::DataSource(format!(
+            return Err(DriverError::DataError(format!(
                 "Scroll continuation failed: HTTP {}",
                 response.status()
-            )));
+            )).into());
         }
 
         response
             .json()
             .await
-            .map_err(|e| Error::DataSource(format!("Failed to parse scroll response: {}", e)))
+            .map_err(|e| DriverError::DataError(format!("Failed to parse scroll response: {}", e)).into())
     }
 
     /// Clear scroll context
@@ -270,23 +279,23 @@ impl DocumentSource {
             .post(&url)
             .send()
             .await
-            .map_err(|e| Error::DataSource(format!("Failed to open PIT: {}", e)))?;
+            .map_err(|e| DriverError::DataError(format!("Failed to open PIT: {}", e)))?;
 
         if !response.status().is_success() {
-            return Err(Error::DataSource(format!(
+            return Err(DriverError::DataError(format!(
                 "PIT open failed: HTTP {}",
                 response.status()
-            )));
+            )).into());
         }
 
         let body: Value = response
             .json()
             .await
-            .map_err(|e| Error::DataSource(format!("Failed to parse PIT response: {}", e)))?;
+            .map_err(|e| DriverError::DataError(format!("Failed to parse PIT response: {}", e)))?;
 
         let pit_id = body["id"]
             .as_str()
-            .ok_or_else(|| Error::DataSource("No PIT id in response".to_string()))?
+            .ok_or_else(|| DriverError::DataError("No PIT id in response".to_string()))?
             .to_string();
 
         info!("Opened PIT: {}", pit_id);
@@ -313,19 +322,19 @@ impl DocumentSource {
             .json(&search_body)
             .send()
             .await
-            .map_err(|e| Error::DataSource(format!("Failed to search with PIT: {}", e)))?;
+            .map_err(|e| DriverError::DataError(format!("Failed to search with PIT: {}", e)))?;
 
         if !response.status().is_success() {
-            return Err(Error::DataSource(format!(
+            return Err(DriverError::DataError(format!(
                 "PIT search failed: HTTP {}",
                 response.status()
-            )));
+            )).into());
         }
 
         let body: Value = response
-            .json()
+            .json::<Value>()
             .await
-            .map_err(|e| Error::DataSource(format!("Failed to parse search response: {}", e)))?;
+            .map_err(|e| DatspoolError::Driver(DriverError::DataError(format!("Failed to parse search response: {}", e))))?;
 
         // Extract total count
         let total = body["hits"]["total"]["value"]
@@ -377,19 +386,19 @@ impl DocumentSource {
             .json(&search_body)
             .send()
             .await
-            .map_err(|e| Error::DataSource(format!("Failed to search with PIT: {}", e)))?;
+            .map_err(|e| DriverError::DataError(format!("Failed to search with PIT: {}", e)))?;
 
         if !response.status().is_success() {
-            return Err(Error::DataSource(format!(
+            return Err(DriverError::DataError(format!(
                 "PIT search failed: HTTP {}",
                 response.status()
-            )));
+            )).into());
         }
 
         response
             .json()
             .await
-            .map_err(|e| Error::DataSource(format!("Failed to parse search response: {}", e)))
+            .map_err(|e| DriverError::DataError(format!("Failed to parse search response: {}", e)).into())
     }
 
     /// Close PIT
@@ -410,7 +419,7 @@ impl DocumentSource {
     fn parse_hits(&self, hits: &Value) -> Result<RecordBatch> {
         let hits_array = hits["hits"]
             .as_array()
-            .ok_or_else(|| Error::DataSource("No hits array in response".to_string()))?;
+            .ok_or_else(|| DriverError::DataError("No hits array in response".to_string()))?;
 
         let mut batch = RecordBatch::with_capacity(hits_array.len());
 
@@ -444,44 +453,7 @@ impl DocumentSource {
     }
 }
 
-#[async_trait]
-impl Source for DocumentSource {
-    async fn connect(&mut self) -> Result<()> {
-        info!("Connecting to document store: {:?}", self.config.urls);
-
-        let urls = self.config.parse_urls()?;
-        if urls.is_empty() {
-            return Err(Error::Config("No document store URLs provided".to_string()));
-        }
-
-        self.base_url = urls[0].as_str().trim_end_matches('/').to_string();
-
-        let client = self.build_client()?;
-
-        // Detect API mode
-        self.api_mode = self.detect_api_mode(&client, &self.base_url).await?;
-
-        self.client = Some(client);
-
-        Ok(())
-    }
-
-    async fn read_batch(
-        &mut self,
-        offset: &OffsetValue,
-        _batch_size: usize,
-    ) -> Result<(RecordBatch, OffsetValue)> {
-        let client = self
-            .client
-            .as_ref()
-            .ok_or_else(|| Error::Connection("Not connected to document store".to_string()))?;
-
-        match self.api_mode {
-            ApiMode::PointInTime => self.read_batch_pit(client).await,
-            ApiMode::Scroll => self.read_batch_scroll(client).await,
-        }
-    }
-
+impl DocumentSource {
     /// Read batch using PIT API
     async fn read_batch_pit(&mut self, client: &Client) -> Result<(RecordBatch, OffsetValue)> {
         // Initialize PIT if first read
@@ -493,7 +465,7 @@ impl Source for DocumentSource {
         let pit_state = self
             .pit_state
             .as_ref()
-            .ok_or_else(|| Error::DataSource("No PIT state".to_string()))?;
+            .ok_or_else(|| DriverError::DataError("No PIT state".to_string()))?;
 
         // Search with PIT
         let body = self
@@ -544,7 +516,7 @@ impl Source for DocumentSource {
         let scroll_state = self
             .scroll_state
             .as_ref()
-            .ok_or_else(|| Error::DataSource("No scroll state".to_string()))?;
+            .ok_or_else(|| DriverError::DataError("No scroll state".to_string()))?;
 
         // Continue scroll
         let body = self
@@ -570,6 +542,46 @@ impl Source for DocumentSource {
         );
 
         Ok((batch, new_offset))
+    }
+}
+
+#[async_trait]
+impl Source for DocumentSource {
+    async fn connect(&mut self) -> Result<()> {
+        info!("Connecting to document store: {:?}", self.config.urls);
+
+        let urls = self.config.parse_urls()?;
+        if urls.is_empty() {
+            return Err(DriverError::DataError("No document store URLs provided".to_string()).into());
+        }
+
+        self.base_url = urls[0].as_str().trim_end_matches('/').to_string();
+
+        let client = self.build_client()?;
+
+        // Detect API mode
+        let base_url = self.base_url.clone();
+        self.api_mode = self.detect_api_mode(&client, &base_url).await?;
+
+        self.client = Some(client);
+
+        Ok(())
+    }
+
+    async fn read_batch(
+        &mut self,
+        _offset: &OffsetValue,
+        _batch_size: usize,
+    ) -> Result<(RecordBatch, OffsetValue)> {
+        let client = self
+            .client
+            .clone()
+            .ok_or_else(|| DriverError::ConnectionFailed("Not connected to document store".to_string()))?;
+
+        match self.api_mode {
+            ApiMode::PointInTime => self.read_batch_pit(&client).await,
+            ApiMode::Scroll => self.read_batch_scroll(&client).await,
+        }
     }
 
     async fn estimate_count(&self) -> Result<Option<u64>> {
