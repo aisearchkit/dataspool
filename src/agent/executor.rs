@@ -142,6 +142,16 @@ impl<S: KvStore + Clone + 'static> ShardExecutor<S> {
             // Update offset
             offset = new_offset.clone();
 
+            // Checkpoint offset periodically
+            if stats.docs_read % 10_000 == 0 {
+                if let Err(e) = self.checkpoint_offset(&shard.shard_id, &offset, stats.docs_read).await {
+                    warn!("Failed to checkpoint offset for shard {}: {}", shard.shard_id, e);
+                    // Continue execution even if checkpoint fails
+                } else {
+                    info!("Checkpointed shard {} at {} docs", shard.shard_id, stats.docs_read);
+                }
+            }
+
             // Report progress periodically (every 10 batches)
             if stats.docs_read % (self.batch_size as u64 * 10) == 0 {
                 info!(
@@ -149,8 +159,6 @@ impl<S: KvStore + Clone + 'static> ShardExecutor<S> {
                     shard.shard_id, stats.docs_read, stats.docs_written, stats.docs_indexed
                 );
             }
-
-            // TODO: Checkpoint offset to TaskStore periodically
         }
 
         // Close connections
@@ -166,6 +174,32 @@ impl<S: KvStore + Clone + 'static> ShardExecutor<S> {
         // For now, we don't index individual documents
         // TODO: Implement chunking and batch indexing when needed
         // This would require task_id and chunk_id from shard metadata
+        Ok(())
+    }
+
+    /// Checkpoint shard progress (offset + record count)
+    async fn checkpoint_offset(
+        &self,
+        shard_id: &crate::types::ShardId,
+        offset: &crate::pipeline::OffsetValue,
+        processed_records: u64,
+    ) -> Result<()> {
+        use crate::types::ShardId;
+        
+        // Load current shard
+        let mut shard = self.task_store
+            .get_shard(shard_id)
+            .await?
+            .ok_or_else(|| crate::error::DatspoolError::Internal(
+                format!("Shard {} not found", shard_id)
+            ))?;
+        
+        // Update progress
+        shard.update_progress(processed_records, 0, offset.clone());
+        
+        // Save to TaskStore
+        self.task_store.save_shard(&shard).await?;
+        
         Ok(())
     }
 }
