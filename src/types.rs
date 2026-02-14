@@ -88,9 +88,17 @@ impl fmt::Display for ShardId {
     }
 }
 
+impl std::str::FromStr for ShardId {
+    type Err = uuid::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(Self(Uuid::parse_str(s)?))
+    }
+}
+
 /// Unique identifier for a node
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, PartialOrd, Ord)]
-pub struct NodeId(String);
+pub struct NodeId(pub String);
 
 impl NodeId {
     pub fn new(id: impl Into<String>) -> Self {

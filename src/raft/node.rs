@@ -19,7 +19,7 @@ pub struct RaftNode<S: KvStore> {
     network: RaftNetwork,
 }
 
-impl<S: KvStore> RaftNode<S> {
+impl<S: KvStore + Clone> RaftNode<S> {
     pub fn new(node_id: String, store: S) -> Self {
         Self {
             node_id: node_id.clone(),
