@@ -50,7 +50,7 @@ humantime-serde = "1.1"
 # Utilities
 uuid = { version = "1.10", features = ["v4", "serde"] }
 bytes = "1.7"
-parking_lot = "0.12"
+parking_lot = "0.13"
 num_cpus = "1.16"
 hostname = "0.4"
 tempfile = "3.12"
