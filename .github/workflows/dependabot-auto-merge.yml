@@ -16,31 +16,29 @@ concurrency:
 
 jobs:
   merge-after-ci:
-    name: Merge Dependabot update after CI succeeds
+    name: Merge CI dependency update after full CI succeeds
     if: >-
       github.event.pull_request.user.login == 'dependabot[bot]' &&
       github.event.pull_request.draft == false
     runs-on: ubuntu-latest
     timeout-minutes: 240
     steps:
-      - name: Read Dependabot update metadata
-        id: metadata
-        uses: dependabot/fetch-metadata@v2
-        with:
-          github-token: "${{ secrets.GITHUB_TOKEN }}"
-
-      - name: Wait for the complete CI matrix and squash-merge
-        if: >-
-          steps.metadata.outputs.update-type == 'version-update:semver-minor' ||
-          steps.metadata.outputs.update-type == 'version-update:semver-patch'
+      - name: Wait for full CI and merge CI-only dependency update
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
           PR_URL: ${{ github.event.pull_request.html_url }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
           PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         shell: bash
         run: |
           set -euo pipefail
+          files="$(gh api "repos/${GH_REPO}/pulls/${PR_NUMBER}/files?per_page=100")"
+          if ! jq -e 'length == 1 and .[0].filename == ".github/workflows/ci.yml"' <<<"$files" >/dev/null; then
+            echo "This Dependabot PR does not exclusively update the CI workflow; leaving it for manual review."
+            exit 0
+          fi
+
           expected='["Format Check","Clippy Lints","Test Suite","Security Audit","Elasticsearch 7102 three-node soak","Elasticsearch 717 three-node soak","Elasticsearch 8x three-node soak","Elasticsearch 9x three-node soak","Build Release"]'
           deadline=$((SECONDS + 3 * 60 * 60))
 
