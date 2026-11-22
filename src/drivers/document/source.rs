@@ -155,7 +155,9 @@ impl DocumentSource {
 
         // Stable PIT pagination via _shard_doc requires Elasticsearch 7.12+.
         // Elasticsearch 7.10/7.11 supports PIT but lacks this tie-breaker, so use Scroll.
-        let mode = if major >= 8 || (major == 7 && minor >= 12) || major >= 2 {
+        let supports_pit_shard_doc =
+            major >= 8 || (major == 7 && minor >= 12) || (2..7).contains(&major);
+        let mode = if supports_pit_shard_doc {
             info!("Using Point-in-Time API (version {})", version_str);
             ApiMode::PointInTime
         } else {
