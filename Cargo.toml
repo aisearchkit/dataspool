@@ -71,4 +71,4 @@ sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio
 tower = { version = "0.5", features = ["util"] }
 
 [build-dependencies]
-tonic-build = "0.12"
+tonic-build = "0.14"
