@@ -63,7 +63,7 @@ arrow = "57.3.0"
 # HTTP client for search engine APIs (ES/OpenSearch compatible)
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
 url = "2.5"
-base64 = "0.22.1"
+base64 = "0.23.1"
 sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio-rustls", "mysql", "postgres", "json"] }
 
 
