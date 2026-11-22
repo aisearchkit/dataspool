@@ -23,6 +23,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 240
     steps:
+      - name: Checkout trusted main branch
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
       - name: Wait for full CI and merge CI-only dependency update
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -59,6 +65,23 @@ jobs:
             ' <<<"$checks" >/dev/null; then
               echo "All nine CI jobs passed for ${PR_HEAD_SHA}; merging ${PR_URL}."
               gh pr merge --squash --delete-branch "$PR_URL"
+
+              merge_sha="$(gh api "repos/${GH_REPO}/pulls/${PR_NUMBER}" --jq '.merge_commit_sha')"
+              if [[ -z "$merge_sha" || "$merge_sha" == "null" ]]; then
+                echo "Unable to determine the Dependabot merge commit SHA." >&2
+                exit 1
+              fi
+              tag="deps-$(date -u +%Y%m%d)-${merge_sha:0:7}"
+              git fetch origin main
+              if git ls-remote --exit-code --tags origin "refs/tags/${tag}" >/dev/null 2>&1; then
+                echo "Tag ${tag} already exists."
+              else
+                git config user.name "github-actions[bot]"
+                git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+                git tag -a "$tag" "$merge_sha" -m "Dependabot CI dependency PR #${PR_NUMBER} (full CI passed)"
+                git push origin "refs/tags/${tag}"
+                echo "Created ${tag}."
+              fi
               exit 0
             fi
 
