@@ -9,6 +9,8 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # RocksDB 10.x trace_record.h uses uint32_t/uint64_t without including <cstdint>.
+  CXXFLAGS: -include cstdint
 
 jobs:
   format:

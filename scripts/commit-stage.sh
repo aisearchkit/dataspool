@@ -17,6 +17,9 @@ fi
 root="$(git rev-parse --show-toplevel)"
 cd "$root"
 
+# Match CI: RocksDB's bundled trace_record.h relies on cstdint being included first.
+export CXXFLAGS="${CXXFLAGS:+$CXXFLAGS }-include cstdint"
+
 if ! git diff --cached --quiet; then
   echo "refusing to mix with pre-staged changes; unstage or commit them first" >&2
   exit 1

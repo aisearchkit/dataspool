@@ -131,3 +131,5 @@ cluster:
 server:
   grpc_port: 50051
   http_port: 8080
+
+CI sets `CXXFLAGS=-include cstdint` because RocksDB bundled `trace_record.h` uses fixed-width integer types without including `<cstdint>` itself. Keep this flag in local commit-stage checks so native builds match CI.
