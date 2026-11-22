@@ -169,7 +169,7 @@ impl DocumentSource {
     }
 
     /// Initialize scroll search
-    async fn init_scroll(&mut self, client: &Client) -> Result<ScrollState> {
+    async fn init_scroll(&mut self, client: &Client) -> Result<(ScrollState, Value)> {
         let scroll_timeout = format!("{}m", self.config.scroll_timeout_mins);
 
         let mut search_body = json!({
@@ -225,10 +225,13 @@ impl DocumentSource {
             self.total_docs = Some(total);
         }
 
-        Ok(ScrollState {
-            scroll_id,
-            docs_read: 0,
-        })
+        Ok((
+            ScrollState {
+                scroll_id,
+                docs_read: 0,
+            },
+            body,
+        ))
     }
 
     /// Continue scroll pagination
@@ -601,34 +604,38 @@ impl DocumentSource {
 
     /// Read batch using Scroll API
     async fn read_batch_scroll(&mut self, client: &Client) -> Result<(RecordBatch, OffsetValue)> {
-        // Initialize scroll if first read
-        if self.scroll_state.is_none() {
-            let state = self.init_scroll(client).await?;
+        // The initial _search response already contains page one. Do not discard it
+        // and immediately call _search/scroll, which would skip that page entirely.
+        let body = if self.scroll_state.is_none() {
+            let (state, first_page) = self.init_scroll(client).await?;
             self.scroll_state = Some(state);
-        }
-
-        let scroll_state = self
-            .scroll_state
-            .as_ref()
-            .ok_or_else(|| DriverError::DataError("No scroll state".to_string()))?;
-
-        // Continue scroll
-        let body = self
-            .continue_scroll(client, &scroll_state.scroll_id)
-            .await?;
+            first_page
+        } else {
+            let scroll_id = self
+                .scroll_state
+                .as_ref()
+                .ok_or_else(|| DriverError::DataError("No scroll state".to_string()))?
+                .scroll_id
+                .clone();
+            self.continue_scroll(client, &scroll_id).await?
+        };
 
         // Parse hits
         let batch = self.parse_hits(&body["hits"])?;
         let batch_size = batch.len();
+        let hits_read = body["hits"]["hits"].as_array().map_or(0, Vec::len) as u64;
 
-        // Update offset
-        let new_docs_read = scroll_state.docs_read + batch_size as u64;
-        let new_offset = OffsetValue::DocumentCount(new_docs_read);
-
-        // Update scroll state
-        if let Some(ref mut state) = self.scroll_state {
-            state.docs_read = new_docs_read;
+        // Elasticsearch may rotate the scroll ID after each response.
+        let state = self
+            .scroll_state
+            .as_mut()
+            .ok_or_else(|| DriverError::DataError("No scroll state".to_string()))?;
+        if let Some(scroll_id) = body["_scroll_id"].as_str() {
+            state.scroll_id = scroll_id.to_string();
         }
+        state.docs_read += hits_read;
+        let new_docs_read = state.docs_read;
+        let new_offset = OffsetValue::DocumentCount(new_docs_read);
 
         debug!(
             "Read batch (Scroll): {} docs, total: {}",
