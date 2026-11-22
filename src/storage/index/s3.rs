@@ -14,7 +14,7 @@
 use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::OnceCell;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use arrow::array::{Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
@@ -61,14 +61,14 @@ impl S3Store {
             .get_or_try_init(|| async {
                 let config = if let Some(endpoint) = &self.endpoint {
                     // MinIO or custom S3-compatible endpoint
-                    aws_config::from_env()
+                    aws_config::defaults(aws_config::BehaviorVersion::latest())
                         .region(aws_config::Region::new(self.region.clone()))
                         .endpoint_url(endpoint)
                         .load()
                         .await
                 } else {
                     // AWS S3
-                    aws_config::from_env()
+                    aws_config::defaults(aws_config::BehaviorVersion::latest())
                         .region(aws_config::Region::new(self.region.clone()))
                         .load()
                         .await

@@ -9,6 +9,6 @@ mod executor;
 mod shard_claimer;
 mod worker_pool;
 
-pub use executor::{ShardExecutor, ExecutionStats};
+pub use executor::{ExecutionStats, ShardExecutor};
 pub use shard_claimer::ShardClaimer;
-pub use worker_pool::{WorkerPool, ResourceLimits};
+pub use worker_pool::{ResourceLimits, WorkerPool};

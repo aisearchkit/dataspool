@@ -29,7 +29,7 @@ impl DatabaseType {
             DatabaseType::Sqlite => 0, // N/A for file-based DB
         }
     }
-    
+
     /// Get protocol prefix for connection URL
     pub fn protocol(&self) -> &str {
         match self {
@@ -45,43 +45,43 @@ impl DatabaseType {
 pub struct RelationalConfig {
     /// Database type (mysql, postgresql, sqlite)
     pub db_type: DatabaseType,
-    
+
     /// Database host (e.g., "localhost" or "192.168.1.10")
     pub host: String,
-    
+
     /// Database port (if None, uses default for db_type)
     #[serde(default)]
     pub port: Option<u16>,
-    
+
     /// Database name
     pub database: String,
-    
+
     /// Username for authentication
     pub username: String,
-    
+
     /// Password for authentication
     #[serde(skip_serializing)]
     pub password: String,
-    
+
     /// Table name to migrate
     pub table: String,
-    
+
     /// Optional WHERE clause for filtering
     #[serde(default)]
     pub where_clause: Option<String>,
-    
+
     /// Primary key column for sharding and offset tracking
     #[serde(default = "default_pk_column")]
     pub pk_column: String,
-    
+
     /// Batch size for SELECT queries
     #[serde(default = "default_batch_size")]
     pub batch_size: usize,
-    
+
     /// Connection timeout
     #[serde(with = "humantime_serde", default = "default_connection_timeout")]
     pub connection_timeout: Duration,
-    
+
     /// SSL/TLS configuration
     #[serde(default)]
     pub ssl: SslConfig,
@@ -104,7 +104,7 @@ fn default_connection_timeout() -> Duration {
 pub struct SslConfig {
     #[serde(default)]
     pub enabled: bool,
-    
+
     pub ca_cert: Option<String>,
     pub client_cert: Option<String>,
     pub client_key: Option<String>,
@@ -115,12 +115,12 @@ impl RelationalConfig {
     pub fn get_port(&self) -> u16 {
         self.port.unwrap_or_else(|| self.db_type.default_port())
     }
-    
+
     /// Build connection URL
     pub fn connection_url(&self) -> String {
         let protocol = self.db_type.protocol();
         let port = self.get_port();
-        
+
         match self.db_type {
             DatabaseType::Sqlite => {
                 // SQLite uses file path instead of host:port
@@ -129,35 +129,30 @@ impl RelationalConfig {
             _ => {
                 format!(
                     "{}://{}:{}@{}:{}/{}",
-                    protocol,
-                    self.username,
-                    self.password,
-                    self.host,
-                    port,
-                    self.database
+                    protocol, self.username, self.password, self.host, port, self.database
                 )
             }
         }
     }
-    
+
     /// Validate configuration
     pub fn validate(&self) -> Result<(), String> {
         if self.host.is_empty() && self.db_type != DatabaseType::Sqlite {
             return Err("host cannot be empty for network databases".to_string());
         }
-        
+
         if self.database.is_empty() {
             return Err("database cannot be empty".to_string());
         }
-        
+
         if self.table.is_empty() {
             return Err("table cannot be empty".to_string());
         }
-        
+
         if self.pk_column.is_empty() {
             return Err("pk_column cannot be empty".to_string());
         }
-        
+
         Ok(())
     }
 }
@@ -190,7 +185,7 @@ mod tests {
             connection_timeout: Duration::from_secs(30),
             ssl: SslConfig::default(),
         };
-        
+
         assert_eq!(config.get_port(), 3306);
         assert_eq!(
             config.connection_url(),
@@ -214,7 +209,7 @@ mod tests {
             connection_timeout: Duration::from_secs(60),
             ssl: SslConfig::default(),
         };
-        
+
         assert_eq!(config.get_port(), 5433);
         assert_eq!(
             config.connection_url(),
@@ -238,12 +233,12 @@ mod tests {
             connection_timeout: Duration::from_secs(30),
             ssl: SslConfig::default(),
         };
-        
+
         assert!(config.validate().is_err());
-        
+
         config.host = "localhost".to_string();
         assert!(config.validate().is_ok());
-        
+
         config.table = "".to_string();
         assert!(config.validate().is_err());
     }

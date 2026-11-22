@@ -33,14 +33,15 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 openraft = { version = "0.9", features = ["serde"] }
 
 # Storage
-rocksdb = "0.22"
+rocksdb = { version = "0.22", default-features = false, features = ["lz4"] }
 
 # Networking
 tonic = "0.12"
-tonic-build = "0.12"
 prost = "0.13"
 prost-types = "0.13"
 hyper = "1.0"
+axum = { version = "0.8", features = ["json", "query"] }
+subtle = "2.6"
 
 # Time
 chrono = { version = "0.4", features = ["serde"] }
@@ -52,28 +53,22 @@ bytes = "1.7"
 parking_lot = "0.12"
 num_cpus = "1.16"
 hostname = "0.4"
+tempfile = "3.12"
 dashmap = "6.1.0"
-aws-sdk-s3 = "1.123.0"
+aws-sdk-s3 = { version = "1.123.0", default-features = false, features = ["sigv4a", "http-1x", "default-https-client", "rt-tokio"] }
 aws-config = "1.8.14"
 parquet = "57.3.0"
 arrow = "57.3.0"
 
 # HTTP client for search engine APIs (ES/OpenSearch compatible)
-reqwest = { version = "0.11", features = ["json", "rustls-tls"], default-features = false }
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
 url = "2.5"
-
-tempfile = "3.12"
 base64 = "0.22.1"
-sqlx = { version = "0.8.6", features = ["runtime-tokio-rustls", "mysql", "postgres"] }
+sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio-rustls", "mysql", "postgres", "json"] }
 
-# Kafka client for streaming driver
-rdkafka = { version = "0.36", features = ["tokio", "ssl", "gssapi", "zstd"] }
 
 [dev-dependencies]
-tempfile = "3.12"
+tower = { version = "0.5", features = ["util"] }
 
 [build-dependencies]
 tonic-build = "0.12"
-
-# HTTP client for license validation
-reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }

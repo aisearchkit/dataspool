@@ -18,10 +18,10 @@
 
 //! Document store configuration
 
+use crate::error::DriverError;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use url::Url;
-use crate::error::DriverError;
 
 /// Document store connection configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -105,7 +105,8 @@ impl DocumentConfig {
             .iter()
             .map(|s| {
                 Url::parse(s).map_err(|e| {
-                    DriverError::DataError(format!("Invalid document store URL '{}': {}", s, e)).into()
+                    DriverError::DataError(format!("Invalid document store URL '{}': {}", s, e))
+                        .into()
                 })
             })
             .collect()

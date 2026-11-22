@@ -132,10 +132,10 @@ impl License {
     }
 
     pub fn is_valid(&self) -> Result<(), LicenseError> {
-        if let Some(expiry) = self.expires_at {
-            if Utc::now() > expiry + Duration::days(self.grace_period_days.max(0)) {
-                return Err(LicenseError::Expired { expires_at: expiry });
-            }
+        if let Some(expiry) = self.expires_at
+            && Utc::now() > expiry + Duration::days(self.grace_period_days.max(0))
+        {
+            return Err(LicenseError::Expired { expires_at: expiry });
         }
         Ok(())
     }

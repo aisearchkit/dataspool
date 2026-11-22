@@ -59,6 +59,9 @@ fn client(user: Option<&str>, password: Option<&str>) -> Client {
 async fn elasticsearch_pit_search_after_and_bulk_item_errors() {
     let clusters = configured_clusters();
     if clusters.is_empty() {
+        if std::env::var("ES_REQUIRE_LIVE").as_deref() == Ok("1") {
+            panic!("ES_REQUIRE_LIVE=1 but no ES_*_URL variables are configured");
+        }
         eprintln!(
             "Skipping live Elasticsearch compatibility checks: no ES_*_URL variables configured"
         );
@@ -84,6 +87,32 @@ async fn elasticsearch_pit_search_after_and_bulk_item_errors() {
                 || version.starts_with("8."),
             "{label} endpoint reported unexpected version {version}"
         );
+        let expected_nodes = std::env::var("ES_EXPECT_NODES")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(1);
+        let node_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(90);
+        let node_count = loop {
+            let nodes: Value = http
+                .get(format!("{base_url}/_nodes?filter_path=nodes"))
+                .send()
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            let count = nodes["nodes"].as_object().map_or(0, |n| n.len());
+            if count >= expected_nodes {
+                break count;
+            }
+            assert!(
+                tokio::time::Instant::now() < node_deadline,
+                "{label}: expected at least {expected_nodes} nodes, discovered {count} after 90s"
+            );
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        };
 
         let suffix = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -92,7 +121,7 @@ async fn elasticsearch_pit_search_after_and_bulk_item_errors() {
         let index = format!("dataspool-compat-{suffix}");
         let create = http
             .put(format!("{base_url}/{index}"))
-            .json(&json!({"mappings":{"properties":{"number":{"type":"integer"}}}}))
+            .json(&json!({"settings":{"number_of_shards":6,"number_of_replicas":1},"mappings":{"properties":{"number":{"type":"integer"}}}}))
             .send()
             .await
             .unwrap();
@@ -375,6 +404,7 @@ async fn elasticsearch_pit_search_after_and_bulk_item_errors() {
             .write_batch(RecordBatch::from(retry_records))
             .await
             .unwrap();
+        let mut total_retried = sink_result.retried_count;
         assert_eq!(
             sink_result.success_count, 2048,
             "{label}: sink must finish all retried documents: {:?}",
@@ -419,8 +449,69 @@ async fn elasticsearch_pit_search_after_and_bulk_item_errors() {
                 observed_429 += 1;
             }
         }
+        let soak_seconds = std::env::var("ES_SOAK_SECONDS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(0);
+        if soak_seconds > 0 {
+            let mut soak_config = DocumentConfig::local(index.clone());
+            soak_config.urls = vec![base_url.clone()];
+            let mut soak_sink = DocumentSink::new(soak_config, index.clone()).with_backpressure(
+                BackpressureConfig {
+                    min_batch_size: 32,
+                    max_batch_size: 256,
+                    initial_batch_size: 256,
+                    min_in_flight: 32,
+                    max_in_flight: 32,
+                    target_latency: std::time::Duration::from_secs(10),
+                    high_queue_utilization: 0.95,
+                },
+            );
+            soak_sink.connect().await.unwrap();
+            let deadline =
+                tokio::time::Instant::now() + std::time::Duration::from_secs(soak_seconds);
+            let mut sequence = 0_u64;
+            let mut soak_written = 0_u64;
+            while tokio::time::Instant::now() < deadline {
+                let batch = (0..4096)
+                    .map(|n| {
+                        Record::with_id(
+                            format!("soak-{sequence}-{n}"),
+                            "compat-soak",
+                            json!({"number":sequence+n as u64}),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                let result = soak_sink
+                    .write_batch(RecordBatch::from(batch))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    result.failed_count, 0,
+                    "{label}: long soak encountered permanent/transient failures: {:?}",
+                    result.errors
+                );
+                assert_eq!(
+                    result.rejected_count, 0,
+                    "{label}: long soak left rejected documents after retry"
+                );
+                soak_written += result.success_count as u64;
+                total_retried += result.retried_count;
+                sequence += 4096;
+            }
+            soak_sink.close().await.unwrap();
+            eprintln!(
+                "Elasticsearch {label}: {soak_seconds}s soak delivered {soak_written} docs, retry_count={total_retried}"
+            );
+        }
+        if std::env::var("ES_REQUIRE_429").as_deref() == Ok("1") {
+            assert!(
+                total_retried > 0,
+                "{label}: multi-node stress did not exercise DocumentSink's real 429 retry path"
+            );
+        }
         eprintln!(
-            "Elasticsearch {label} ({version}): PIT restart, CDC, alias cutover passed; overload probe observed {observed_429} HTTP 429 responses"
+            "Elasticsearch {label} ({version}): nodes={node_count}, PIT restart, CDC, alias cutover passed; overload probe observed {observed_429} HTTP 429 responses; sink_retries={total_retried}"
         );
 
         let _ = http

@@ -47,6 +47,8 @@ pub struct DocumentSink {
     target_index: String,
     backpressure: AdaptiveBackpressure,
     node_pressure: ClusterNodePressure,
+    last_rejected_total: u64,
+    pressure_initialized: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -55,6 +57,9 @@ pub struct ClusterNodePressure {
     pub write_active: u64,
     pub write_queue: u64,
     pub write_rejected: u64,
+    pub write_rejected_delta: u64,
+    pub write_queue_capacity: u64,
+    pub queue_capacity_known: bool,
     pub queue_utilization: f64,
     pub per_node: Vec<NodeWritePressure>,
 }
@@ -66,6 +71,67 @@ pub struct NodeWritePressure {
     pub write_active: u64,
     pub write_queue: u64,
     pub write_rejected: u64,
+    pub write_queue_capacity: u64,
+}
+
+fn parse_node_pressure(
+    stats: &Value,
+    info: &Value,
+    previous_rejected: u64,
+    initialized: bool,
+) -> (ClusterNodePressure, u64) {
+    let mut pressure = ClusterNodePressure::default();
+    let stats_nodes = stats["nodes"].as_object();
+    let info_nodes = info["nodes"].as_object();
+    if let Some(nodes) = stats_nodes {
+        pressure.nodes = nodes.len();
+        for (node_id, node) in nodes {
+            let pool = node["thread_pool"]["write"]
+                .as_object()
+                .or_else(|| node["thread_pool"]["bulk"].as_object());
+            let Some(pool) = pool else {
+                continue;
+            };
+            let info_pool = info_nodes
+                .and_then(|nodes| nodes.get(node_id))
+                .and_then(|node| {
+                    node["thread_pool"]["write"]
+                        .as_object()
+                        .or_else(|| node["thread_pool"]["bulk"].as_object())
+                });
+            let capacity = info_pool
+                .and_then(|pool| {
+                    pool.get("queue_size")
+                        .or_else(|| pool.get("max_queue_size"))
+                })
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            let item = NodeWritePressure {
+                node_id: node_id.clone(),
+                name: node["name"].as_str().unwrap_or_default().to_string(),
+                write_active: pool.get("active").and_then(Value::as_u64).unwrap_or(0),
+                write_queue: pool.get("queue").and_then(Value::as_u64).unwrap_or(0),
+                write_rejected: pool.get("rejected").and_then(Value::as_u64).unwrap_or(0),
+                write_queue_capacity: capacity,
+            };
+            pressure.write_active += item.write_active;
+            pressure.write_queue += item.write_queue;
+            pressure.write_rejected += item.write_rejected;
+            pressure.write_queue_capacity += item.write_queue_capacity;
+            pressure.per_node.push(item);
+        }
+    }
+    pressure.queue_capacity_known = pressure.write_queue_capacity > 0;
+    if pressure.queue_capacity_known {
+        pressure.queue_utilization =
+            (pressure.write_queue as f64 / pressure.write_queue_capacity as f64).clamp(0.0, 1.0);
+    }
+    let rejected_delta = if initialized {
+        pressure.write_rejected.saturating_sub(previous_rejected)
+    } else {
+        0
+    };
+    (pressure, rejected_delta)
 }
 
 impl DocumentSink {
@@ -78,6 +144,8 @@ impl DocumentSink {
             target_index,
             backpressure: AdaptiveBackpressure::new(BackpressureConfig::default()),
             node_pressure: ClusterNodePressure::default(),
+            last_rejected_total: 0,
+            pressure_initialized: false,
         }
     }
 
@@ -154,43 +222,42 @@ impl DocumentSink {
     }
 
     async fn refresh_node_pressure(&mut self, client: &Client) {
-        let response = client
+        let stats_response = client
             .get(format!("{}/_nodes/stats/thread_pool", self.base_url))
             .send()
             .await;
-        let Ok(response) = response else {
+        let Ok(stats_response) = stats_response else {
             return;
         };
-        if !response.status().is_success() {
+        if !stats_response.status().is_success() {
             return;
         }
-        let Ok(body) = response.json::<Value>().await else {
+        let Ok(stats) = stats_response.json::<Value>().await else {
             return;
         };
-        let mut pressure = ClusterNodePressure::default();
-        if let Some(nodes) = body["nodes"].as_object() {
-            pressure.nodes = nodes.len();
-            for (node_id, node) in nodes {
-                let pool = node["thread_pool"]["write"]
-                    .as_object()
-                    .or_else(|| node["thread_pool"]["bulk"].as_object());
-                if let Some(pool) = pool {
-                    let item = NodeWritePressure {
-                        node_id: node_id.clone(),
-                        name: node["name"].as_str().unwrap_or_default().to_string(),
-                        write_active: pool.get("active").and_then(Value::as_u64).unwrap_or(0),
-                        write_queue: pool.get("queue").and_then(Value::as_u64).unwrap_or(0),
-                        write_rejected: pool.get("rejected").and_then(Value::as_u64).unwrap_or(0),
-                    };
-                    pressure.write_active += item.write_active;
-                    pressure.write_queue += item.write_queue;
-                    pressure.write_rejected += item.write_rejected;
-                    pressure.per_node.push(item);
-                }
+
+        // Stats provide active/queue/rejected; node info provides configured queue capacity.
+        // If capacity is unavailable, utilization remains explicitly unknown (0.0) and
+        // latency/429 feedback still controls AIMD.
+        let info_response = client
+            .get(format!("{}/_nodes/info/thread_pool", self.base_url))
+            .send()
+            .await;
+        let info = match info_response {
+            Ok(response) if response.status().is_success() => {
+                response.json::<Value>().await.unwrap_or(Value::Null)
             }
-        }
-        pressure.queue_utilization = pressure.write_queue as f64
-            / (pressure.write_queue + pressure.write_active).max(1) as f64;
+            _ => Value::Null,
+        };
+        let (mut pressure, rejected_delta) = parse_node_pressure(
+            &stats,
+            &info,
+            self.last_rejected_total,
+            self.pressure_initialized,
+        );
+        pressure.write_rejected_delta = rejected_delta;
+        self.last_rejected_total = pressure.write_rejected;
+        self.pressure_initialized = true;
         self.node_pressure = pressure;
     }
 
@@ -361,7 +428,7 @@ impl DocumentSink {
             // Check status code
             let status = index_result["status"].as_u64().unwrap_or(500);
 
-            if status >= 200 && status < 300 {
+            if (200..300).contains(&status) {
                 result.success_count += 1;
             } else {
                 result.failed_count += 1;
@@ -444,7 +511,7 @@ impl Sink for DocumentSink {
             status_code: 200,
             // Elasticsearch exposes this as a process-lifetime counter; only per-request
             // rejections may drive the AIMD rejection signal.
-            rejected: 0,
+            rejected: pressure.write_rejected_delta,
             queue_utilization: pressure.queue_utilization,
             ..Default::default()
         });
@@ -492,7 +559,6 @@ impl Sink for DocumentSink {
                 status_code: if result.rejected_count > 0 { 429 } else { 200 },
                 rejected: result.rejected_count as u64,
                 queue_utilization: pressure.queue_utilization,
-                ..Default::default()
             });
             if !window.pause.is_zero() {
                 tokio::time::sleep(window.pause).await;
@@ -567,7 +633,7 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let mut bulk_requests = 0;
-            for _ in 0..4 {
+            for _ in 0..5 {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let request = read_request(&mut stream).await;
                 let first_line = String::from_utf8_lossy(&request)
@@ -615,6 +681,36 @@ mod tests {
         assert_eq!(result.retried_count, 2);
         sink.close().await.unwrap();
         server.await.unwrap();
+    }
+
+    #[test]
+    fn parses_cluster_node_queue_capacity_and_rejection_deltas() {
+        let stats = json!({"nodes":{
+            "n1":{"name":"data-1","thread_pool":{"write":{"active":2,"queue":50,"rejected":12}}},
+            "n2":{"name":"data-2","thread_pool":{"write":{"active":1,"queue":10,"rejected":3}}}
+        }});
+        let info = json!({"nodes":{
+            "n1":{"thread_pool":{"write":{"queue_size":100}}},
+            "n2":{"thread_pool":{"write":{"queue_size":100}}}
+        }});
+        let (first, first_delta) = parse_node_pressure(&stats, &info, 0, false);
+        assert_eq!(first.nodes, 2);
+        assert_eq!(first.write_queue, 60);
+        assert_eq!(first.write_queue_capacity, 200);
+        assert_eq!(first.queue_utilization, 0.3);
+        assert!(first.queue_capacity_known);
+        assert_eq!(
+            first_delta, 0,
+            "first sample establishes the counter baseline"
+        );
+
+        let (next, delta) = parse_node_pressure(&stats, &info, 10, true);
+        assert_eq!(next.write_rejected, 15);
+        assert_eq!(delta, 5);
+
+        let (unknown, _) = parse_node_pressure(&stats, &Value::Null, 0, false);
+        assert!(!unknown.queue_capacity_known);
+        assert_eq!(unknown.queue_utilization, 0.0);
     }
 
     #[test]

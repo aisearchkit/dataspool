@@ -3,7 +3,7 @@
 //! L1: In-memory cache layer with LRU eviction
 
 use dashmap::DashMap;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::debug;
 
 /// In-memory cache for hot index data

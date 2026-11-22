@@ -286,6 +286,75 @@ impl KvStore for RocksDbStore {
         .map_err(|e| StorageError::DatabaseError(format!("Task join error: {}", e)))?
     }
 
+    async fn prefix_scan_page_cf(
+        &self,
+        cf: ColumnFamily,
+        prefix: &[u8],
+        offset: usize,
+        limit: usize,
+    ) -> Result<Vec<(Bytes, Bytes)>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let db = self.db.clone();
+        let cf_name = cf.to_string();
+        let prefix = prefix.to_vec();
+        task::spawn_blocking(move || {
+            let cf_handle = db.cf_handle(&cf_name).ok_or_else(|| {
+                StorageError::DatabaseError(format!("Column family not found: {cf_name}"))
+            })?;
+            let mut result = Vec::with_capacity(limit);
+            let iter = db.iterator_cf(
+                cf_handle,
+                rocksdb::IteratorMode::From(&prefix, rocksdb::Direction::Forward),
+            );
+            let mut skipped = 0usize;
+            for item in iter {
+                let (key, value) = item.map_err(|e| StorageError::ReadFailed(e.to_string()))?;
+                if !key.starts_with(&prefix) {
+                    break;
+                }
+                if skipped < offset {
+                    skipped += 1;
+                    continue;
+                }
+                result.push((Bytes::from(key.to_vec()), Bytes::from(value.to_vec())));
+                if result.len() >= limit {
+                    break;
+                }
+            }
+            Ok(result)
+        })
+        .await
+        .map_err(|e| StorageError::DatabaseError(format!("Task join error: {e}")))?
+    }
+
+    async fn count_prefix_cf(&self, cf: ColumnFamily, prefix: &[u8]) -> Result<usize> {
+        let db = self.db.clone();
+        let cf_name = cf.to_string();
+        let prefix = prefix.to_vec();
+        task::spawn_blocking(move || {
+            let cf_handle = db.cf_handle(&cf_name).ok_or_else(|| {
+                StorageError::DatabaseError(format!("Column family not found: {cf_name}"))
+            })?;
+            let mut count = 0usize;
+            let iter = db.iterator_cf(
+                cf_handle,
+                rocksdb::IteratorMode::From(&prefix, rocksdb::Direction::Forward),
+            );
+            for item in iter {
+                let (key, _) = item.map_err(|e| StorageError::ReadFailed(e.to_string()))?;
+                if !key.starts_with(&prefix) {
+                    break;
+                }
+                count = count.saturating_add(1);
+            }
+            Ok(count)
+        })
+        .await
+        .map_err(|e| StorageError::DatabaseError(format!("Task join error: {e}")))?
+    }
+
     async fn exists(&self, key: &[u8]) -> Result<bool> {
         self.get(key).await.map(|opt| opt.is_some())
     }

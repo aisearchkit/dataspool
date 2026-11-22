@@ -1,3 +1,5 @@
+// Tonic-generated gRPC service methods return tonic::Status (large by design).
+#![allow(clippy::result_large_err)]
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //
 // Dataspool - Hybrid-mode data migration and orchestration platform
@@ -22,6 +24,7 @@
 //! high availability through Raft consensus and horizontal scalability
 //! through distributed task execution.
 
+pub mod admin;
 pub mod agent;
 pub mod comms;
 pub mod config;
@@ -34,6 +37,7 @@ pub mod storage;
 pub mod task;
 pub mod types;
 
+pub use admin::DlqApi;
 pub use agent::{ShardClaimer, ShardExecutor, WorkerPool};
 pub use comms::{GrpcClient, GrpcServer};
 pub use config::DatspoolConfig;

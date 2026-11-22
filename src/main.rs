@@ -16,17 +16,10 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-mod config;
-mod error;
-mod types;
-
-pub use config::DatspoolConfig;
-pub use error::{ConfigError, DatspoolError, DriverError, RaftError, Result, StorageError};
-pub use types::{NodeId, NodeRole, NodeStatus, ShardId, ShardState, TaskId, TaskState, TaskStats};
+use dataspool::{DatspoolError, Result};
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Initialize tracing subscriber for structured logging
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -35,8 +28,26 @@ async fn main() -> Result<()> {
         .json()
         .init();
 
-    tracing::info!("Starting Dataspool v{}", env!("CARGO_PKG_VERSION"));
-    tracing::info!("Hybrid-mode data migration and orchestration platform");
+    let admin_token = std::env::var("DATASPOOL_ADMIN_TOKEN").map_err(|_| {
+        DatspoolError::Configuration("DATASPOOL_ADMIN_TOKEN must be set (minimum 32 bytes)".into())
+    })?;
+    let db_path = std::env::var("DATASPOOL_DB_PATH").unwrap_or_else(|_| "./data/dataspool".into());
+    let bind = std::env::var("DATASPOOL_HTTP_BIND").unwrap_or_else(|_| "127.0.0.1:8080".into());
+    let store = dataspool::RocksDbStore::open(&db_path)?;
+    let tasks = std::sync::Arc::new(dataspool::TaskStore::new(store));
+    let api = dataspool::DlqApi::new(tasks, admin_token)?;
+    let listener = tokio::net::TcpListener::bind(&bind)
+        .await
+        .map_err(|e| DatspoolError::Internal(format!("HTTP bind {bind} failed: {e}")))?;
 
+    tracing::info!(%bind, %db_path, "Starting Dataspool DLQ admin API");
+    if !bind.starts_with("127.0.0.1:") && !bind.starts_with("[::1]:") {
+        tracing::warn!(
+            "DLQ admin API is bound to a non-loopback address; terminate TLS and restrict network access at a trusted reverse proxy"
+        );
+    }
+    axum::serve(listener, api.router())
+        .await
+        .map_err(|e| DatspoolError::Internal(format!("HTTP server failed: {e}")))?;
     Ok(())
 }

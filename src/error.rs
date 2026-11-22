@@ -114,13 +114,13 @@ pub enum DriverError {
 
     #[error("Invalid query: {0}")]
     InvalidQuery(String),
-    
+
     #[error("Query execution failed: {0}")]
     QueryError(String),
 
     #[error("Data error: {0}")]
     DataError(String),
-    
+
     #[error("Feature not supported: {0}")]
     Unsupported(String),
 

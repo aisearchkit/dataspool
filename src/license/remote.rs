@@ -81,9 +81,7 @@ mod tests {
     async fn test_validate_license_integration() {
         let client = KeystoneClient::new("http://localhost:8080").unwrap();
 
-        let result = client
-            .validate_license("test-key", None)
-            .await;
+        let result = client.validate_license("test-key", None).await;
 
         // Should fail with invalid key but not error
         assert!(result.is_ok());

@@ -100,15 +100,19 @@ impl<S: KvStore> DeadLetterQueue<S> {
     }
 
     pub async fn list(&self, limit: usize) -> Result<Vec<DeadLetterEntry>> {
+        self.list_page(0, limit).await
+    }
+
+    /// Read a stable page ordered by RocksDB key (the deterministic entry ID).
+    pub async fn list_page(&self, offset: usize, limit: usize) -> Result<Vec<DeadLetterEntry>> {
         if limit == 0 {
             return Ok(Vec::new());
         }
         let rows = self
             .store
-            .prefix_scan_cf(cf::DEAD_LETTER, &self.prefix)
+            .prefix_scan_page_cf(cf::DEAD_LETTER, &self.prefix, offset, limit)
             .await?;
         rows.into_iter()
-            .take(limit)
             .map(|(_, value)| {
                 serde_json::from_slice(&value)
                     .map_err(|e| DatspoolError::Internal(format!("decode DLQ entry: {e}")))
@@ -116,12 +120,23 @@ impl<S: KvStore> DeadLetterQueue<S> {
             .collect()
     }
 
-    pub async fn len(&self) -> Result<usize> {
-        Ok(self
-            .store
-            .prefix_scan_cf(cf::DEAD_LETTER, &self.prefix)
+    pub async fn get(&self, id: &str) -> Result<Option<DeadLetterEntry>> {
+        let mut key = self.prefix.clone();
+        key.extend_from_slice(id.as_bytes());
+        self.store
+            .get_cf(cf::DEAD_LETTER, &key)
             .await?
-            .len())
+            .map(|value| {
+                serde_json::from_slice(&value)
+                    .map_err(|e| DatspoolError::Internal(format!("decode DLQ entry: {e}")))
+            })
+            .transpose()
+    }
+
+    pub async fn len(&self) -> Result<usize> {
+        self.store
+            .count_prefix_cf(cf::DEAD_LETTER, &self.prefix)
+            .await
     }
 
     pub async fn remove(&self, id: &str) -> Result<()> {
@@ -139,13 +154,22 @@ impl<S: KvStore> DeadLetterQueue<S> {
     }
 
     /// Replay selected entries. Entries are removed only after destination success.
-    pub async fn replay<SinkT: Sink>(&self, sink: &mut SinkT, ids: &[String]) -> Result<usize> {
-        let selected = self
-            .list(usize::MAX)
-            .await?
-            .into_iter()
-            .filter(|entry| ids.is_empty() || ids.contains(&entry.id))
-            .collect::<Vec<_>>();
+    pub async fn replay<SinkT: Sink + ?Sized>(
+        &self,
+        sink: &mut SinkT,
+        ids: &[String],
+    ) -> Result<usize> {
+        if ids.is_empty() {
+            return Err(DatspoolError::Configuration(
+                "DLQ replay requires explicit entry IDs; replay-all is disabled".into(),
+            ));
+        }
+        let mut selected = Vec::with_capacity(ids.len());
+        for id in ids {
+            if let Some(entry) = self.get(id).await? {
+                selected.push(entry);
+            }
+        }
         let mut replayed = 0;
         for entry in selected {
             let result = sink
@@ -170,6 +194,32 @@ mod tests {
     use super::*;
     use crate::storage::rocksdb::RocksDbStore;
     use tempfile::tempdir;
+
+    struct NoopSink;
+    #[async_trait::async_trait]
+    impl Sink for NoopSink {
+        fn sink_type(&self) -> &str {
+            "noop"
+        }
+        async fn connect(&mut self) -> Result<()> {
+            Ok(())
+        }
+        async fn write_batch(
+            &mut self,
+            batch: RecordBatch,
+        ) -> Result<super::super::traits::WriteResult> {
+            Ok(super::super::traits::WriteResult {
+                success_count: batch.len(),
+                ..Default::default()
+            })
+        }
+        async fn flush(&mut self) -> Result<()> {
+            Ok(())
+        }
+        async fn close(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
 
     #[tokio::test]
     async fn persists_and_removes_dead_letters() {
@@ -197,6 +247,12 @@ mod tests {
         let entries = dlq.list(10).await.unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].status, 400);
+        assert_eq!(dlq.list_page(1, 10).await.unwrap().len(), 0);
+        assert_eq!(
+            dlq.get(&entries[0].id).await.unwrap().unwrap().id,
+            entries[0].id
+        );
+        assert!(dlq.replay(&mut NoopSink, &[]).await.is_err());
         dlq.remove(&entries[0].id).await.unwrap();
         assert_eq!(dlq.len().await.unwrap(), 0);
     }

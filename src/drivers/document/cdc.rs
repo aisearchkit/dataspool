@@ -84,12 +84,12 @@ impl ElasticsearchCdcSource {
     }
 
     fn restore_offset(&mut self, offset: &OffsetValue) -> Result<()> {
-        if let OffsetValue::Custom(value) = offset {
-            if value["driver"].as_str() == Some("elasticsearch_cdc") {
-                self.last_sequence = value["last_sequence"].as_u64().ok_or_else(|| {
-                    DriverError::DataError("CDC checkpoint is missing last_sequence".into())
-                })?;
-            }
+        if let OffsetValue::Custom(value) = offset
+            && value["driver"].as_str() == Some("elasticsearch_cdc")
+        {
+            self.last_sequence = value["last_sequence"].as_u64().ok_or_else(|| {
+                DriverError::DataError("CDC checkpoint is missing last_sequence".into())
+            })?;
         }
         Ok(())
     }

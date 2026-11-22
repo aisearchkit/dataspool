@@ -11,9 +11,9 @@
 //! - SQLite (future support)
 
 pub mod config;
-pub mod source;
 pub mod sink;
+pub mod source;
 
 pub use config::{DatabaseType, RelationalConfig, SslConfig};
-pub use source::RelationalSource;
 pub use sink::RelationalSink;
+pub use source::RelationalSource;

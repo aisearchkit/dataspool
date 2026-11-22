@@ -548,10 +548,10 @@ impl DocumentSource {
                 self.search_pit(client, &state.pit_id, None).await?
             }
         };
-        if let Some(rotated_id) = body["pit_id"].as_str() {
-            if let Some(state) = self.pit_state.as_mut() {
-                state.pit_id = rotated_id.to_string();
-            }
+        if let Some(rotated_id) = body["pit_id"].as_str()
+            && let Some(state) = self.pit_state.as_mut()
+        {
+            state.pit_id = rotated_id.to_string();
         }
 
         // Parse hits

@@ -94,16 +94,17 @@ Dataspool 旨在解决以上痛点，提供一个延迟低、扩展性强、部�
 
 按顺序执行：
 
-1. 对本阶段修改的 Rust 文件执行 `rustfmt --edition 2024 --config skip_children=true`，避免递归格式化无关模块。
+1. 执行 `cargo fmt --all`，然后 `cargo fmt --all -- --check`，保持整个仓库格式一致。
 2. `cargo check --all-targets`
-3. 运行 `cargo test --lib` 和相关集成测试。
-4. `git diff --check`
-5. 审查 `git diff`、`git status`，确认没有密钥、凭据、构建产物、临时文件或无关改动。
-6. 使用 `scripts/commit-stage.sh 'type(scope): summary' path...` 自动执行上述门禁，并只暂存明确列出的本阶段文件。
+3. `cargo clippy --all-targets --all-features -- -D warnings`
+4. 运行 `cargo test --all-features` 和相关集成测试。
+5. `git diff --check`
+6. 审查 `git diff`、`git status`，确认没有密钥、凭据、构建产物、临时文件或无关改动。
+7. 使用 `scripts/commit-stage.sh 'type(scope): summary' path...` 自动执行上述门禁，并只暂存明确列出的本阶段文件。
 7. commit 成功后必须自动执行 `git push origin HEAD`；只有远程确认更新成功才可报告“已推送”。
 8. 检查 `git status --short --branch`，记录 commit SHA、推送结果和剩余工作区变更。
 
-仓库现有部分文件尚未满足全仓库 `cargo fmt --all -- --check`；阶段门禁只格式化本阶段改动文件，避免无关格式化噪声。
+全仓库格式检查是 CI 的强制门禁；新增或修改 Rust 文件后必须运行 `cargo fmt --all`。不要通过跳过全局格式检查规避既有格式问题。
 
 若检查失败，必须先修复并重跑；不得提交未通过门禁的代码。若失败属于已确认的基线问题，必须记录错误、证明与本阶段变更无关，并在提交说明/开发记录中明确标记；未经验证不得宣称构建或测试通过。禁止使用 `git add .` 盲目暂存。
 

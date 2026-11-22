@@ -11,7 +11,7 @@ use tracing::{info, warn};
 use super::Command;
 use crate::error::{DatspoolError, Result};
 use crate::storage::KvStore;
-use crate::task::{ShardMeta, TaskStore};
+use crate::task::TaskStore;
 
 /// Response from applying a command
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -83,15 +83,16 @@ impl<S: KvStore + Clone> MetaStateMachine<S> {
         expected_state: String,
     ) -> Result<CommandResponse> {
         use crate::types::{NodeId, ShardId, ShardState};
-        
+
         // Parse expected state
         let expected_state: ShardState = serde_json::from_str(&expected_state)
             .map_err(|e| DatspoolError::Serialization(e.to_string()))?;
-        
+
         // Parse shard ID
-        let shard_id: ShardId = shard_id.parse()
+        let shard_id: ShardId = shard_id
+            .parse()
             .map_err(|e: uuid::Error| DatspoolError::Serialization(e.to_string()))?;
-        
+
         // Get current shard
         let mut shard = match self.task_store.get_shard(&shard_id).await? {
             Some(s) => s,
@@ -103,7 +104,7 @@ impl<S: KvStore + Clone> MetaStateMachine<S> {
                 });
             }
         };
-        
+
         // Check if expected state matches (CAS semantics)
         if shard.state != expected_state {
             return Ok(CommandResponse {
@@ -115,15 +116,15 @@ impl<S: KvStore + Clone> MetaStateMachine<S> {
                 data: None,
             });
         }
-        
+
         // Transition to Running using built-in method
         shard.start(NodeId(node_id.clone()));
-        
+
         // Persist change
         self.task_store.save_shard(&shard).await?;
-        
+
         info!("Shard {} claimed by {} (CAS succeeded)", shard_id, node_id);
-        
+
         Ok(CommandResponse {
             success: true,
             message: format!("Shard {} claimed by {}", shard_id, node_id),

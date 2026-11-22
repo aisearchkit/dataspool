@@ -9,14 +9,17 @@
 //! Code is generated during build from proto/*.proto files.
 
 // Include generated protobuf code
+#[allow(clippy::result_large_err)]
 pub mod cluster {
     tonic::include_proto!("dataspool.cluster");
 }
 
+#[allow(clippy::result_large_err)]
 pub mod task {
     tonic::include_proto!("dataspool.task");
 }
 
+#[allow(clippy::result_large_err)]
 pub mod log {
     tonic::include_proto!("dataspool.log");
 }

@@ -1,0 +1,271 @@
+services:
+  es7102-1:
+    image: docker.elastic.co/elasticsearch/elasticsearch:7.10.2
+    profiles: ["es7102"]
+    environment:
+      "cluster.name": "dataspool-es7102"
+      "node.name": "es7102-1"
+      "node.roles": "master,data,ingest"
+      "network.host": "0.0.0.0"
+      "discovery.seed_hosts": "es7102-1,es7102-2,es7102-3"
+      "cluster.initial_master_nodes": "es7102-1,es7102-2,es7102-3"
+      "xpack.security.enabled": "false"
+      "ES_JAVA_OPTS": "-Xms512m -Xmx512m"
+      "bootstrap.memory_lock": "true"
+      "thread_pool.write.queue_size": "1"
+      "cluster.routing.allocation.disk.threshold_enabled": "false"
+    ports:
+      - "19302:9200"
+    volumes:
+      - es7102-1-data:/usr/share/elasticsearch/data
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS 'http://localhost:9200/_cluster/health?wait_for_status=yellow&timeout=2s' >/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+
+  es7102-2:
+    image: docker.elastic.co/elasticsearch/elasticsearch:7.10.2
+    profiles: ["es7102"]
+    environment:
+      "cluster.name": "dataspool-es7102"
+      "node.name": "es7102-2"
+      "node.roles": "master,data,ingest"
+      "network.host": "0.0.0.0"
+      "discovery.seed_hosts": "es7102-1,es7102-2,es7102-3"
+      "cluster.initial_master_nodes": "es7102-1,es7102-2,es7102-3"
+      "xpack.security.enabled": "false"
+      "ES_JAVA_OPTS": "-Xms512m -Xmx512m"
+      "bootstrap.memory_lock": "true"
+      "thread_pool.write.queue_size": "1"
+      "cluster.routing.allocation.disk.threshold_enabled": "false"
+    ports:
+      - "19303:9200"
+    volumes:
+      - es7102-2-data:/usr/share/elasticsearch/data
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS 'http://localhost:9200/_cluster/health?wait_for_status=yellow&timeout=2s' >/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+
+  es7102-3:
+    image: docker.elastic.co/elasticsearch/elasticsearch:7.10.2
+    profiles: ["es7102"]
+    environment:
+      "cluster.name": "dataspool-es7102"
+      "node.name": "es7102-3"
+      "node.roles": "master,data,ingest"
+      "network.host": "0.0.0.0"
+      "discovery.seed_hosts": "es7102-1,es7102-2,es7102-3"
+      "cluster.initial_master_nodes": "es7102-1,es7102-2,es7102-3"
+      "xpack.security.enabled": "false"
+      "ES_JAVA_OPTS": "-Xms512m -Xmx512m"
+      "bootstrap.memory_lock": "true"
+      "thread_pool.write.queue_size": "1"
+      "cluster.routing.allocation.disk.threshold_enabled": "false"
+    ports:
+      - "19304:9200"
+    volumes:
+      - es7102-3-data:/usr/share/elasticsearch/data
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS 'http://localhost:9200/_cluster/health?wait_for_status=yellow&timeout=2s' >/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+
+  es717-1:
+    image: docker.elastic.co/elasticsearch/elasticsearch:7.17.28
+    profiles: ["es717"]
+    environment:
+      "cluster.name": "dataspool-es717"
+      "node.name": "es717-1"
+      "node.roles": "master,data,ingest"
+      "network.host": "0.0.0.0"
+      "discovery.seed_hosts": "es717-1,es717-2,es717-3"
+      "cluster.initial_master_nodes": "es717-1,es717-2,es717-3"
+      "xpack.security.enabled": "false"
+      "ES_JAVA_OPTS": "-Xms512m -Xmx512m"
+      "bootstrap.memory_lock": "true"
+      "thread_pool.write.queue_size": "1"
+      "cluster.routing.allocation.disk.threshold_enabled": "false"
+    ports:
+      - "19312:9200"
+    volumes:
+      - es717-1-data:/usr/share/elasticsearch/data
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS 'http://localhost:9200/_cluster/health?wait_for_status=yellow&timeout=2s' >/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+
+  es717-2:
+    image: docker.elastic.co/elasticsearch/elasticsearch:7.17.28
+    profiles: ["es717"]
+    environment:
+      "cluster.name": "dataspool-es717"
+      "node.name": "es717-2"
+      "node.roles": "master,data,ingest"
+      "network.host": "0.0.0.0"
+      "discovery.seed_hosts": "es717-1,es717-2,es717-3"
+      "cluster.initial_master_nodes": "es717-1,es717-2,es717-3"
+      "xpack.security.enabled": "false"
+      "ES_JAVA_OPTS": "-Xms512m -Xmx512m"
+      "bootstrap.memory_lock": "true"
+      "thread_pool.write.queue_size": "1"
+      "cluster.routing.allocation.disk.threshold_enabled": "false"
+    ports:
+      - "19313:9200"
+    volumes:
+      - es717-2-data:/usr/share/elasticsearch/data
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS 'http://localhost:9200/_cluster/health?wait_for_status=yellow&timeout=2s' >/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+
+  es717-3:
+    image: docker.elastic.co/elasticsearch/elasticsearch:7.17.28
+    profiles: ["es717"]
+    environment:
+      "cluster.name": "dataspool-es717"
+      "node.name": "es717-3"
+      "node.roles": "master,data,ingest"
+      "network.host": "0.0.0.0"
+      "discovery.seed_hosts": "es717-1,es717-2,es717-3"
+      "cluster.initial_master_nodes": "es717-1,es717-2,es717-3"
+      "xpack.security.enabled": "false"
+      "ES_JAVA_OPTS": "-Xms512m -Xmx512m"
+      "bootstrap.memory_lock": "true"
+      "thread_pool.write.queue_size": "1"
+      "cluster.routing.allocation.disk.threshold_enabled": "false"
+    ports:
+      - "19314:9200"
+    volumes:
+      - es717-3-data:/usr/share/elasticsearch/data
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS 'http://localhost:9200/_cluster/health?wait_for_status=yellow&timeout=2s' >/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+
+  es8x-1:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.19.8
+    profiles: ["es8x"]
+    environment:
+      "cluster.name": "dataspool-es8x"
+      "node.name": "es8x-1"
+      "node.roles": "master,data,ingest"
+      "network.host": "0.0.0.0"
+      "discovery.seed_hosts": "es8x-1,es8x-2,es8x-3"
+      "cluster.initial_master_nodes": "es8x-1,es8x-2,es8x-3"
+      "xpack.security.enabled": "false"
+      "ES_JAVA_OPTS": "-Xms512m -Xmx512m"
+      "bootstrap.memory_lock": "true"
+      "thread_pool.write.queue_size": "1"
+      "cluster.routing.allocation.disk.threshold_enabled": "false"
+    ports:
+      - "19322:9200"
+    volumes:
+      - es8x-1-data:/usr/share/elasticsearch/data
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS 'http://localhost:9200/_cluster/health?wait_for_status=yellow&timeout=2s' >/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+
+  es8x-2:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.19.8
+    profiles: ["es8x"]
+    environment:
+      "cluster.name": "dataspool-es8x"
+      "node.name": "es8x-2"
+      "node.roles": "master,data,ingest"
+      "network.host": "0.0.0.0"
+      "discovery.seed_hosts": "es8x-1,es8x-2,es8x-3"
+      "cluster.initial_master_nodes": "es8x-1,es8x-2,es8x-3"
+      "xpack.security.enabled": "false"
+      "ES_JAVA_OPTS": "-Xms512m -Xmx512m"
+      "bootstrap.memory_lock": "true"
+      "thread_pool.write.queue_size": "1"
+      "cluster.routing.allocation.disk.threshold_enabled": "false"
+    ports:
+      - "19323:9200"
+    volumes:
+      - es8x-2-data:/usr/share/elasticsearch/data
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS 'http://localhost:9200/_cluster/health?wait_for_status=yellow&timeout=2s' >/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+
+  es8x-3:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.19.8
+    profiles: ["es8x"]
+    environment:
+      "cluster.name": "dataspool-es8x"
+      "node.name": "es8x-3"
+      "node.roles": "master,data,ingest"
+      "network.host": "0.0.0.0"
+      "discovery.seed_hosts": "es8x-1,es8x-2,es8x-3"
+      "cluster.initial_master_nodes": "es8x-1,es8x-2,es8x-3"
+      "xpack.security.enabled": "false"
+      "ES_JAVA_OPTS": "-Xms512m -Xmx512m"
+      "bootstrap.memory_lock": "true"
+      "thread_pool.write.queue_size": "1"
+      "cluster.routing.allocation.disk.threshold_enabled": "false"
+    ports:
+      - "19324:9200"
+    volumes:
+      - es8x-3-data:/usr/share/elasticsearch/data
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS 'http://localhost:9200/_cluster/health?wait_for_status=yellow&timeout=2s' >/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+volumes:
+  es7102-1-data:
+  es7102-2-data:
+  es7102-3-data:
+  es717-1-data:
+  es717-2-data:
+  es717-3-data:
+  es8x-1-data:
+  es8x-2-data:
+  es8x-3-data:

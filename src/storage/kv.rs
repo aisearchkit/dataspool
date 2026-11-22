@@ -58,6 +58,32 @@ pub trait KvStore: Send + Sync {
     /// Create iterator over specific column family with prefix
     async fn prefix_scan_cf(&self, cf: ColumnFamily, prefix: &[u8]) -> Result<Vec<(Bytes, Bytes)>>;
 
+    /// Read a bounded page from a prefix range. Implementations should avoid materializing
+    /// the entire range; the default keeps compatibility for simple stores.
+    async fn prefix_scan_page_cf(
+        &self,
+        cf: ColumnFamily,
+        prefix: &[u8],
+        offset: usize,
+        limit: usize,
+    ) -> Result<Vec<(Bytes, Bytes)>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        Ok(self
+            .prefix_scan_cf(cf, prefix)
+            .await?
+            .into_iter()
+            .skip(offset)
+            .take(limit)
+            .collect())
+    }
+
+    /// Count keys in a prefix range. The default implementation is a compatibility fallback.
+    async fn count_prefix_cf(&self, cf: ColumnFamily, prefix: &[u8]) -> Result<usize> {
+        Ok(self.prefix_scan_cf(cf, prefix).await?.len())
+    }
+
     /// Check if key exists
     async fn exists(&self, key: &[u8]) -> Result<bool>;
 

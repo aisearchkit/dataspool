@@ -255,7 +255,10 @@ impl<S: KvStore + Clone + 'static> ShardExecutor<S> {
             stats.docs_written += batch_size as u64;
             offset = new_offset;
 
-            if stats.docs_read % (self.batch_size as u64 * 10).max(1) == 0 {
+            if stats
+                .docs_read
+                .is_multiple_of((self.batch_size as u64 * 10).max(1))
+            {
                 info!(
                     "Shard {} progress: {} docs read, {} written",
                     shard.shard_id, stats.docs_read, stats.docs_written

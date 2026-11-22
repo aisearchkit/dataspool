@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use sqlx::mysql::{MySqlConnectOptions, MySqlPool, MySqlPoolOptions};
 use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions};
 use sqlx::{Execute, QueryBuilder};
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use super::config::{DatabaseType, RelationalConfig};
 use crate::error::{DatspoolError, DriverError};
@@ -90,13 +90,12 @@ impl RelationalSink {
                 Ok(ConnectionPool::Mysql(pool))
             }
             DatabaseType::Postgresql => {
-                let opts: PgConnectOptions =
-                    self.config.connection_url().parse().map_err(|e| {
-                        DatspoolError::Driver(DriverError::ConnectionFailed(format!(
-                            "Invalid PostgreSQL URL: {}",
-                            e
-                        )))
-                    })?;
+                let opts: PgConnectOptions = self.config.connection_url().parse().map_err(|e| {
+                    DatspoolError::Driver(DriverError::ConnectionFailed(format!(
+                        "Invalid PostgreSQL URL: {}",
+                        e
+                    )))
+                })?;
 
                 let pool = PgPoolOptions::new()
                     .max_connections(10)
@@ -112,22 +111,23 @@ impl RelationalSink {
 
                 Ok(ConnectionPool::Postgresql(pool))
             }
-            DatabaseType::Sqlite => {
-                Err(DatspoolError::Driver(DriverError::Unsupported(
-                    "SQLite sink not yet implemented".to_string(),
-                )))
-            }
+            DatabaseType::Sqlite => Err(DatspoolError::Driver(DriverError::Unsupported(
+                "SQLite sink not yet implemented".to_string(),
+            ))),
         }
     }
 
     /// Extract column names and values from a Record
-    fn extract_record_data(&self, record: &Record) -> Result<(Vec<String>, Vec<serde_json::Value>), DatspoolError> {
+    fn extract_record_data(
+        &self,
+        record: &Record,
+    ) -> Result<(Vec<String>, Vec<serde_json::Value>), DatspoolError> {
         let obj = match &record.payload {
             serde_json::Value::Object(map) => map,
             _ => {
                 return Err(DatspoolError::Driver(DriverError::DataError(
                     "Record payload must be a JSON object".to_string(),
-                )))
+                )));
             }
         };
 
@@ -184,12 +184,13 @@ impl Sink for RelationalSink {
         }
 
         let record_count = batch.len();
-        debug!("Writing batch of {} records to {}", record_count, self.config.table);
+        debug!(
+            "Writing batch of {} records to {}",
+            record_count, self.config.table
+        );
 
         let result = match pool {
-            ConnectionPool::Mysql(mysql_pool) => {
-                self.write_batch_mysql(mysql_pool, &batch).await?
-            }
+            ConnectionPool::Mysql(mysql_pool) => self.write_batch_mysql(mysql_pool, &batch).await?,
             ConnectionPool::Postgresql(pg_pool) => {
                 self.write_batch_postgres(pg_pool, &batch).await?
             }
@@ -243,7 +244,6 @@ impl RelationalSink {
         // Build INSERT query based on write mode
         let table_quoted = format!("`{}`", self.config.table);
         let columns_quoted: Vec<String> = columns.iter().map(|c| format!("`{}`", c)).collect();
-        let placeholders = columns.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
 
         let query_prefix = match self.write_mode {
             WriteMode::Insert => format!(
@@ -402,7 +402,7 @@ impl RelationalSink {
         if self.write_mode == WriteMode::Replace {
             let pk_quoted = format!("\"{}\"", self.config.pk_column);
             query_builder.push(format!(" ON CONFLICT ({}) DO UPDATE SET ", pk_quoted));
-            
+
             let mut is_first_col = true;
             for col in &columns {
                 if col == &self.config.pk_column {

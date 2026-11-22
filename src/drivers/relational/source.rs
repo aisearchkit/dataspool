@@ -6,9 +6,9 @@
 //! Relational database source implementation
 
 use async_trait::async_trait;
+use sqlx::Row;
 use sqlx::mysql::{MySqlConnectOptions, MySqlPool, MySqlPoolOptions, MySqlRow};
 use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions, PgRow};
-use sqlx::Row;
 use tracing::{debug, info};
 
 use super::config::{DatabaseType, RelationalConfig};
@@ -71,13 +71,12 @@ impl RelationalSource {
                 Ok(ConnectionPool::Mysql(pool))
             }
             DatabaseType::Postgresql => {
-                let opts: PgConnectOptions =
-                    self.config.connection_url().parse().map_err(|e| {
-                        DatspoolError::Driver(DriverError::ConnectionFailed(format!(
-                            "Invalid PostgreSQL URL: {}",
-                            e
-                        )))
-                    })?;
+                let opts: PgConnectOptions = self.config.connection_url().parse().map_err(|e| {
+                    DatspoolError::Driver(DriverError::ConnectionFailed(format!(
+                        "Invalid PostgreSQL URL: {}",
+                        e
+                    )))
+                })?;
 
                 let pool = PgPoolOptions::new()
                     .max_connections(5)
@@ -93,11 +92,9 @@ impl RelationalSource {
 
                 Ok(ConnectionPool::Postgresql(pool))
             }
-            DatabaseType::Sqlite => {
-                Err(DatspoolError::Driver(DriverError::Unsupported(
-                    "SQLite not yet implemented".to_string(),
-                )))
-            }
+            DatabaseType::Sqlite => Err(DatspoolError::Driver(DriverError::Unsupported(
+                "SQLite not yet implemented".to_string(),
+            ))),
         }
     }
 
@@ -166,11 +163,7 @@ impl RelationalSource {
 
         let payload = serde_json::Value::Object(json_obj);
 
-        Ok(Record::with_id(
-            id.to_string(),
-            "relational",
-            payload,
-        ))
+        Ok(Record::with_id(id.to_string(), "relational", payload))
     }
 
     /// Convert PostgreSQL row to Record
@@ -199,11 +192,7 @@ impl RelationalSource {
 
         let payload = serde_json::Value::Object(json_obj);
 
-        Ok(Record::with_id(
-            id.to_string(),
-            "relational",
-            payload,
-        ))
+        Ok(Record::with_id(id.to_string(), "relational", payload))
     }
 }
 
@@ -248,12 +237,15 @@ impl Source for RelationalSource {
         // Execute query based on pool type
         let (records, last_pk) = match pool {
             ConnectionPool::Mysql(mysql_pool) => {
-                let rows = sqlx::query(&query).fetch_all(mysql_pool).await.map_err(|e| {
-                    DatspoolError::Driver(DriverError::DataError(format!(
-                        "Failed to fetch MySQL rows: {}",
-                        e
-                    )))
-                })?;
+                let rows = sqlx::query(&query)
+                    .fetch_all(mysql_pool)
+                    .await
+                    .map_err(|e| {
+                        DatspoolError::Driver(DriverError::DataError(format!(
+                            "Failed to fetch MySQL rows: {}",
+                            e
+                        )))
+                    })?;
 
                 debug!("Fetched {} MySQL rows", rows.len());
 

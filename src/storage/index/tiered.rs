@@ -18,6 +18,10 @@ pub struct TieredIndexStore<S: KvStore> {
 }
 
 impl<S: KvStore> TieredIndexStore<S> {
+    pub fn config(&self) -> &TieredConfig {
+        &self.config
+    }
+
     pub fn new(config: TieredConfig, metadata_store: Arc<S>) -> Self {
         let l1 = Arc::new(MemoryCache::new(config.memory_capacity));
 

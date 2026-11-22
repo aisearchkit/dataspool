@@ -38,7 +38,7 @@ impl<S: KvStore + Clone + 'static> ShardClaimer<S> {
         Self {
             node_id: NodeId::new(node_id),
             task_store,
-            raft: None, // Single-node mode without Raft
+            raft: None,       // Single-node mode without Raft
             max_attempts: 10, // Try up to 10 shards before giving up
         }
     }
@@ -65,7 +65,7 @@ impl<S: KvStore + Clone + 'static> ShardClaimer<S> {
 
         // Query all tasks and find pending shards
         let tasks = self.task_store.list_tasks().await?;
-        
+
         if tasks.is_empty() {
             debug!("No tasks available");
             return Ok(None);
@@ -76,7 +76,8 @@ impl<S: KvStore + Clone + 'static> ShardClaimer<S> {
         // Collect all pending shards from all tasks
         let mut pending_shards = Vec::new();
         for task in &tasks {
-            let shards = self.task_store
+            let shards = self
+                .task_store
                 .list_shards_by_state(&task.task_id, |s| matches!(s, ShardState::Pending))
                 .await?;
             pending_shards.extend(shards);
@@ -109,20 +110,14 @@ impl<S: KvStore + Clone + 'static> ShardClaimer<S> {
                     continue;
                 }
                 Err(e) => {
-                    warn!(
-                        "Error attempting to claim shard {}: {}",
-                        shard.shard_id, e
-                    );
+                    warn!("Error attempting to claim shard {}: {}", shard.shard_id, e);
                     // Try next shard
                     continue;
                 }
             }
         }
 
-        debug!(
-            "Failed to claim any shard after {} attempts",
-            attempts
-        );
+        debug!("Failed to claim any shard after {} attempts", attempts);
         Ok(None)
     }
 
@@ -131,7 +126,10 @@ impl<S: KvStore + Clone + 'static> ShardClaimer<S> {
     /// Returns Ok(true) if successfully claimed, Ok(false) if already claimed
     async fn try_claim_shard(&self, shard_id: &ShardId) -> Result<bool> {
         // Load current shard state
-        let shard = self.task_store.get_shard(shard_id).await?
+        let shard = self
+            .task_store
+            .get_shard(shard_id)
+            .await?
             .ok_or_else(|| DatspoolError::Internal(format!("Shard not found: {}", shard_id)))?;
 
         // Check if still pending
@@ -172,13 +170,16 @@ impl<S: KvStore + Clone + 'static> ShardClaimer<S> {
         match raft_locked.propose(cmd).await {
             Ok(()) => {
                 info!("Raft proposal accepted for shard {}", shard_id);
-                
+
                 // Verify state changed to Running
                 // (In production, we'd check the proposal result directly)
                 drop(raft_locked); // Release lock before querying
-                let shard = self.task_store.get_shard(shard_id).await?
+                let shard = self
+                    .task_store
+                    .get_shard(shard_id)
+                    .await?
                     .ok_or_else(|| DatspoolError::Internal("Shard disappeared".to_string()))?;
-                
+
                 Ok(matches!(shard.state, ShardState::Running { .. }))
             }
             Err(e) => {
@@ -197,7 +198,10 @@ impl<S: KvStore + Clone + 'static> ShardClaimer<S> {
         };
 
         // Load shard again to minimize race window
-        let shard = self.task_store.get_shard(shard_id).await?
+        let shard = self
+            .task_store
+            .get_shard(shard_id)
+            .await?
             .ok_or_else(|| DatspoolError::Internal("Shard disappeared".to_string()))?;
 
         // Double-check still pending
@@ -229,7 +233,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let db = RocksDbStore::open(dir.path()).unwrap();
         let task_store = Arc::new(TaskStore::new(db));
-        
+
         let claimer = ShardClaimer::new("node-1".to_string(), task_store);
         let result = claimer.try_claim().await.unwrap();
         assert!(result.is_none());
@@ -249,26 +253,26 @@ mod tests {
             "test-sink".to_string(),
         );
         let mut task_with_id = task;
-        task_with_id.task_id = task_id.clone();
+        task_with_id.task_id = task_id;
         task_store.save_task(&task_with_id).await.unwrap();
 
         // Create a pending shard
-        let shard = crate::task::shard::ShardMeta::new(
-            task_id,
-            0,
-            "{}".to_string(),
-        );
+        let shard = crate::task::shard::ShardMeta::new(task_id, 0, "{}".to_string());
         task_store.save_shard(&shard).await.unwrap();
 
         // Try to claim
         let claimer = ShardClaimer::new("node-1".to_string(), task_store.clone());
         let result = claimer.try_claim().await.unwrap();
-        
+
         assert!(result.is_some());
         assert_eq!(result.unwrap(), shard.shard_id.to_string());
 
         // Verify shard is now Running
-        let claimed = task_store.get_shard(&shard.shard_id).await.unwrap().unwrap();
+        let claimed = task_store
+            .get_shard(&shard.shard_id)
+            .await
+            .unwrap()
+            .unwrap();
         assert!(matches!(claimed.state, ShardState::Running { .. }));
     }
 
@@ -286,15 +290,11 @@ mod tests {
             "test-sink".to_string(),
         );
         let mut task_with_id = task;
-        task_with_id.task_id = task_id.clone();
+        task_with_id.task_id = task_id;
         task_store.save_task(&task_with_id).await.unwrap();
 
         // Create a pending shard
-        let shard = crate::task::shard::ShardMeta::new(
-            task_id,
-            0,
-            "{}".to_string(),
-        );
+        let shard = crate::task::shard::ShardMeta::new(task_id, 0, "{}".to_string());
         task_store.save_shard(&shard).await.unwrap();
 
         // First claimer claims it

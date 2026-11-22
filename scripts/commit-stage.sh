@@ -22,15 +22,15 @@ if ! git diff --cached --quiet; then
   exit 1
 fi
 
-# Format only this stage's Rust files; skip child modules to avoid touching unrelated files.
-for path in "$@"; do
-  if [[ "$path" == *.rs ]]; then
-    rustfmt --edition 2024 --config skip_children=true "$path"
-  fi
-done
-
+cargo fmt --all
+cargo fmt --all -- --check
 cargo check --all-targets
-cargo test --lib
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all-features
+if ! command -v cargo-audit >/dev/null 2>&1; then
+  cargo install cargo-audit --locked
+fi
+cargo audit --deny unsound --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2026-0459
 if [[ -n "${ES_7102_URL:-}${ES_717_URL:-}${ES_8X_URL:-}" ]]; then
   : "${ES_7102_URL:?set ES_7102_URL for the complete compatibility matrix}"
   : "${ES_717_URL:?set ES_717_URL for the complete compatibility matrix}"

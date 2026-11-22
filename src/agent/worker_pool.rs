@@ -124,8 +124,8 @@ impl<S: KvStore + Clone + 'static> WorkerPool<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::rocksdb::RocksDbStore;
     use crate::storage::index::TieredConfig;
+    use crate::storage::rocksdb::RocksDbStore;
     use tempfile::tempdir;
 
     #[test]
@@ -133,10 +133,13 @@ mod tests {
         let dir = tempdir().unwrap();
         let db = RocksDbStore::open(dir.path()).unwrap();
         let task_store = Arc::new(TaskStore::new(db.clone()));
-        
+
         let index_config = TieredConfig::default();
-        let index_store = Arc::new(RwLock::new(TieredIndexStore::new(index_config, Arc::new(db))));
-        
+        let index_store = Arc::new(RwLock::new(TieredIndexStore::new(
+            index_config,
+            Arc::new(db),
+        )));
+
         let pool = WorkerPool::new("node-1".to_string(), 4, task_store, index_store).unwrap();
         assert_eq!(pool.node_id, "node-1");
         assert_eq!(pool.limits.max_concurrent_tasks, 4);
