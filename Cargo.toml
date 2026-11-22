@@ -30,7 +30,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 # Raft consensus
-openraft = { version = "0.9", features = ["serde"] }
+openraft = { version = "0.10", features = ["serde"] }
 
 # Storage
 rocksdb = { version = "0.23", default-features = false, features = ["lz4"] }
