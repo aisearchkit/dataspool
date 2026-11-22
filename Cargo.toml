@@ -33,7 +33,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 openraft = { version = "0.9", features = ["serde"] }
 
 # Storage
-rocksdb = { version = "0.23", default-features = false, features = ["lz4"] }
+rocksdb = { version = "0.25", default-features = false, features = ["lz4"] }
 
 # Networking
 tonic = "0.12"
