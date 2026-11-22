@@ -1,0 +1,222 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+//! Durable, shard-scoped FIFO batch queue backed by the configured KV store.
+
+use super::record::{Record, RecordBatch};
+use super::traits::OffsetValue;
+use crate::error::{DatspoolError, Result};
+use crate::storage::kv::{KvStore, cf};
+use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CacheEntry {
+    records: Vec<Record>,
+    next_offset: Option<OffsetValue>,
+    source_count: u64,
+}
+
+/// A persistent queue scoped to one migration shard. Entries are acknowledged
+/// only after the destination confirms successful delivery.
+pub struct LocalBatchCache<S: KvStore> {
+    store: Arc<S>,
+    prefix: Vec<u8>,
+    max_entries: usize,
+}
+
+impl<S: KvStore> Clone for LocalBatchCache<S> {
+    fn clone(&self) -> Self {
+        Self {
+            store: self.store.clone(),
+            prefix: self.prefix.clone(),
+            max_entries: self.max_entries,
+        }
+    }
+}
+
+impl<S: KvStore> LocalBatchCache<S> {
+    pub fn new(store: Arc<S>, max_entries: usize) -> Self {
+        Self::with_namespace(store, max_entries, "default")
+    }
+
+    pub fn new_for_shard(store: Arc<S>, max_entries: usize, shard_id: &str) -> Self {
+        Self::with_namespace(store, max_entries, shard_id)
+    }
+
+    fn with_namespace(store: Arc<S>, max_entries: usize, namespace: &str) -> Self {
+        let safe_namespace: String = namespace
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || "-_".contains(c) {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        Self {
+            store,
+            prefix: format!("migration-batch/{}/", safe_namespace).into_bytes(),
+            max_entries: max_entries.max(1),
+        }
+    }
+
+    pub async fn enqueue(&self, batch: &RecordBatch) -> Result<String> {
+        self.enqueue_with_checkpoint(batch, None, batch.len() as u64)
+            .await
+    }
+
+    /// Persist the batch and the source cursor together. A restart can replay
+    /// the batch and advance the shard checkpoint only after delivery succeeds.
+    pub async fn enqueue_with_checkpoint(
+        &self,
+        batch: &RecordBatch,
+        next_offset: Option<OffsetValue>,
+        source_count: u64,
+    ) -> Result<String> {
+        if self.pending().await? >= self.max_entries {
+            return Err(DatspoolError::Internal(format!(
+                "local migration cache is full ({} entries; limit {})",
+                self.pending().await?,
+                self.max_entries
+            )));
+        }
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let seq = SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let mut key = self.prefix.clone();
+        key.extend_from_slice(format!("{:032x}-{:016x}", now, seq).as_bytes());
+        let entry = CacheEntry {
+            records: batch.records().to_vec(),
+            next_offset,
+            source_count,
+        };
+        self.store
+            .put_cf(cf::CACHE, &key, &serde_json::to_vec(&entry)?)
+            .await?;
+        Ok(String::from_utf8_lossy(&key).into_owned())
+    }
+
+    async fn peek_entry(&self) -> Result<Option<(String, CacheEntry)>> {
+        let entries = self.store.prefix_scan_cf(cf::CACHE, &self.prefix).await?;
+        match entries.into_iter().next() {
+            Some((key, value)) => {
+                let entry: CacheEntry = serde_json::from_slice(&value)?;
+                Ok(Some((String::from_utf8_lossy(&key).into_owned(), entry)))
+            }
+            None => Ok(None),
+        }
+    }
+
+    pub async fn peek(&self) -> Result<Option<(String, RecordBatch)>> {
+        Ok(self
+            .peek_entry()
+            .await?
+            .map(|(key, entry)| (key, entry.records.into())))
+    }
+
+    pub async fn ack(&self, key: &str) -> Result<()> {
+        self.store.delete_cf(cf::CACHE, key.as_bytes()).await
+    }
+
+    pub async fn pending(&self) -> Result<usize> {
+        Ok(self
+            .store
+            .prefix_scan_cf(cf::CACHE, &self.prefix)
+            .await?
+            .len())
+    }
+
+    /// Deliver and acknowledge one batch, returning its checkpoint only after
+    /// the destination has accepted the complete batch.
+    pub async fn deliver_one_with_checkpoint<F, Fut>(&self, deliver: F) -> Result<bool>
+    where
+        F: FnOnce(RecordBatch, Option<OffsetValue>, u64) -> Fut,
+        Fut: std::future::Future<Output = Result<()>>,
+    {
+        let Some((key, entry)) = self.peek_entry().await? else {
+            return Ok(false);
+        };
+        deliver(entry.records.into(), entry.next_offset, entry.source_count).await?;
+        // Ack only after both destination delivery and checkpoint persistence.
+        self.ack(&key).await?;
+        Ok(true)
+    }
+
+    pub async fn deliver_one<F, Fut>(&self, deliver: F) -> Result<bool>
+    where
+        F: FnOnce(RecordBatch) -> Fut,
+        Fut: std::future::Future<Output = Result<()>>,
+    {
+        self.deliver_one_with_checkpoint(|batch, _, _| deliver(batch))
+            .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::rocksdb::RocksDbStore;
+    use serde_json::json;
+    use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn persists_checkpoint_until_acknowledged() {
+        let dir = tempdir().unwrap();
+        let store = Arc::new(RocksDbStore::open(dir.path()).unwrap());
+        let cache = LocalBatchCache::new_for_shard(store, 4, "shard-a");
+        let batch = RecordBatch::from(vec![Record::with_id("1", "elasticsearch", json!({"v": 1}))]);
+        let offset = OffsetValue::Custom(json!({"pit_id":"pit-1","search_after":[1]}));
+        cache
+            .enqueue_with_checkpoint(&batch, Some(offset.clone()), 1)
+            .await
+            .unwrap();
+        let acknowledged = cache
+            .deliver_one_with_checkpoint(|restored, next_offset, source_count| async move {
+                assert!(!restored.is_empty());
+                assert_eq!(next_offset, Some(offset));
+                assert_eq!(source_count, 1);
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert!(acknowledged);
+        assert_eq!(cache.pending().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn failed_delivery_keeps_batch() {
+        let dir = tempdir().unwrap();
+        let store = Arc::new(RocksDbStore::open(dir.path()).unwrap());
+        let cache = LocalBatchCache::new_for_shard(store, 2, "shard-b");
+        cache
+            .enqueue(&RecordBatch::from(vec![Record::new("es", json!({"v": 1}))]))
+            .await
+            .unwrap();
+        let result = cache
+            .deliver_one(|_| async {
+                Err(DatspoolError::Internal("destination unavailable".into()))
+            })
+            .await;
+        assert!(result.is_err());
+        assert_eq!(cache.pending().await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn queues_are_isolated_by_shard() {
+        let dir = tempdir().unwrap();
+        let store = Arc::new(RocksDbStore::open(dir.path()).unwrap());
+        let a = LocalBatchCache::new_for_shard(store.clone(), 2, "a");
+        let b = LocalBatchCache::new_for_shard(store, 2, "b");
+        a.enqueue(&RecordBatch::from(vec![Record::new("es", json!({"v": 1}))]))
+            .await
+            .unwrap();
+        assert_eq!(a.pending().await.unwrap(), 1);
+        assert_eq!(b.pending().await.unwrap(), 0);
+    }
+}

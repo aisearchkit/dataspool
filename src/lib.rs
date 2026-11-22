@@ -39,6 +39,7 @@ pub use comms::{GrpcClient, GrpcServer};
 pub use config::DatspoolConfig;
 pub use error::{ConfigError, DatspoolError, DriverError, RaftError, Result, StorageError};
 pub use pipeline::{
+    AdaptiveBackpressure, BackpressureConfig, ClusterPressure, FlowWindow, LocalBatchCache,
     Pipeline, PipelineConfig, PipelineStats, Record, RecordBatch, Sink, Source, Transform,
 };
 pub use raft::{Command, RaftNode};

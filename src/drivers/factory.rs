@@ -25,6 +25,12 @@ pub enum SourceConfig {
         #[serde(flatten)]
         config: super::relational::RelationalConfig,
     },
+    /// Append-only Elasticsearch change-log source (application outbox / CDC connector).
+    ElasticsearchCdc {
+        connection: super::document::DocumentConfig,
+        #[serde(default)]
+        cdc: super::document::CdcConfig,
+    },
     // Future drivers:
     // NoSql { config: NoSqlConfig }, // MongoDB, Redis, Cassandra
     // Streaming { config: StreamingConfig }, // Kafka, Pulsar, AutoMQ
@@ -52,7 +58,7 @@ pub enum SinkConfig {
 }
 
 /// Create a Source instance from configuration
-/// 
+///
 /// **License Enforcement**: Checks if the requested driver is licensed
 pub fn create_source(config: &SourceConfig) -> Result<Box<dyn Source>> {
     create_source_with_license(config, None)
@@ -68,11 +74,12 @@ pub fn create_source_with_license(
         let feature = match config {
             SourceConfig::Document { .. } => Feature::DocumentMigration,
             SourceConfig::Relational { .. } => Feature::RelationalMigration,
+            SourceConfig::ElasticsearchCdc { .. } => Feature::StreamingMigration,
         };
 
-        manager.check_feature(feature).map_err(|e| {
-            DatspoolError::Configuration(format!("License check failed: {}", e))
-        })?;
+        manager
+            .check_feature(feature)
+            .map_err(|e| DatspoolError::Configuration(format!("License check failed: {}", e)))?;
     }
 
     match config {
@@ -82,6 +89,11 @@ pub fn create_source_with_license(
         }
         SourceConfig::Relational { config } => {
             let source = super::relational::RelationalSource::new(config.clone())?;
+            Ok(Box::new(source))
+        }
+        SourceConfig::ElasticsearchCdc { connection, cdc } => {
+            let source =
+                super::document::ElasticsearchCdcSource::new(connection.clone(), cdc.clone());
             Ok(Box::new(source))
         }
     }
@@ -106,9 +118,9 @@ pub fn create_sink_with_license(
             SinkConfig::Relational { .. } => Feature::RelationalMigration,
         };
 
-        manager.check_feature(feature).map_err(|e| {
-            DatspoolError::Configuration(format!("License check failed: {}", e))
-        })?;
+        manager
+            .check_feature(feature)
+            .map_err(|e| DatspoolError::Configuration(format!("License check failed: {}", e)))?;
     }
 
     match config {
@@ -128,7 +140,7 @@ pub fn create_sink_with_license(
 pub struct TaskConfig {
     pub source: SourceConfig,
     pub sink: SinkConfig,
-    
+
     /// Optional transformations to apply
     #[serde(default)]
     pub transforms: Vec<TransformConfig>,
@@ -142,12 +154,12 @@ pub enum TransformConfig {
     FieldRename {
         mappings: std::collections::HashMap<String, String>,
     },
-    
+
     /// Filter records
     Filter {
         condition: String, // JSON path expression
     },
-    
+
     /// No-op (pass-through)
     NoOp,
 }
@@ -161,7 +173,7 @@ mod tests {
         let config = SourceConfig::Document {
             config: crate::drivers::document::DocumentConfig::local("test-index"),
         };
-        
+
         let json = serde_json::to_string(&config).unwrap();
         assert!(json.contains(r#""type":"document"#));
         assert!(json.contains("test-index"));
@@ -174,7 +186,7 @@ mod tests {
             "urls": ["http://localhost:9200"],
             "index": "test-index"
         }"#;
-        
+
         let config: SourceConfig = serde_json::from_str(json).unwrap();
         match config {
             SourceConfig::Document { config } => {
@@ -186,11 +198,29 @@ mod tests {
     }
 
     #[test]
+    fn test_create_elasticsearch_cdc_source() {
+        let config: SourceConfig = serde_json::from_value(serde_json::json!({
+            "type": "elasticsearch_cdc",
+            "connection": {
+                "urls": ["http://localhost:9200"],
+                "index": "change-log"
+            },
+            "cdc": {
+                "change_index": "events",
+                "sequence_field": "sequence"
+            }
+        }))
+        .unwrap();
+        let source = create_source(&config).unwrap();
+        assert_eq!(source.source_type(), "elasticsearch_cdc");
+    }
+
+    #[test]
     fn test_create_source() {
         let config = SourceConfig::Document {
             config: crate::drivers::document::DocumentConfig::local("test-index"),
         };
-        
+
         let source = create_source(&config).unwrap();
         assert_eq!(source.source_type(), "document");
     }
@@ -206,10 +236,10 @@ mod tests {
             },
             transforms: vec![],
         };
-        
+
         let json = serde_json::to_string_pretty(&task_config).unwrap();
         println!("Task config JSON:\n{}", json);
-        
+
         // Verify we can deserialize it back
         let _parsed: TaskConfig = serde_json::from_str(&json).unwrap();
     }

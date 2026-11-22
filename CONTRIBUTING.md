@@ -35,7 +35,13 @@ git add .
 git commit -m "feat(scheduler): add task auto-sharding by date range"
 ```
 
-### 5. 推送并创建 Pull Request
+### 5. 阶段验证与自动提交
+
+每个独立开发阶段结束后，必须执行 `DEVELOPMENT.md` 中的自动化质量门禁。推荐直接运行 `scripts/commit-stage.sh 'feat(scope): summary' path...`：脚本会格式化指定 Rust 文件、执行完整编译、单元测试和兼容集成测试、检查 diff，并只暂存列出的文件后自动创建 Conventional Commit。检查失败时先修复，不得提交；确认属于仓库既有基线问题时必须明确记录，不能声称检查通过。禁止盲目执行 `git add .`。
+
+自动提交不代表自动推送。未经明确要求，不得推送远程分支或创建 PR。
+
+### 6. 推送并创建 Pull Request
 
 ```bash
 git push origin feat/your-feature-name

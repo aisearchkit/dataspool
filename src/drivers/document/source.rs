@@ -23,7 +23,7 @@ use crate::error::{DatspoolError, DriverError, Result};
 use crate::pipeline::{OffsetValue, Record, RecordBatch, Source};
 use async_trait::async_trait;
 use reqwest::{Client, ClientBuilder};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tracing::{debug, info, warn};
 
 /// Document store API mode
@@ -88,20 +88,21 @@ impl DocumentSource {
             use base64::Engine;
             let credentials = format!("{}:{}", username, password);
             let encoded = base64::engine::general_purpose::STANDARD.encode(credentials.as_bytes());
-            
+
             let mut headers = reqwest::header::HeaderMap::new();
             let auth_value = format!("Basic {}", encoded);
             headers.insert(
                 reqwest::header::AUTHORIZATION,
-                reqwest::header::HeaderValue::from_str(&auth_value)
-                    .map_err(|e| DriverError::ConnectionFailed(format!("Invalid auth header: {}", e)))?
+                reqwest::header::HeaderValue::from_str(&auth_value).map_err(|e| {
+                    DriverError::ConnectionFailed(format!("Invalid auth header: {}", e))
+                })?,
             );
             builder = builder.default_headers(headers);
         }
 
-        builder
-            .build()
-            .map_err(|e| DriverError::ConnectionFailed(format!("Failed to build HTTP client: {}", e)).into())
+        builder.build().map_err(|e| {
+            DriverError::ConnectionFailed(format!("Failed to build HTTP client: {}", e)).into()
+        })
     }
 
     /// Detect version and select API mode
@@ -123,7 +124,8 @@ impl DocumentSource {
             return Err(DriverError::ConnectionFailed(format!(
                 "Failed to get cluster info: HTTP {}",
                 response.status()
-            )).into());
+            ))
+            .into());
         }
 
         let body: Value = response
@@ -181,7 +183,10 @@ impl DocumentSource {
             self.config.index, self.config.batch_size
         );
 
-        let url = format!("{}{}/_search?scroll={}", self.base_url, self.config.index, scroll_timeout);
+        let url = format!(
+            "{}{}/_search?scroll={}",
+            self.base_url, self.config.index, scroll_timeout
+        );
 
         let response = client
             .post(&url)
@@ -194,13 +199,13 @@ impl DocumentSource {
             return Err(DriverError::DataError(format!(
                 "Scroll init failed: HTTP {}",
                 response.status()
-            )).into());
+            ))
+            .into());
         }
 
-        let body: Value = response
-            .json()
-            .await
-            .map_err(|e| DriverError::DataError(format!("Failed to parse scroll response: {}", e)))?;
+        let body: Value = response.json().await.map_err(|e| {
+            DriverError::DataError(format!("Failed to parse scroll response: {}", e))
+        })?;
 
         let scroll_id = body["_scroll_id"]
             .as_str()
@@ -243,13 +248,13 @@ impl DocumentSource {
             return Err(DriverError::DataError(format!(
                 "Scroll continuation failed: HTTP {}",
                 response.status()
-            )).into());
+            ))
+            .into());
         }
 
-        response
-            .json()
-            .await
-            .map_err(|e| DriverError::DataError(format!("Failed to parse scroll response: {}", e)).into())
+        response.json().await.map_err(|e| {
+            DriverError::DataError(format!("Failed to parse scroll response: {}", e)).into()
+        })
     }
 
     /// Clear scroll context
@@ -273,7 +278,10 @@ impl DocumentSource {
         debug!("Initializing PIT: index={}", self.config.index);
 
         // Open PIT
-        let url = format!("{}{}/_pit?keep_alive={}", self.base_url, self.config.index, keep_alive);
+        let url = format!(
+            "{}{}/_pit?keep_alive={}",
+            self.base_url, self.config.index, keep_alive
+        );
 
         let response = client
             .post(&url)
@@ -285,7 +293,8 @@ impl DocumentSource {
             return Err(DriverError::DataError(format!(
                 "PIT open failed: HTTP {}",
                 response.status()
-            )).into());
+            ))
+            .into());
         }
 
         let body: Value = response
@@ -328,13 +337,17 @@ impl DocumentSource {
             return Err(DriverError::DataError(format!(
                 "PIT search failed: HTTP {}",
                 response.status()
-            )).into());
+            ))
+            .into());
         }
 
-        let body: Value = response
-            .json::<Value>()
-            .await
-            .map_err(|e| DatspoolError::Driver(DriverError::DataError(format!("Failed to parse search response: {}", e))))?;
+        let body: Value = response.json::<Value>().await.map_err(|e| {
+            DatspoolError::Driver(DriverError::DataError(format!(
+                "Failed to parse search response: {}",
+                e
+            )))
+        })?;
+        let pit_id = body["pit_id"].as_str().unwrap_or(&pit_id).to_string();
 
         // Extract total count
         let total = body["hits"]["total"]["value"]
@@ -392,13 +405,13 @@ impl DocumentSource {
             return Err(DriverError::DataError(format!(
                 "PIT search failed: HTTP {}",
                 response.status()
-            )).into());
+            ))
+            .into());
         }
 
-        response
-            .json()
-            .await
-            .map_err(|e| DriverError::DataError(format!("Failed to parse search response: {}", e)).into())
+        response.json().await.map_err(|e| {
+            DriverError::DataError(format!("Failed to parse search response: {}", e)).into()
+        })
     }
 
     /// Close PIT
@@ -455,22 +468,66 @@ impl DocumentSource {
 
 impl DocumentSource {
     /// Read batch using PIT API
-    async fn read_batch_pit(&mut self, client: &Client) -> Result<(RecordBatch, OffsetValue)> {
-        // Initialize PIT if first read
+    async fn read_batch_pit(
+        &mut self,
+        client: &Client,
+        offset: &OffsetValue,
+    ) -> Result<(RecordBatch, OffsetValue)> {
+        // Restore the live PIT cursor from the durable shard checkpoint after restart.
         if self.pit_state.is_none() {
-            let state = self.init_pit(client).await?;
-            self.pit_state = Some(state);
+            let restored = match offset {
+                OffsetValue::Custom(value)
+                    if value["driver"].as_str() == Some("elasticsearch_pit") =>
+                {
+                    let pit_id = value["pit_id"]
+                        .as_str()
+                        .ok_or_else(|| {
+                            DriverError::DataError("PIT checkpoint is missing pit_id".into())
+                        })?
+                        .to_string();
+                    let search_after = value["search_after"].as_array().cloned();
+                    let docs_read = value["docs_read"].as_u64().unwrap_or(0);
+                    Some(PitState {
+                        pit_id,
+                        docs_read,
+                        search_after,
+                    })
+                }
+                _ => None,
+            };
+            self.pit_state = Some(match restored {
+                Some(state) => {
+                    info!(
+                        docs_read = state.docs_read,
+                        "Restored Elasticsearch PIT checkpoint"
+                    );
+                    state
+                }
+                None => self.init_pit(client).await?,
+            });
         }
 
-        let pit_state = self
-            .pit_state
-            .as_ref()
-            .ok_or_else(|| DriverError::DataError("No PIT state".to_string()))?;
+        let (pit_id, search_after, docs_read) = {
+            let state = self
+                .pit_state
+                .as_ref()
+                .ok_or_else(|| DriverError::DataError("No PIT state".to_string()))?;
+            (
+                state.pit_id.clone(),
+                state.search_after.clone(),
+                state.docs_read,
+            )
+        };
 
-        // Search with PIT
+        // Search with PIT. Elasticsearch may rotate the PIT id on each response.
         let body = self
-            .search_pit(client, &pit_state.pit_id, pit_state.search_after.as_ref())
+            .search_pit(client, &pit_id, search_after.as_ref())
             .await?;
+        if let Some(rotated_id) = body["pit_id"].as_str() {
+            if let Some(state) = self.pit_state.as_mut() {
+                state.pit_id = rotated_id.to_string();
+            }
+        }
 
         // Parse hits
         let batch = self.parse_hits(&body["hits"])?;
@@ -487,15 +544,23 @@ impl DocumentSource {
             None
         };
 
-        // Update offset
-        let new_docs_read = pit_state.docs_read + batch_size as u64;
-        let new_offset = OffsetValue::DocumentCount(new_docs_read);
+        // Count raw hits, including documents skipped because _source is disabled.
+        let hits_read = body["hits"]["hits"].as_array().map_or(0, Vec::len) as u64;
+        let new_docs_read = docs_read + hits_read;
 
-        // Update PIT state
-        if let Some(ref mut state) = self.pit_state {
-            state.docs_read = new_docs_read;
-            state.search_after = search_after;
-        }
+        // Update PIT state and emit a restart-safe opaque cursor.
+        let state = self
+            .pit_state
+            .as_mut()
+            .ok_or_else(|| DriverError::DataError("No PIT state".to_string()))?;
+        state.docs_read = new_docs_read;
+        state.search_after = search_after;
+        let new_offset = OffsetValue::Custom(json!({
+            "driver": "elasticsearch_pit",
+            "pit_id": state.pit_id,
+            "docs_read": new_docs_read,
+            "search_after": state.search_after,
+        }));
 
         debug!(
             "Read batch (PIT): {} docs, total: {}",
@@ -552,7 +617,9 @@ impl Source for DocumentSource {
 
         let urls = self.config.parse_urls()?;
         if urls.is_empty() {
-            return Err(DriverError::DataError("No document store URLs provided".to_string()).into());
+            return Err(
+                DriverError::DataError("No document store URLs provided".to_string()).into(),
+            );
         }
 
         self.base_url = urls[0].as_str().trim_end_matches('/').to_string();
@@ -570,16 +637,16 @@ impl Source for DocumentSource {
 
     async fn read_batch(
         &mut self,
-        _offset: &OffsetValue,
+        offset: &OffsetValue,
         _batch_size: usize,
     ) -> Result<(RecordBatch, OffsetValue)> {
-        let client = self
-            .client
-            .clone()
-            .ok_or_else(|| DriverError::ConnectionFailed("Not connected to document store".to_string()))?;
+        self.config.batch_size = _batch_size.max(1);
+        let client = self.client.clone().ok_or_else(|| {
+            DriverError::ConnectionFailed("Not connected to document store".to_string())
+        })?;
 
         match self.api_mode {
-            ApiMode::PointInTime => self.read_batch_pit(&client).await,
+            ApiMode::PointInTime => self.read_batch_pit(&client, offset).await,
             ApiMode::Scroll => self.read_batch_scroll(&client).await,
         }
     }

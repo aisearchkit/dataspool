@@ -19,6 +19,11 @@ impl<S: KvStore> TaskStore<S> {
         Self { store }
     }
 
+    /// Borrow the underlying KV store for shard-scoped durable pipeline queues.
+    pub fn kv_store(&self) -> &S {
+        &self.store
+    }
+
     /// Save task metadata
     pub async fn save_task(&self, task: &TaskMeta) -> Result<()> {
         let key = format!("task:{}", task.task_id);

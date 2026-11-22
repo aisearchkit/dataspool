@@ -7,10 +7,11 @@
 
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tracing::{info, warn};
+use tracing::info;
 
-use crate::error::Result;
-use crate::pipeline::{RecordBatch, Source, Sink};
+use crate::drivers::factory::{SinkConfig, SourceConfig, create_sink, create_source};
+use crate::error::{DatspoolError, Result};
+use crate::pipeline::{LocalBatchCache, Sink, Source};
 use crate::storage::index::TieredIndexStore;
 use crate::storage::kv::KvStore;
 use crate::task::shard::ShardMeta;
@@ -55,7 +56,10 @@ impl<S: KvStore + Clone + 'static> Clone for ShardExecutor<S> {
 }
 
 impl<S: KvStore + Clone + 'static> ShardExecutor<S> {
-    pub fn new(task_store: Arc<TaskStore<S>>, index_store: Arc<RwLock<TieredIndexStore<S>>>) -> Self {
+    pub fn new(
+        task_store: Arc<TaskStore<S>>,
+        index_store: Arc<RwLock<TieredIndexStore<S>>>,
+    ) -> Self {
         Self {
             task_store,
             index_store,
@@ -68,28 +72,56 @@ impl<S: KvStore + Clone + 'static> ShardExecutor<S> {
         self
     }
 
-    /// Execute a shard migration
+    /// Load source/sink configurations from the owning task and execute a shard.
     pub async fn execute(&self, shard_id: &str) -> Result<ExecutionStats> {
+        use std::str::FromStr;
+
         info!("Executing shard: {}", shard_id);
-        
-        // TODO: Implement full shard execution
-        // Current limitation: We need a way to deserialize Source/Sink from shard config
-        // This requires a factory pattern or enum-based dispatch
-        
-        // For now, return placeholder stats
-        let stats = ExecutionStats {
-            start_time: Some(std::time::Instant::now()),
-            end_time: Some(std::time::Instant::now()),
-            ..Default::default()
-        };
-        
-        info!("Shard {} execution completed (placeholder)", shard_id);
-        
+        let shard_key = crate::types::ShardId::from_str(shard_id).map_err(|e| {
+            DatspoolError::Configuration(format!("Invalid shard id '{shard_id}': {e}"))
+        })?;
+        let shard = self
+            .task_store
+            .get_shard(&shard_key)
+            .await?
+            .ok_or_else(|| DatspoolError::Internal(format!("Shard {shard_id} not found")))?;
+        let task = self
+            .task_store
+            .get_task(&shard.task_id)
+            .await?
+            .ok_or_else(|| DatspoolError::Internal(format!("Task {} not found", shard.task_id)))?;
+
+        let source_config: SourceConfig = serde_json::from_str(&task.source_config)
+            .map_err(|e| DatspoolError::Configuration(format!("Invalid source config: {e}")))?;
+        let sink_config: SinkConfig = serde_json::from_str(&task.sink_config)
+            .map_err(|e| DatspoolError::Configuration(format!("Invalid sink config: {e}")))?;
+        let mut source = create_source(&source_config)?;
+        let mut sink = create_sink(&sink_config)?;
+
+        let stats = self
+            .execute_pipeline_with_instances(&shard, source.as_mut(), sink.as_mut())
+            .await?;
+        let mut completed = self
+            .task_store
+            .get_shard(&shard_key)
+            .await?
+            .ok_or_else(|| {
+                DatspoolError::Internal(format!("Shard {shard_id} disappeared during execution"))
+            })?;
+        completed.complete(stats.docs_written);
+        self.task_store.save_shard(&completed).await?;
+
+        info!(
+            shard_id,
+            docs_read = stats.docs_read,
+            docs_written = stats.docs_written,
+            "Shard execution completed"
+        );
         Ok(stats)
     }
 
     /// Execute pipeline for a shard (will be used when Source/Sink factory is ready)
-    /// 
+    ///
     /// Example usage:
     /// ```ignore
     /// let source = create_source_from_config(&shard.source_config)?;
@@ -112,51 +144,110 @@ impl<S: KvStore + Clone + 'static> ShardExecutor<S> {
         source.connect().await?;
         sink.connect().await?;
 
-        // Resume from last offset if available
-        let mut offset = shard.offset.clone();
+        // Use the latest durable shard checkpoint, not a possibly stale caller copy.
+        let current_shard = self.task_store.get_shard(&shard.shard_id).await?;
+        let mut offset = current_shard
+            .as_ref()
+            .map(|stored| stored.offset.clone())
+            .unwrap_or_else(|| shard.offset.clone());
+        let cache = LocalBatchCache::new_for_shard(
+            Arc::new(self.task_store.kv_store().clone()),
+            128,
+            &shard.shard_id.to_string(),
+        );
+
+        // Replay durable batches before reading new source data after a restart.
+        while cache.pending().await? > 0 {
+            let task_store = self.task_store.clone();
+            let shard_id = shard.shard_id;
+            let sink_ref = &mut *sink;
+            let delivered = cache
+                .deliver_one_with_checkpoint(|batch, next_offset, source_count| async move {
+                    let write = sink_ref.write_batch(batch).await?;
+                    if !write.is_success() {
+                        return Err(crate::error::DatspoolError::Internal(format!(
+                            "cached batch delivery failed: {} failed: {}",
+                            write.failed_count,
+                            write.errors.join("; ")
+                        )));
+                    }
+                    if let Some(next_offset) = next_offset {
+                        let mut stored =
+                            task_store.get_shard(&shard_id).await?.ok_or_else(|| {
+                                crate::error::DatspoolError::Internal(format!(
+                                    "Shard {} not found",
+                                    shard_id
+                                ))
+                            })?;
+                        // Checkpoint writes are idempotent if a crash occurred after save but before cache ACK.
+                        if stored.offset != next_offset {
+                            stored.update_progress(source_count, 0, next_offset);
+                            task_store.save_shard(&stored).await?;
+                        }
+                    }
+                    Ok(())
+                })
+                .await?;
+            if !delivered {
+                break;
+            }
+        }
+        if let Some(stored) = self.task_store.get_shard(&shard.shard_id).await? {
+            offset = stored.offset;
+        }
 
         loop {
-            // Read batch from source
+            // Read batch from source. The source receives the committed cursor.
             let (batch, new_offset) = source.read_batch(&offset, self.batch_size).await?;
             let batch_size = batch.len();
-
             if batch_size == 0 {
                 info!("No more data to read for shard {}", shard.shard_id);
                 break;
             }
 
+            // Persist payload + next cursor before attempting destination delivery.
+            cache
+                .enqueue_with_checkpoint(&batch, Some(new_offset.clone()), batch_size as u64)
+                .await?;
+            let task_store = self.task_store.clone();
+            let shard_id = shard.shard_id;
+            let sink_ref = &mut *sink;
+            cache
+                .deliver_one_with_checkpoint(|cached_batch, next_offset, source_count| async move {
+                    let write = sink_ref.write_batch(cached_batch).await?;
+                    if !write.is_success() {
+                        return Err(crate::error::DatspoolError::Internal(format!(
+                            "batch delivery failed for shard {}: {} failed: {}",
+                            shard_id,
+                            write.failed_count,
+                            write.errors.join("; ")
+                        )));
+                    }
+                    if let Some(next_offset) = next_offset {
+                        let mut stored =
+                            task_store.get_shard(&shard_id).await?.ok_or_else(|| {
+                                crate::error::DatspoolError::Internal(format!(
+                                    "Shard {} not found",
+                                    shard_id
+                                ))
+                            })?;
+                        if stored.offset != next_offset {
+                            stored.update_progress(source_count, 0, next_offset);
+                            task_store.save_shard(&stored).await?;
+                        }
+                    }
+                    Ok(())
+                })
+                .await?;
+
             stats.docs_read += batch_size as u64;
-
-            // Index document IDs to tiered storage
-            if let Err(e) = self.index_documents(&batch).await {
-                warn!("Failed to index documents: {}", e);
-                // Continue execution even if indexing fails (non-critical)
-            } else {
-                stats.docs_indexed += batch_size as u64;
-            }
-
-            // Write batch to sink
-            sink.write_batch(batch).await?;
             stats.docs_written += batch_size as u64;
+            offset = new_offset;
 
-            // Update offset
-            offset = new_offset.clone();
-
-            // Checkpoint offset periodically
-            if stats.docs_read % 10_000 == 0 {
-                if let Err(e) = self.checkpoint_offset(&shard.shard_id, &offset, stats.docs_read).await {
-                    warn!("Failed to checkpoint offset for shard {}: {}", shard.shard_id, e);
-                    // Continue execution even if checkpoint fails
-                } else {
-                    info!("Checkpointed shard {} at {} docs", shard.shard_id, stats.docs_read);
-                }
-            }
-
-            // Report progress periodically (every 10 batches)
-            if stats.docs_read % (self.batch_size as u64 * 10) == 0 {
+            if stats.docs_read % (self.batch_size as u64 * 10).max(1) == 0 {
                 info!(
-                    "Shard {} progress: {} docs read, {} written, {} indexed",
-                    shard.shard_id, stats.docs_read, stats.docs_written, stats.docs_indexed
+                    "Shard {} progress: {} docs read, {} written",
+                    shard.shard_id, stats.docs_read, stats.docs_written
                 );
             }
         }
@@ -168,46 +259,12 @@ impl<S: KvStore + Clone + 'static> ShardExecutor<S> {
         stats.end_time = Some(std::time::Instant::now());
         Ok(stats)
     }
-
-    /// Index document IDs to tiered storage
-    async fn index_documents(&self, _batch: &RecordBatch) -> Result<()> {
-        // For now, we don't index individual documents
-        // TODO: Implement chunking and batch indexing when needed
-        // This would require task_id and chunk_id from shard metadata
-        Ok(())
-    }
-
-    /// Checkpoint shard progress (offset + record count)
-    async fn checkpoint_offset(
-        &self,
-        shard_id: &crate::types::ShardId,
-        offset: &crate::pipeline::OffsetValue,
-        processed_records: u64,
-    ) -> Result<()> {
-        use crate::types::ShardId;
-        
-        // Load current shard
-        let mut shard = self.task_store
-            .get_shard(shard_id)
-            .await?
-            .ok_or_else(|| crate::error::DatspoolError::Internal(
-                format!("Shard {} not found", shard_id)
-            ))?;
-        
-        // Update progress
-        shard.update_progress(processed_records, 0, offset.clone());
-        
-        // Save to TaskStore
-        self.task_store.save_shard(&shard).await?;
-        
-        Ok(())
-    }
 }
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::rocksdb::RocksDbStore;
     use crate::storage::index::TieredConfig;
+    use crate::storage::rocksdb::RocksDbStore;
     use tempfile::tempdir;
 
     #[test]
@@ -215,10 +272,13 @@ mod tests {
         let dir = tempdir().unwrap();
         let db = RocksDbStore::open(dir.path()).unwrap();
         let task_store = Arc::new(TaskStore::new(db.clone()));
-        
+
         let index_config = TieredConfig::default();
-        let index_store = Arc::new(RwLock::new(TieredIndexStore::new(index_config, Arc::new(db))));
-        
+        let index_store = Arc::new(RwLock::new(TieredIndexStore::new(
+            index_config,
+            Arc::new(db),
+        )));
+
         let executor = ShardExecutor::new(task_store, index_store);
         assert_eq!(executor.batch_size, 1000);
     }
@@ -228,10 +288,13 @@ mod tests {
         let dir = tempdir().unwrap();
         let db = RocksDbStore::open(dir.path()).unwrap();
         let task_store = Arc::new(TaskStore::new(db.clone()));
-        
+
         let index_config = TieredConfig::default();
-        let index_store = Arc::new(RwLock::new(TieredIndexStore::new(index_config, Arc::new(db))));
-        
+        let index_store = Arc::new(RwLock::new(TieredIndexStore::new(
+            index_config,
+            Arc::new(db),
+        )));
+
         let executor = ShardExecutor::new(task_store, index_store).with_batch_size(5000);
         assert_eq!(executor.batch_size, 5000);
     }

@@ -126,6 +126,9 @@ pub struct WriteResult {
     /// Number of failed records
     pub failed_count: usize,
 
+    /// Number of transient cluster rejections (429 / rejected execution)
+    pub rejected_count: usize,
+
     /// Total bytes written
     pub bytes_written: u64,
 
@@ -139,6 +142,7 @@ impl WriteResult {
         Self {
             success_count: count,
             failed_count: 0,
+            rejected_count: 0,
             bytes_written: bytes,
             errors: Vec::new(),
         }

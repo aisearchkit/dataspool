@@ -158,9 +158,12 @@ pub mod cf {
     /// Alert rules and history
     pub const ALERT: ColumnFamily = "alert";
 
+    /// Durable migration batch cache
+    pub const CACHE: ColumnFamily = "migration_cache";
+
     /// Get all column family names
     pub fn all() -> &'static [ColumnFamily] {
-        &[RAFT, META, OFFSET, AUTH, ALERT]
+        &[RAFT, META, OFFSET, AUTH, ALERT, CACHE]
     }
 }
 
@@ -184,7 +187,7 @@ mod tests {
     #[test]
     fn test_column_families() {
         let cfs = cf::all();
-        assert_eq!(cfs.len(), 5);
+        assert_eq!(cfs.len(), 6);
         assert!(cfs.contains(&cf::RAFT));
         assert!(cfs.contains(&cf::META));
         assert!(cfs.contains(&cf::OFFSET));

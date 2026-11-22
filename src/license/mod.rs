@@ -7,6 +7,8 @@
 
 mod manager;
 mod remote;
+mod types;
 
-pub use manager::{Feature, License, LicenseManager, LicenseTier};
+pub use manager::{LicenseManager, LicenseStats};
 pub use remote::{KeystoneClient, ValidateLicenseResponse};
+pub use types::{Feature, License, LicenseError, LicenseTier};

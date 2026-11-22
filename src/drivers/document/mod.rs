@@ -30,11 +30,13 @@
 //! - Configurable batch sizes and timeouts
 //! - Local shard reader for zero-network overhead (when colocated)
 
-mod source;
-mod sink;
+pub mod cdc;
 mod config;
 pub mod local_reader;
+mod sink;
+mod source;
 
+pub use cdc::{CdcConfig, ElasticsearchCdcSource, switch_alias_after_catchup};
 pub use config::DocumentConfig;
 pub use sink::DocumentSink;
 pub use source::DocumentSource;

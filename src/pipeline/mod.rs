@@ -18,9 +18,14 @@
 
 //! Data pipeline module for ETL operations
 
+pub mod backpressure;
+pub mod cache;
 pub mod engine;
 pub mod record;
 pub mod traits;
+
+pub use backpressure::{AdaptiveBackpressure, BackpressureConfig, ClusterPressure, FlowWindow};
+pub use cache::LocalBatchCache;
 
 pub use engine::{Pipeline, PipelineConfig, PipelineStats, ProgressCallback};
 pub use record::{Record, RecordBatch};

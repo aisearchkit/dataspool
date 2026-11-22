@@ -18,6 +18,7 @@
 
 //! Pipeline execution engine
 
+use super::backpressure::{AdaptiveBackpressure, BackpressureConfig, ClusterPressure};
 use super::record::RecordBatch;
 use super::traits::{OffsetValue, Sink, Source, Transform};
 use crate::error::Result;
@@ -124,6 +125,7 @@ pub struct Pipeline {
     sink: Box<dyn Sink>,
     config: PipelineConfig,
     progress_callback: Option<Arc<dyn ProgressCallback>>,
+    backpressure: Option<AdaptiveBackpressure>,
 }
 
 impl Pipeline {
@@ -135,6 +137,7 @@ impl Pipeline {
             sink,
             config,
             progress_callback: None,
+            backpressure: None,
         }
     }
 
@@ -147,6 +150,12 @@ impl Pipeline {
     /// Set progress callback
     pub fn with_progress_callback(mut self, callback: Arc<dyn ProgressCallback>) -> Self {
         self.progress_callback = Some(callback);
+        self
+    }
+
+    /// Enable adaptive batch sizing and pacing based on destination pressure.
+    pub fn with_backpressure(mut self, config: BackpressureConfig) -> Self {
+        self.backpressure = Some(AdaptiveBackpressure::new(config));
         self
     }
 
@@ -172,10 +181,12 @@ impl Pipeline {
 
         loop {
             // Read batch from source
-            let (batch, new_offset) = self
-                .source
-                .read_batch(&current_offset, self.config.batch_size)
-                .await?;
+            let read_size = self
+                .backpressure
+                .as_ref()
+                .map(|controller| controller.window().batch_size)
+                .unwrap_or(self.config.batch_size);
+            let (batch, new_offset) = self.source.read_batch(&current_offset, read_size).await?;
 
             // Empty batch means end of data
             if batch.is_empty() {
@@ -192,9 +203,21 @@ impl Pipeline {
             // Apply transformations
             let transformed_batch = self.apply_transforms(batch)?;
 
-            // Write to sink
+            // Write to sink and feed latency/rejection signals into the controller.
+            let write_started = Instant::now();
             match self.sink.write_batch(transformed_batch).await {
                 Ok(write_result) => {
+                    if let Some(controller) = self.backpressure.as_mut() {
+                        let window = controller.observe(ClusterPressure {
+                            took: write_started.elapsed(),
+                            rejected: write_result.rejected_count as u64,
+                            status_code: 200,
+                            queue_utilization: 0.0,
+                        });
+                        if !window.pause.is_zero() {
+                            tokio::time::sleep(window.pause).await;
+                        }
+                    }
                     stats.records_read += batch_size as u64;
                     stats.records_written += write_result.success_count as u64;
                     stats.bytes_written += write_result.bytes_written;
@@ -216,6 +239,14 @@ impl Pipeline {
                     }
                 }
                 Err(e) => {
+                    if let Some(controller) = self.backpressure.as_mut() {
+                        let window = controller.observe(ClusterPressure {
+                            took: write_started.elapsed(),
+                            status_code: 503,
+                            ..Default::default()
+                        });
+                        tokio::time::sleep(window.pause).await;
+                    }
                     consecutive_errors += 1;
                     tracing::warn!(
                         error = %e,
