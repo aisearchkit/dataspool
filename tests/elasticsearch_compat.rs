@@ -341,26 +341,30 @@ async fn elasticsearch_pit_search_after_and_bulk_item_errors() {
             .send()
             .await
             .unwrap();
-        assert!(late_response.status().is_success(), "{label}: append late CDC event");
+        assert!(
+            late_response.status().is_success(),
+            "{label}: append late CDC event"
+        );
         http.post(format!("{base_url}/{change_index}/_refresh"))
             .send()
             .await
             .unwrap();
 
-        let (snapshot_page_one, snapshot_offset) = online
-            .read_batch(&OffsetValue::initial(), 1)
-            .await
-            .unwrap();
-        assert_eq!(snapshot_page_one.len(), 1, "{label}: online snapshot page one");
-        let (snapshot_page_two, snapshot_offset) = online
-            .read_batch(&snapshot_offset, 1)
-            .await
-            .unwrap();
-        assert_eq!(snapshot_page_two.len(), 1, "{label}: online snapshot page two");
-        let (cdc_page, online_offset) = online
-            .read_batch(&snapshot_offset, 1)
-            .await
-            .unwrap();
+        let (snapshot_page_one, snapshot_offset) =
+            online.read_batch(&OffsetValue::initial(), 1).await.unwrap();
+        assert_eq!(
+            snapshot_page_one.len(),
+            1,
+            "{label}: online snapshot page one"
+        );
+        let (snapshot_page_two, snapshot_offset) =
+            online.read_batch(&snapshot_offset, 1).await.unwrap();
+        assert_eq!(
+            snapshot_page_two.len(),
+            1,
+            "{label}: online snapshot page two"
+        );
+        let (cdc_page, online_offset) = online.read_batch(&snapshot_offset, 1).await.unwrap();
         assert_eq!(cdc_page.len(), 1, "{label}: online CDC catch-up event");
         assert_eq!(
             cdc_page.records()[0].get_metadata("_cdc_sequence"),
@@ -383,11 +387,11 @@ async fn elasticsearch_pit_search_after_and_bulk_item_errors() {
             },
         );
         resumed_online.connect().await.unwrap();
-        let (after_restart, _) = resumed_online
-            .read_batch(&online_offset, 1)
-            .await
-            .unwrap();
-        assert!(after_restart.is_empty(), "{label}: online CDC checkpoint resume");
+        let (after_restart, _) = resumed_online.read_batch(&online_offset, 1).await.unwrap();
+        assert!(
+            after_restart.is_empty(),
+            "{label}: online CDC checkpoint resume"
+        );
         online.close().await.unwrap();
         resumed_online.close().await.unwrap();
 

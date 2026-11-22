@@ -111,7 +111,9 @@ pub fn create_source_with_license(
             cdc,
         } => {
             let source = super::document::ElasticsearchOnlineMigrationSource::new(
-                snapshot.clone(), change_log_connection.clone(), cdc.clone(),
+                snapshot.clone(),
+                change_log_connection.clone(),
+                cdc.clone(),
             );
             Ok(Box::new(source))
         }

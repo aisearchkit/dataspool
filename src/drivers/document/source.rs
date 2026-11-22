@@ -617,10 +617,8 @@ impl DocumentSource {
         if self.scroll_state.is_none()
             && let OffsetValue::Custom(value) = offset
             && value["driver"].as_str() == Some("elasticsearch_scroll")
-            && let (Some(scroll_id), Some(docs_read)) = (
-                value["scroll_id"].as_str(),
-                value["docs_read"].as_u64(),
-            )
+            && let (Some(scroll_id), Some(docs_read)) =
+                (value["scroll_id"].as_str(), value["docs_read"].as_u64())
         {
             self.scroll_state = Some(ScrollState {
                 scroll_id: scroll_id.to_string(),

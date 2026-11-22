@@ -113,11 +113,15 @@ impl ElasticsearchCdcSource {
     /// snapshot PIT. The producer must publish an event only after its source
     /// mutation is visible to searches, and must retain events after this value.
     pub async fn capture_watermark(&self) -> Result<u64> {
-        let client = self.client.as_ref().ok_or_else(|| {
-            DriverError::ConnectionFailed("CDC source is not connected".into())
-        })?;
+        let client = self
+            .client
+            .as_ref()
+            .ok_or_else(|| DriverError::ConnectionFailed("CDC source is not connected".into()))?;
         let response = client
-            .post(format!("{}/{}/_search", self.base_url, self.cdc.change_index))
+            .post(format!(
+                "{}/{}/_search",
+                self.base_url, self.cdc.change_index
+            ))
             .json(&json!({
                 "size": 1,
                 "track_total_hits": false,
@@ -131,21 +135,26 @@ impl ElasticsearchCdcSource {
             return Err(DriverError::DataError(format!(
                 "CDC watermark query returned HTTP {}",
                 response.status()
-            )).into());
+            ))
+            .into());
         }
-        let body: Value = response.json().await.map_err(|e| {
-            DriverError::DataError(format!("Invalid CDC watermark response: {e}"))
-        })?;
+        let body: Value = response
+            .json()
+            .await
+            .map_err(|e| DriverError::DataError(format!("Invalid CDC watermark response: {e}")))?;
         let hits = body["hits"]["hits"].as_array().ok_or_else(|| {
             DriverError::DataError("CDC watermark response has no hits array".into())
         })?;
         match hits.first() {
             Some(hit) => hit["_source"][&self.cdc.sequence_field]
                 .as_u64()
-                .ok_or_else(|| DriverError::DataError(format!(
-                    "CDC watermark field '{}' is not an unsigned integer",
-                    self.cdc.sequence_field
-                )).into()),
+                .ok_or_else(|| {
+                    DriverError::DataError(format!(
+                        "CDC watermark field '{}' is not an unsigned integer",
+                        self.cdc.sequence_field
+                    ))
+                    .into()
+                }),
             None => Ok(0),
         }
     }

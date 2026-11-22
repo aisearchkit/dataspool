@@ -80,22 +80,28 @@ impl ElasticsearchOnlineMigrationSource {
         self.phase = match value["phase"].as_str() {
             Some("snapshot") => Phase::Snapshot,
             Some("cdc") => Phase::Cdc,
-            other => return Err(DriverError::DataError(format!(
-                "Invalid online migration checkpoint phase: {other:?}"
-            )).into()),
+            other => {
+                return Err(DriverError::DataError(format!(
+                    "Invalid online migration checkpoint phase: {other:?}"
+                ))
+                .into());
+            }
         };
         self.initial_watermark = Some(value["initial_watermark"].as_u64().ok_or_else(|| {
-            DriverError::DataError("Online migration checkpoint is missing initial_watermark".into())
+            DriverError::DataError(
+                "Online migration checkpoint is missing initial_watermark".into(),
+            )
         })?);
         self.snapshot_offset = serde_json::from_value(value["snapshot_offset"].clone())
             .map_err(|e| DriverError::DataError(format!("Invalid snapshot checkpoint: {e}")))?;
         self.cdc_offset = serde_json::from_value(value["cdc_offset"].clone())
             .map_err(|e| DriverError::DataError(format!("Invalid CDC checkpoint: {e}")))?;
-        self.cdc.set_start_sequence(
-            self.cdc_offset_sequence().ok_or_else(|| {
-                DriverError::DataError("Online migration checkpoint has invalid CDC sequence".into())
-            })?,
-        );
+        self.cdc
+            .set_start_sequence(self.cdc_offset_sequence().ok_or_else(|| {
+                DriverError::DataError(
+                    "Online migration checkpoint has invalid CDC sequence".into(),
+                )
+            })?);
         Ok(())
     }
 }
@@ -124,11 +130,16 @@ impl Source for ElasticsearchOnlineMigrationSource {
         batch_size: usize,
     ) -> Result<(RecordBatch, OffsetValue)> {
         if !self.connected {
-            return Err(DatspoolError::Internal("Online migration source is not connected".into()));
+            return Err(DatspoolError::Internal(
+                "Online migration source is not connected".into(),
+            ));
         }
         self.restore(offset)?;
         if self.phase == Phase::Snapshot {
-            let (batch, next) = self.snapshot.read_batch(&self.snapshot_offset, batch_size).await?;
+            let (batch, next) = self
+                .snapshot
+                .read_batch(&self.snapshot_offset, batch_size)
+                .await?;
             self.snapshot_offset = next;
             if !batch.is_empty() {
                 return Ok((batch, self.checkpoint()));
