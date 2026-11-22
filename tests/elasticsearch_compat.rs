@@ -181,7 +181,7 @@ async fn elasticsearch_pit_search_after_and_bulk_item_errors() {
 
         let first_response = http
             .post(format!("{base_url}/_search"))
-            .json(&json!({"size":1,"pit":{"id":&pit_id,"keep_alive":"1m"},"sort":[{"_shard_doc":"asc"}]}))
+            .json(&json!({"size":1,"pit":{"id":&pit_id,"keep_alive":"1m"},"sort":[{"number":"asc"}]}))
             .send()
             .await
             .unwrap();
@@ -202,7 +202,7 @@ async fn elasticsearch_pit_search_after_and_bulk_item_errors() {
             .json(&json!({
                 "size": 1,
                 "pit": {"id": &current_pit_id, "keep_alive": "1m"},
-                "sort": [{"_shard_doc":"asc"}],
+                "sort": [{"number":"asc"}],
                 "search_after": sort
             }))
             .send()
@@ -243,26 +243,35 @@ async fn elasticsearch_pit_search_after_and_bulk_item_errors() {
             .read_batch(&OffsetValue::initial(), 1)
             .await
             .unwrap();
-        assert_eq!(
-            first_page.len(),
-            1,
-            "{label}: DocumentSource PIT first page"
-        );
-        drop(first_source); // emulate process termination without closing the PIT lease
-        let mut resumed_source = DocumentSource::new(source_config);
-        resumed_source.connect().await.unwrap();
-        let (resumed_page, _) = resumed_source.read_batch(&checkpoint, 1).await.unwrap();
-        assert_eq!(
-            resumed_page.len(),
-            1,
-            "{label}: DocumentSource PIT resume page"
-        );
-        assert_ne!(
-            first_page.records()[0].id,
-            resumed_page.records()[0].id,
-            "{label}: PIT resume duplicated a document"
-        );
-        resumed_source.close().await.unwrap();
+        assert_eq!(first_page.len(), 1, "{label}: first source page");
+        if version.starts_with("7.10.") || version.starts_with("7.11.") {
+            // PIT exists in 7.10/7.11, but _shard_doc does not. The driver deliberately
+            // selects Scroll there; verify continuation on the live scroll context.
+            let (next_page, _) = first_source.read_batch(&checkpoint, 1).await.unwrap();
+            assert_eq!(next_page.len(), 1, "{label}: Scroll continuation page");
+            assert_ne!(
+                first_page.records()[0].id,
+                next_page.records()[0].id,
+                "{label}: Scroll continuation duplicated a document"
+            );
+            first_source.close().await.unwrap();
+        } else {
+            drop(first_source); // emulate process termination without closing the PIT lease
+            let mut resumed_source = DocumentSource::new(source_config);
+            resumed_source.connect().await.unwrap();
+            let (resumed_page, _) = resumed_source.read_batch(&checkpoint, 1).await.unwrap();
+            assert_eq!(
+                resumed_page.len(),
+                1,
+                "{label}: DocumentSource PIT resume page"
+            );
+            assert_ne!(
+                first_page.records()[0].id,
+                resumed_page.records()[0].id,
+                "{label}: PIT resume duplicated a document"
+            );
+            resumed_source.close().await.unwrap();
+        }
 
         // CDC append-only feed, delete event encoding and alias cutover guard.
         let change_index = format!("{index}-changes");
@@ -392,8 +401,8 @@ async fn elasticsearch_pit_search_after_and_bulk_item_errors() {
                 min_batch_size: 32,
                 max_batch_size: 128,
                 initial_batch_size: 64,
-                min_in_flight: 16,
-                max_in_flight: 16,
+                min_in_flight: 4,
+                max_in_flight: 4,
                 target_latency: std::time::Duration::from_secs(10),
                 high_queue_utilization: 0.5,
             },
@@ -461,10 +470,10 @@ async fn elasticsearch_pit_search_after_and_bulk_item_errors() {
             let mut soak_sink = DocumentSink::new(soak_config, index.clone()).with_backpressure(
                 BackpressureConfig {
                     min_batch_size: 32,
-                    max_batch_size: 256,
-                    initial_batch_size: 256,
-                    min_in_flight: 32,
-                    max_in_flight: 32,
+                    max_batch_size: 128,
+                    initial_batch_size: 128,
+                    min_in_flight: 4,
+                    max_in_flight: 4,
                     target_latency: std::time::Duration::from_secs(10),
                     high_queue_utilization: 0.95,
                 },

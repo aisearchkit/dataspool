@@ -293,7 +293,7 @@ impl DocumentSink {
         let mut pending = records;
         let mut result = WriteResult::default();
         let mut attempt = 0_u32;
-        const MAX_RETRIES: u32 = 5;
+        const MAX_RETRIES: u32 = 8;
         while !pending.is_empty() {
             let body =
                 Self::build_bulk_body_for(&target_index, &RecordBatch::from(pending.clone()));

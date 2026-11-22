@@ -153,8 +153,9 @@ impl DocumentSource {
             }
         };
 
-        // PIT available in 7.10+/2.0+
-        let mode = if major >= 8 || (major == 7 && minor >= 10) || major >= 2 {
+        // Stable PIT pagination via _shard_doc requires Elasticsearch 7.12+.
+        // Elasticsearch 7.10/7.11 supports PIT but lacks this tie-breaker, so use Scroll.
+        let mode = if major >= 8 || (major == 7 && minor >= 12) || major >= 2 {
             info!("Using Point-in-Time API (version {})", version_str);
             ApiMode::PointInTime
         } else {
@@ -312,9 +313,7 @@ impl DocumentSource {
         // First search to get total count
         let mut search_body = json!({
             "size": self.config.batch_size,
-            // _doc is only a per-shard Lucene document position and is not a
-            // globally unique search_after cursor across multiple shards.
-            // _shard_doc is stable and unique within a PIT snapshot.
+            // _shard_doc is stable and unique within a PIT snapshot (ES 7.12+).
             "sort": [{"_shard_doc": "asc"}],
             "pit": {
                 "id": &pit_id,
