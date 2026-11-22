@@ -34,13 +34,14 @@ if ! command -v cargo-audit >/dev/null 2>&1; then
   cargo install cargo-audit --locked
 fi
 cargo audit --deny unsound --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2026-0459
-if [[ -n "${ES_7102_URL:-}${ES_717_URL:-}${ES_8X_URL:-}" ]]; then
+if [[ -n "${ES_7102_URL:-}${ES_717_URL:-}${ES_8X_URL:-}${ES_9X_URL:-}" ]]; then
   : "${ES_7102_URL:?set ES_7102_URL for the complete compatibility matrix}"
   : "${ES_717_URL:?set ES_717_URL for the complete compatibility matrix}"
   : "${ES_8X_URL:?set ES_8X_URL for the complete compatibility matrix}"
+  : "${ES_9X_URL:?set ES_9X_URL for the complete compatibility matrix}"
   cargo test --test elasticsearch_compat -- --nocapture
 else
-  echo "Skipping live Elasticsearch matrix (set all ES_7102_URL / ES_717_URL / ES_8X_URL to enable)"
+  echo "Skipping live Elasticsearch matrix (set all ES_7102_URL / ES_717_URL / ES_8X_URL / ES_9X_URL to enable)"
 fi
 
 git diff --check

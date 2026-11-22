@@ -9,7 +9,8 @@ case "$VERSION" in
   7102) PROFILE=es7102; export ES_7102_URL="${ES_7102_URL:-http://127.0.0.1:19302}" ;;
   717) PROFILE=es717; export ES_717_URL="${ES_717_URL:-http://127.0.0.1:19312}" ;;
   8x) PROFILE=es8x; export ES_8X_URL="${ES_8X_URL:-http://127.0.0.1:19322}" ;;
-  *) echo "usage: $0 {7102|717|8x}" >&2; exit 2 ;;
+  9x) PROFILE=es9x; export ES_9X_URL="${ES_9X_URL:-http://127.0.0.1:19332}" ;;
+  *) echo "usage: $0 {7102|717|8x|9x}" >&2; exit 2 ;;
 esac
 export ES_EXPECT_NODES="${ES_EXPECT_NODES:-3}"
 export ES_SOAK_SECONDS="${ES_SOAK_SECONDS:-300}"

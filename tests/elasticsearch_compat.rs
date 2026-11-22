@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-//! Optional live compatibility checks for Elasticsearch 7.10.2, 7.17 and 8.x.
+//! Optional live compatibility checks for Elasticsearch 7.10.2, 7.17, 8.x and 9.x.
 //!
-//! Set ES_7102_URL, ES_717_URL and/or ES_8X_URL to run against real clusters.
+//! Set ES_7102_URL, ES_717_URL, ES_8X_URL and/or ES_9X_URL to run against real clusters.
 //! Optional credentials: ES_7102_USER/PASSWORD, ES_717_USER/PASSWORD,
-//! ES_8X_USER/PASSWORD.
+//! ES_8X_USER/PASSWORD, ES_9X_USER/PASSWORD.
 
 use dataspool::drivers::document::{
     CdcConfig, DocumentConfig, DocumentSink, DocumentSource, ElasticsearchCdcSource,
@@ -19,6 +19,7 @@ fn configured_clusters() -> Vec<(&'static str, String, Option<String>, Option<St
         ("ES_7102_URL", "ES_7102_USER", "ES_7102_PASSWORD", "7.10.2"),
         ("ES_717_URL", "ES_717_USER", "ES_717_PASSWORD", "7.17"),
         ("ES_8X_URL", "ES_8X_USER", "ES_8X_PASSWORD", "8.x"),
+        ("ES_9X_URL", "ES_9X_USER", "ES_9X_PASSWORD", "9.x"),
     ]
     .into_iter()
     .filter_map(|(url_key, user_key, pass_key, label)| {
@@ -84,7 +85,8 @@ async fn elasticsearch_pit_search_after_and_bulk_item_errors() {
         assert!(
             version.starts_with("7.10.")
                 || version.starts_with("7.17.")
-                || version.starts_with("8."),
+                || version.starts_with("8.")
+                || version.starts_with("9."),
             "{label} endpoint reported unexpected version {version}"
         );
         let expected_nodes = std::env::var("ES_EXPECT_NODES")

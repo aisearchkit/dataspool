@@ -43,7 +43,7 @@ Source ES (PIT/search_after) -> bounded read -> local durable batch cache
 2. Add item-level bulk retry and dead-letter handling; do not count a partially failed batch as fully checkpointed.
 3. Wire the durable cache into the executor so offsets advance only after destination acknowledgement.
 4. Implement a CDC/change-log adapter and watermark-based catch-up before cutover.
-5. Add integration tests against Elasticsearch 7.10.2, 7.17, 8.x and compatible Easysearch/OpenSearch versions.
+5. Add integration tests against Elasticsearch 7.10.2, 7.17, 8.x, 9.x and compatible Easysearch/OpenSearch versions.
 6. Expose throughput, bulk latency, 429 count, cache depth, retry count and adaptive window as cluster metrics.
 
 ## CDC contract and cutover
