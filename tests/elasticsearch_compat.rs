@@ -140,25 +140,51 @@ async fn elasticsearch_pit_search_after_and_bulk_item_errors() {
 {"index":{"_id":"bad"}}
 {"number":"not-an-integer"}
 "#;
-        let bulk_response: Value = http
-            .post(format!("{base_url}/{index}/_bulk"))
-            .header("content-type", "application/x-ndjson")
-            .body(bulk)
-            .send()
-            .await
-            .unwrap()
-            .error_for_status()
-            .unwrap()
-            .json()
-            .await
-            .unwrap();
+        // The cluster deliberately uses write queue_size=1 to exercise real 429
+        // handling later in this test. Retry this small, idempotent fixture bulk so
+        // transient startup pressure does not make the compatibility setup flaky.
+        let mut fixture_attempt = 0_u32;
+        let bulk_response: Value = loop {
+            let response: Value = http
+                .post(format!("{base_url}/{index}/_bulk"))
+                .header("content-type", "application/x-ndjson")
+                .body(bulk)
+                .send()
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            let has_rejections = response["items"]
+                .as_array()
+                .is_some_and(|items| items.iter().any(|item| item["index"]["status"] == 429));
+            if !has_rejections {
+                break response;
+            }
+            fixture_attempt += 1;
+            assert!(
+                fixture_attempt <= 5,
+                "{label}: fixture bulk remained rejected after {fixture_attempt} retries: {response}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(
+                100 * (1_u64 << fixture_attempt),
+            ))
+            .await;
+        };
         assert_eq!(
             bulk_response["items"].as_array().unwrap().len(),
             3,
             "{label}"
         );
-        assert_eq!(bulk_response["items"][0]["index"]["status"], 201, "{label}");
-        assert_eq!(bulk_response["items"][1]["index"]["status"], 201, "{label}");
+        for item in &bulk_response["items"].as_array().unwrap()[..2] {
+            assert!(
+                [200, 201].contains(&item["index"]["status"].as_u64().unwrap_or_default()),
+                "{label}: expected successful fixture item, got {}",
+                item["index"]["status"]
+            );
+        }
         assert_eq!(bulk_response["items"][2]["index"]["status"], 400, "{label}");
         http.post(format!("{base_url}/{index}/_refresh"))
             .send()
