@@ -20,16 +20,18 @@
 
 pub mod backpressure;
 pub mod cache;
+pub mod dead_letter;
 pub mod engine;
 pub mod record;
 pub mod traits;
 
 pub use backpressure::{AdaptiveBackpressure, BackpressureConfig, ClusterPressure, FlowWindow};
 pub use cache::LocalBatchCache;
+pub use dead_letter::{DeadLetterEntry, DeadLetterQueue};
 
 pub use engine::{Pipeline, PipelineConfig, PipelineStats, ProgressCallback};
 pub use record::{Record, RecordBatch};
 pub use traits::{
-    FieldRenameTransform, FilterTransform, NoOpTransform, OffsetValue, Sink, Source, Transform,
-    WriteResult,
+    FailedRecord, FieldRenameTransform, FilterTransform, NoOpTransform, OffsetValue, Sink, Source,
+    Transform, WriteResult,
 };

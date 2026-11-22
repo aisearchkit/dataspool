@@ -184,7 +184,7 @@ impl DocumentSource {
         );
 
         let url = format!(
-            "{}{}/_search?scroll={}",
+            "{}/{}/_search?scroll={}",
             self.base_url, self.config.index, scroll_timeout
         );
 
@@ -279,7 +279,7 @@ impl DocumentSource {
 
         // Open PIT
         let url = format!(
-            "{}{}/_pit?keep_alive={}",
+            "{}/{}/_pit?keep_alive={}",
             self.base_url, self.config.index, keep_alive
         );
 
@@ -312,7 +312,7 @@ impl DocumentSource {
         // First search to get total count
         let mut search_body = json!({
             "size": self.config.batch_size,
-            "sort": [{"_shard_doc": "asc"}],
+            "sort": [{"_doc": "asc"}],
             "pit": {
                 "id": &pit_id,
                 "keep_alive": &keep_alive
@@ -334,9 +334,10 @@ impl DocumentSource {
             .map_err(|e| DriverError::DataError(format!("Failed to search with PIT: {}", e)))?;
 
         if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
             return Err(DriverError::DataError(format!(
-                "PIT search failed: HTTP {}",
-                response.status()
+                "PIT search failed: HTTP {status}: {body}"
             ))
             .into());
         }
@@ -377,7 +378,7 @@ impl DocumentSource {
 
         let mut search_body = json!({
             "size": self.config.batch_size,
-            "sort": [{"_shard_doc": "asc"}],
+            "sort": [{"_doc": "asc"}],
             "pit": {
                 "id": pit_id,
                 "keep_alive": &keep_alive
@@ -520,9 +521,33 @@ impl DocumentSource {
         };
 
         // Search with PIT. Elasticsearch may rotate the PIT id on each response.
-        let body = self
+        let body = match self
             .search_pit(client, &pit_id, search_after.as_ref())
-            .await?;
+            .await
+        {
+            Ok(body) => body,
+            Err(error) => {
+                let message = error.to_string();
+                let expired = message.contains("PIT search failed: HTTP 404")
+                    || message.contains("search_context_missing_exception")
+                    || message.contains("No search context found");
+                if !expired {
+                    return Err(error);
+                }
+                // PIT IDs are server-side leases, not durable bookmarks. If a process
+                // restart outlives keep_alive, open a fresh snapshot and restart from
+                // its beginning. Stable destination IDs make this replay idempotent.
+                warn!(
+                    "Saved PIT expired; reopening snapshot from the beginning: {}",
+                    message
+                );
+                self.pit_state = Some(self.init_pit(client).await?);
+                let state = self.pit_state.as_ref().ok_or_else(|| {
+                    DriverError::DataError("PIT state missing after reopen".into())
+                })?;
+                self.search_pit(client, &state.pit_id, None).await?
+            }
+        };
         if let Some(rotated_id) = body["pit_id"].as_str() {
             if let Some(state) = self.pit_state.as_mut() {
                 state.pit_id = rotated_id.to_string();

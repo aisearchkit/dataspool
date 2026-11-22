@@ -161,9 +161,12 @@ pub mod cf {
     /// Durable migration batch cache
     pub const CACHE: ColumnFamily = "migration_cache";
 
+    /// Failed documents awaiting operator review or replay
+    pub const DEAD_LETTER: ColumnFamily = "dead_letter";
+
     /// Get all column family names
     pub fn all() -> &'static [ColumnFamily] {
-        &[RAFT, META, OFFSET, AUTH, ALERT, CACHE]
+        &[RAFT, META, OFFSET, AUTH, ALERT, CACHE, DEAD_LETTER]
     }
 }
 
@@ -187,9 +190,10 @@ mod tests {
     #[test]
     fn test_column_families() {
         let cfs = cf::all();
-        assert_eq!(cfs.len(), 6);
+        assert_eq!(cfs.len(), 7);
         assert!(cfs.contains(&cf::RAFT));
         assert!(cfs.contains(&cf::META));
         assert!(cfs.contains(&cf::OFFSET));
+        assert!(cfs.contains(&cf::DEAD_LETTER));
     }
 }

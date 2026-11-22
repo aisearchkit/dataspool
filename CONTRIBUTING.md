@@ -31,21 +31,16 @@ git checkout -b fix/your-bug-fix
 使用 Conventional Commits 格式：
 
 ```bash
-git add .
-git commit -m "feat(scheduler): add task auto-sharding by date range"
+scripts/commit-stage.sh 'feat(scheduler): add task auto-sharding by date range' src/scheduler/auto_shard.rs tests/scheduler_auto_shard.rs
 ```
 
 ### 5. 阶段验证与自动提交
 
 每个独立开发阶段结束后，必须执行 `DEVELOPMENT.md` 中的自动化质量门禁。推荐直接运行 `scripts/commit-stage.sh 'feat(scope): summary' path...`：脚本会格式化指定 Rust 文件、执行完整编译、单元测试和兼容集成测试、检查 diff，并只暂存列出的文件后自动创建 Conventional Commit。检查失败时先修复，不得提交；确认属于仓库既有基线问题时必须明确记录，不能声称检查通过。禁止盲目执行 `git add .`。
 
-自动提交不代表自动推送。未经明确要求，不得推送远程分支或创建 PR。
+阶段提交成功后，脚本会自动推送当前分支到 `origin`。推送失败时保留本地提交并报告原因，不得声称已推送。
 
-### 6. 推送并创建 Pull Request
-
-```bash
-git push origin feat/your-feature-name
-```
+### 6. 创建 Pull Request
 
 在 GitHub 上创建 Pull Request，并：
 - 填写 PR 模板
@@ -81,3 +76,8 @@ git push origin feat/your-feature-name
 - 建设性的讨论
 - 欢迎新手提问
 - 帮助他人成长
+
+
+## Automated commit and push
+
+For each completed development stage, run `scripts/commit-stage.sh 'type(scope): summary' path...`. The script runs the quality gates, commits only explicitly listed files, then pushes the current branch to `origin`. A failed push leaves the commit locally and must be reported as not pushed. Never use `git add .` for stage commits.

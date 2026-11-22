@@ -100,7 +100,8 @@ Dataspool 旨在解决以上痛点，提供一个延迟低、扩展性强、部�
 4. `git diff --check`
 5. 审查 `git diff`、`git status`，确认没有密钥、凭据、构建产物、临时文件或无关改动。
 6. 使用 `scripts/commit-stage.sh 'type(scope): summary' path...` 自动执行上述门禁，并只暂存明确列出的本阶段文件。
-7. 检查 `git status --short`，记录 commit SHA 和剩余工作区变更。
+7. commit 成功后必须自动执行 `git push origin HEAD`；只有远程确认更新成功才可报告“已推送”。
+8. 检查 `git status --short --branch`，记录 commit SHA、推送结果和剩余工作区变更。
 
 仓库现有部分文件尚未满足全仓库 `cargo fmt --all -- --check`；阶段门禁只格式化本阶段改动文件，避免无关格式化噪声。
 
@@ -110,8 +111,8 @@ Dataspool 旨在解决以上痛点，提供一个延迟低、扩展性强、部�
 
 - 一个独立功能阶段对应一个 commit，便于审查和回滚。
 - 使用 `feat(scope): ...`、`fix(scope): ...`、`test(scope): ...`、`docs(scope): ...` 等 Conventional Commits 类型。
-- 提交前检查 staged diff；提交后记录 commit SHA 和验证结果。
-- 不自动推送远程仓库，除非任务明确要求。
+- 提交前检查 staged diff；提交后自动推送当前分支到 `origin`，并记录 commit SHA 和推送结果。
+- 推送失败时保留本地 commit，报告失败原因和 ahead 状态；不得宣称已推送。
 
 ## 6. 配置文件规范
 

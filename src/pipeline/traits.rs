@@ -120,14 +120,20 @@ pub trait Sink: Send + Sync {
 /// Result of a write operation
 #[derive(Debug, Clone, Default)]
 pub struct WriteResult {
+    /// Permanent per-document failures that have enough detail for durable DLQ storage.
+    pub failed_records: Vec<FailedRecord>,
+
     /// Number of successfully written records
     pub success_count: usize,
 
     /// Number of failed records
     pub failed_count: usize,
 
-    /// Number of transient cluster rejections (429 / rejected execution)
+    /// Number of transient cluster rejections still failing after retries.
     pub rejected_count: usize,
+
+    /// Number of documents re-submitted after a transient rejection.
+    pub retried_count: usize,
 
     /// Total bytes written
     pub bytes_written: u64,
@@ -136,13 +142,23 @@ pub struct WriteResult {
     pub errors: Vec<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct FailedRecord {
+    pub record: super::record::Record,
+    pub status: u16,
+    pub error_type: String,
+    pub reason: String,
+}
+
 impl WriteResult {
     /// Create successful write result
     pub fn success(count: usize, bytes: u64) -> Self {
         Self {
+            failed_records: Vec::new(),
             success_count: count,
             failed_count: 0,
             rejected_count: 0,
+            retried_count: 0,
             bytes_written: bytes,
             errors: Vec::new(),
         }

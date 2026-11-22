@@ -32,9 +32,12 @@ done
 cargo check --all-targets
 cargo test --lib
 if [[ -n "${ES_7102_URL:-}${ES_717_URL:-}${ES_8X_URL:-}" ]]; then
+  : "${ES_7102_URL:?set ES_7102_URL for the complete compatibility matrix}"
+  : "${ES_717_URL:?set ES_717_URL for the complete compatibility matrix}"
+  : "${ES_8X_URL:?set ES_8X_URL for the complete compatibility matrix}"
   cargo test --test elasticsearch_compat -- --nocapture
 else
-  echo "Skipping live Elasticsearch matrix (set ES_7102_URL / ES_717_URL / ES_8X_URL to enable)"
+  echo "Skipping live Elasticsearch matrix (set all ES_7102_URL / ES_717_URL / ES_8X_URL to enable)"
 fi
 
 git diff --check
@@ -48,5 +51,14 @@ fi
 git commit -m "$message"
 printf '\nCommitted: '
 git rev-parse --short HEAD
+branch="$(git branch --show-current)"
+if [[ -z "$branch" ]]; then
+  echo "cannot auto-push from detached HEAD" >&2
+  exit 1
+fi
+printf '\nPushing %s to origin...\n' "$branch"
+git push --set-upstream origin "$branch"
+printf '\nPushed commit: '
+git rev-parse --short HEAD
 printf '\nRemaining worktree changes:\n'
-git status --short
+git status --short --branch

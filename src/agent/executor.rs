@@ -11,7 +11,7 @@ use tracing::info;
 
 use crate::drivers::factory::{SinkConfig, SourceConfig, create_sink, create_source};
 use crate::error::{DatspoolError, Result};
-use crate::pipeline::{LocalBatchCache, Sink, Source};
+use crate::pipeline::{DeadLetterQueue, LocalBatchCache, Sink, Source};
 use crate::storage::index::TieredIndexStore;
 use crate::storage::kv::KvStore;
 use crate::task::shard::ShardMeta;
@@ -164,12 +164,15 @@ impl<S: KvStore + Clone + 'static> ShardExecutor<S> {
             let delivered = cache
                 .deliver_one_with_checkpoint(|batch, next_offset, source_count| async move {
                     let write = sink_ref.write_batch(batch).await?;
-                    if !write.is_success() {
+                    if write.rejected_count > 0 || write.failed_count > write.failed_records.len() {
                         return Err(crate::error::DatspoolError::Internal(format!(
-                            "cached batch delivery failed: {} failed: {}",
-                            write.failed_count,
-                            write.errors.join("; ")
+                            "cached batch delivery still has retryable/unclassified failures: {} failed, {} rejected: {}",
+                            write.failed_count, write.rejected_count, write.errors.join("; ")
                         )));
+                    }
+                    if !write.failed_records.is_empty() {
+                        let dlq = DeadLetterQueue::new(Arc::new(task_store.kv_store().clone()), &shard_id.to_string());
+                        dlq.enqueue(write.failed_records).await?;
                     }
                     if let Some(next_offset) = next_offset {
                         let mut stored =
@@ -215,13 +218,21 @@ impl<S: KvStore + Clone + 'static> ShardExecutor<S> {
             cache
                 .deliver_one_with_checkpoint(|cached_batch, next_offset, source_count| async move {
                     let write = sink_ref.write_batch(cached_batch).await?;
-                    if !write.is_success() {
+                    if write.rejected_count > 0 || write.failed_count > write.failed_records.len() {
                         return Err(crate::error::DatspoolError::Internal(format!(
-                            "batch delivery failed for shard {}: {} failed: {}",
+                            "batch delivery failed for shard {}: {} failed, {} rejected: {}",
                             shard_id,
                             write.failed_count,
+                            write.rejected_count,
                             write.errors.join("; ")
                         )));
+                    }
+                    if !write.failed_records.is_empty() {
+                        let dlq = DeadLetterQueue::new(
+                            Arc::new(task_store.kv_store().clone()),
+                            &shard_id.to_string(),
+                        );
+                        dlq.enqueue(write.failed_records).await?;
                     }
                     if let Some(next_offset) = next_offset {
                         let mut stored =

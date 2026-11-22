@@ -38,5 +38,5 @@ mod source;
 
 pub use cdc::{CdcConfig, ElasticsearchCdcSource, switch_alias_after_catchup};
 pub use config::DocumentConfig;
-pub use sink::DocumentSink;
+pub use sink::{ClusterNodePressure, DocumentSink, NodeWritePressure};
 pub use source::DocumentSource;

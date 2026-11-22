@@ -4,7 +4,9 @@ services:
     environment:
       discovery.type: single-node
       xpack.security.enabled: "false"
-      ES_JAVA_OPTS: -Xms1g -Xmx1g
+      ES_JAVA_OPTS: -Xms512m -Xmx512m
+      thread_pool.write.queue_size: "1"
+      cluster.routing.allocation.disk.threshold_enabled: "false"
     ports:
       - "19202:9200"
     healthcheck:
@@ -18,7 +20,9 @@ services:
     environment:
       discovery.type: single-node
       xpack.security.enabled: "false"
-      ES_JAVA_OPTS: -Xms1g -Xmx1g
+      ES_JAVA_OPTS: -Xms512m -Xmx512m
+      thread_pool.write.queue_size: "1"
+      cluster.routing.allocation.disk.threshold_enabled: "false"
     ports:
       - "19217:9200"
     healthcheck:
@@ -32,7 +36,9 @@ services:
     environment:
       discovery.type: single-node
       xpack.security.enabled: "false"
-      ES_JAVA_OPTS: -Xms1g -Xmx1g
+      ES_JAVA_OPTS: -Xms512m -Xmx512m
+      thread_pool.write.queue_size: "1"
+      cluster.routing.allocation.disk.threshold_enabled: "false"
     ports:
       - "19218:9200"
     healthcheck:
