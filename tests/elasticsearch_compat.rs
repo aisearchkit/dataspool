@@ -7,7 +7,7 @@
 
 use dataspool::drivers::document::{
     CdcConfig, DocumentConfig, DocumentSink, DocumentSource, ElasticsearchCdcSource,
-    switch_alias_after_catchup,
+    ElasticsearchOnlineMigrationSource, switch_alias_after_catchup,
 };
 use dataspool::pipeline::{BackpressureConfig, OffsetValue, Record, RecordBatch, Sink, Source};
 use reqwest::{Client, StatusCode};
@@ -246,34 +246,21 @@ async fn elasticsearch_pit_search_after_and_bulk_item_errors() {
             .await
             .unwrap();
         assert_eq!(first_page.len(), 1, "{label}: first source page");
-        if version.starts_with("7.10.") || version.starts_with("7.11.") {
-            // PIT exists in 7.10/7.11, but _shard_doc does not. The driver deliberately
-            // selects Scroll there; verify continuation on the live scroll context.
-            let (next_page, _) = first_source.read_batch(&checkpoint, 1).await.unwrap();
-            assert_eq!(next_page.len(), 1, "{label}: Scroll continuation page");
-            assert_ne!(
-                first_page.records()[0].id,
-                next_page.records()[0].id,
-                "{label}: Scroll continuation duplicated a document"
-            );
-            first_source.close().await.unwrap();
-        } else {
-            drop(first_source); // emulate process termination without closing the PIT lease
-            let mut resumed_source = DocumentSource::new(source_config);
-            resumed_source.connect().await.unwrap();
-            let (resumed_page, _) = resumed_source.read_batch(&checkpoint, 1).await.unwrap();
-            assert_eq!(
-                resumed_page.len(),
-                1,
-                "{label}: DocumentSource PIT resume page"
-            );
-            assert_ne!(
-                first_page.records()[0].id,
-                resumed_page.records()[0].id,
-                "{label}: PIT resume duplicated a document"
-            );
-            resumed_source.close().await.unwrap();
-        }
+        drop(first_source); // emulate process termination without closing the server-side cursor
+        let mut resumed_source = DocumentSource::new(source_config.clone());
+        resumed_source.connect().await.unwrap();
+        let (resumed_page, _) = resumed_source.read_batch(&checkpoint, 1).await.unwrap();
+        assert_eq!(
+            resumed_page.len(),
+            1,
+            "{label}: DocumentSource cursor resume page"
+        );
+        assert_ne!(
+            first_page.records()[0].id,
+            resumed_page.records()[0].id,
+            "{label}: cursor resume duplicated a document"
+        );
+        resumed_source.close().await.unwrap();
 
         // CDC append-only feed, delete event encoding and alias cutover guard.
         let change_index = format!("{index}-changes");
@@ -327,6 +314,79 @@ async fn elasticsearch_pit_search_after_and_bulk_item_errors() {
             "{label}: CDC watermark"
         );
         cdc.close().await.unwrap();
+
+        // Verify the complete online source: capture the change-log watermark,
+        // copy the source snapshot, then consume only events newer than the watermark.
+        let mut online_change_connection = source_config.clone();
+        online_change_connection.index = change_index.clone();
+        let mut online = ElasticsearchOnlineMigrationSource::new(
+            source_config.clone(),
+            online_change_connection,
+            CdcConfig {
+                change_index: change_index.clone(),
+                ..CdcConfig::default()
+            },
+        );
+        online.connect().await.unwrap();
+        let late_event = format!(
+            "{{\"index\":{{\"_id\":\"evt-3\"}}}}\n{{\"sequence\":3,\"operation\":\"index\",\"document_id\":\"doc-3\",\"target_index\":\"{index}\",\"document\":{{\"number\":33}},\"routing\":\"tenant-3\"}}\n"
+        );
+        let late_response = http
+            .post(format!("{base_url}/{change_index}/_bulk"))
+            .header("content-type", "application/x-ndjson")
+            .body(late_event)
+            .send()
+            .await
+            .unwrap();
+        assert!(late_response.status().is_success(), "{label}: append late CDC event");
+        http.post(format!("{base_url}/{change_index}/_refresh"))
+            .send()
+            .await
+            .unwrap();
+
+        let (snapshot_page_one, snapshot_offset) = online
+            .read_batch(&OffsetValue::initial(), 1)
+            .await
+            .unwrap();
+        assert_eq!(snapshot_page_one.len(), 1, "{label}: online snapshot page one");
+        let (snapshot_page_two, snapshot_offset) = online
+            .read_batch(&snapshot_offset, 1)
+            .await
+            .unwrap();
+        assert_eq!(snapshot_page_two.len(), 1, "{label}: online snapshot page two");
+        let (cdc_page, online_offset) = online
+            .read_batch(&snapshot_offset, 1)
+            .await
+            .unwrap();
+        assert_eq!(cdc_page.len(), 1, "{label}: online CDC catch-up event");
+        assert_eq!(
+            cdc_page.records()[0].get_metadata("_cdc_sequence"),
+            Some("3"),
+            "{label}: online CDC starts after captured watermark"
+        );
+        assert_eq!(
+            cdc_page.records()[0].get_metadata("_routing"),
+            Some("tenant-3"),
+            "{label}: online CDC preserves routing"
+        );
+        let mut resumed_change_connection = source_config.clone();
+        resumed_change_connection.index = change_index.clone();
+        let mut resumed_online = ElasticsearchOnlineMigrationSource::new(
+            source_config.clone(),
+            resumed_change_connection,
+            CdcConfig {
+                change_index: change_index.clone(),
+                ..CdcConfig::default()
+            },
+        );
+        resumed_online.connect().await.unwrap();
+        let (after_restart, _) = resumed_online
+            .read_batch(&online_offset, 1)
+            .await
+            .unwrap();
+        assert!(after_restart.is_empty(), "{label}: online CDC checkpoint resume");
+        online.close().await.unwrap();
+        resumed_online.close().await.unwrap();
 
         let old_index = format!("{index}-old");
         let new_index = format!("{index}-new");

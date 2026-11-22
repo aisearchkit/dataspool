@@ -210,6 +210,24 @@ impl<S: KvStore + Clone + 'static> ShardExecutor<S> {
             let batch_size = batch.len();
             if batch_size == 0 {
                 if source.is_continuous() {
+                    // Continuous composite sources can advance phases (snapshot -> CDC)
+                    // without emitting a record. Persist that transition so a restart
+                    // does not reopen the snapshot or recapture a later CDC watermark.
+                    if new_offset != offset {
+                        let mut stored = self
+                            .task_store
+                            .get_shard(&shard.shard_id)
+                            .await?
+                            .ok_or_else(|| {
+                                DatspoolError::Internal(format!(
+                                    "Shard {} disappeared while checkpointing source phase",
+                                    shard.shard_id
+                                ))
+                            })?;
+                        stored.update_progress(0, 0, new_offset.clone());
+                        self.task_store.save_shard(&stored).await?;
+                        offset = new_offset;
+                    }
                     // A drained CDC feed is idle, not complete. Keep the source
                     // connected and poll again so writes arriving later are copied.
                     tokio::time::sleep(std::time::Duration::from_secs(1)).await;

@@ -50,3 +50,7 @@ docker compose -f docker-compose.elasticsearch-compat.yml down -v
 Or provide `ES_7102_URL`, `ES_717_URL`, `ES_8X_URL`, and `ES_9X_URL` separately. The test validates version detection, per-item mapping failures, PIT/search_after and `DocumentSource` restart recovery, CDC index/delete events, alias cutover/watermark guard, concurrent Bulk delivery and an overload probe that reports observed HTTP 429 responses. A zero 429 count means the cluster did not reject during that probe; it is not evidence that the 429 path was exercised.
 
 The local compose configuration intentionally uses a one-entry write queue to make overload more reproducible and disables disk threshold enforcement only for disposable test clusters. Never copy those settings into production.
+
+## Snapshot plus CDC task configuration
+
+The `elasticsearch_online` source runs a snapshot first and then tails the append-only change index. It captures the change-log maximum sequence before opening the snapshot and persists both phase and cursor in the shard checkpoint. See [online migration design](../elasticsearch-online-migration.md) for the producer ordering contract and the full YAML example. This is a continuous source: the worker remains active when the change-log backlog is empty. It does not imply native Elasticsearch CDC; a transactional outbox or external CDC producer is still required.

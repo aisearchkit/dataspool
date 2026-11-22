@@ -31,6 +31,13 @@ pub enum SourceConfig {
         #[serde(default)]
         cdc: super::document::CdcConfig,
     },
+    /// Snapshot followed by change-log replay for online Elasticsearch migration.
+    ElasticsearchOnline {
+        snapshot: super::document::DocumentConfig,
+        change_log_connection: super::document::DocumentConfig,
+        #[serde(default)]
+        cdc: super::document::CdcConfig,
+    },
     // Future drivers:
     // NoSql { config: NoSqlConfig }, // MongoDB, Redis, Cassandra
     // Streaming { config: StreamingConfig }, // Kafka, Pulsar, AutoMQ
@@ -74,7 +81,9 @@ pub fn create_source_with_license(
         let feature = match config {
             SourceConfig::Document { .. } => Feature::DocumentMigration,
             SourceConfig::Relational { .. } => Feature::RelationalMigration,
-            SourceConfig::ElasticsearchCdc { .. } => Feature::StreamingMigration,
+            SourceConfig::ElasticsearchCdc { .. } | SourceConfig::ElasticsearchOnline { .. } => {
+                Feature::StreamingMigration
+            }
         };
 
         manager
@@ -94,6 +103,16 @@ pub fn create_source_with_license(
         SourceConfig::ElasticsearchCdc { connection, cdc } => {
             let source =
                 super::document::ElasticsearchCdcSource::new(connection.clone(), cdc.clone());
+            Ok(Box::new(source))
+        }
+        SourceConfig::ElasticsearchOnline {
+            snapshot,
+            change_log_connection,
+            cdc,
+        } => {
+            let source = super::document::ElasticsearchOnlineMigrationSource::new(
+                snapshot.clone(), change_log_connection.clone(), cdc.clone(),
+            );
             Ok(Box::new(source))
         }
     }
@@ -213,6 +232,29 @@ mod tests {
         .unwrap();
         let source = create_source(&config).unwrap();
         assert_eq!(source.source_type(), "elasticsearch_cdc");
+    }
+
+    #[test]
+    fn test_create_elasticsearch_online_migration_source() {
+        let config: SourceConfig = serde_json::from_value(serde_json::json!({
+            "type": "elasticsearch_online",
+            "snapshot": {
+                "urls": ["http://source:9200"],
+                "index": "orders"
+            },
+            "change_log_connection": {
+                "urls": ["http://source:9200"],
+                "index": "change-log"
+            },
+            "cdc": {
+                "change_index": "dataspool-change-log",
+                "sequence_field": "sequence"
+            }
+        }))
+        .unwrap();
+        let source = create_source(&config).unwrap();
+        assert_eq!(source.source_type(), "elasticsearch_online_migration");
+        assert!(source.is_continuous());
     }
 
     #[test]

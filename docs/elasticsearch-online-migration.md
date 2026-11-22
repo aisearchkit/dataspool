@@ -2,7 +2,7 @@
 
 ## Current repository capabilities
 
-The document driver already detects the cluster version, uses PIT + `search_after` for Elasticsearch 7.10+ (and compatible engines), falls back to Scroll when configured/required, and writes through `_bulk`. The generic pipeline supports pluggable transforms and checkpoints an opaque source offset. These are the base for snapshot migration, not yet a complete change-data-capture (CDC) system.
+The document driver detects the cluster version, uses PIT + `search_after` for Elasticsearch 7.12+ (and compatible engines), uses Scroll for Elasticsearch 7.10/7.11 or when configured, and writes through `_bulk`. The generic pipeline supports pluggable transforms and checkpoints an opaque source offset. These are the base for snapshot migration, not yet a complete change-data-capture (CDC) system.
 
 ## Target architecture
 
@@ -20,7 +20,7 @@ Source ES (PIT/search_after) -> bounded read -> local durable batch cache
 ### Compatibility
 
 - Detect source and target versions independently; do not assume both clusters expose identical features.
-- Elasticsearch 7.10+ uses PIT + `search_after`; older versions use Scroll.
+- Elasticsearch 7.12+ uses PIT + `search_after`; Elasticsearch 7.10/7.11 and older versions use Scroll.
 - Target writes use the Bulk API and preserve `_id`, routing, and selected metadata.
 - Treat HTTP 429 and item-level `es_rejected_execution_exception` as backpressure signals, not generic fatal errors.
 
@@ -74,3 +74,34 @@ Cutover is guarded by `switch_alias_after_catchup`: it refuses to update aliases
 ## Compatibility test matrix
 
 `docker-compose.elasticsearch-compat.yml` starts Elasticsearch 7.10.2, 7.17.28 and 8.19.8. Run `docker compose -f docker-compose.elasticsearch-compat.yml up -d`, wait for health checks, then execute `tests/run_es_compat.sh`. The test creates a temporary index, validates Bulk item-level errors, opens a PIT and exercises `search_after`. Existing clusters can be tested by setting `ES_7102_URL`, `ES_717_URL` and `ES_8X_URL` (and optional matching `_USER` / `_PASSWORD` variables).
+
+## Snapshot-plus-CDC source (implemented foundation)
+
+Use `type: elasticsearch_online` to run a snapshot followed by continuous change-log replay in one shard execution. The source captures the maximum change-log sequence first, opens the document snapshot only after that watermark has been captured, reads the snapshot, and then consumes events with sequence greater than the captured value. The composite checkpoint stores the phase, snapshot cursor, initial watermark, and CDC cursor. The executor persists a phase-only transition even when no records are emitted, so a restart does not recapture a newer watermark and skip changes.
+
+Example task source configuration:
+
+```yaml
+source:
+  type: elasticsearch_online
+  snapshot:
+    urls: ["https://source-es:9200"]
+    index: "orders"
+    batch_size: 1000
+  change_log_connection:
+    urls: ["https://source-es:9200"]
+    index: "dataspool-change-log"
+  cdc:
+    change_index: "dataspool-change-log"
+    sequence_field: "sequence"
+    operation_field: "operation"
+    document_id_field: "document_id"
+    target_index_field: "target_index"
+    document_field: "document"
+    routing_field: "routing"
+    batch_size: 1000
+```
+
+Configure the sink as a document sink targeting the destination index. CDC events may override the sink's default index using `target_index`; `operation: delete` is translated to a Bulk delete action. Snapshot `_routing` metadata and optional CDC `routing` values are carried into Bulk action metadata. The change-log producer must guarantee that each sequence is globally unique and strictly increasing, that a change event is searchable only after its source mutation is visible to the snapshot/search API, and that events are retained until the migration has consumed them. The snapshot is opened after the initial watermark is captured: changes after that watermark may be present in both snapshot and CDC, which is intentional and safe with stable document IDs and ordered replay. This source is at-least-once, not exactly-once.
+
+The online source does not itself create a transactional outbox, pause application writes, or perform final alias cutover. Those require producer-specific integration and an explicit write-barrier/final-watermark operation. Do not switch production aliases solely because the CDC poller is running.

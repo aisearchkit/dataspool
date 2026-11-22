@@ -463,6 +463,9 @@ impl DocumentSource {
             if let Some(index) = hit["_index"].as_str() {
                 record.add_metadata("_index", index);
             }
+            if let Some(routing) = hit["_routing"].as_str() {
+                record.add_metadata("_routing", routing);
+            }
             if let Some(doc_type) = hit["_type"].as_str() {
                 record.add_metadata("_type", doc_type);
             }
@@ -603,7 +606,28 @@ impl DocumentSource {
     }
 
     /// Read batch using Scroll API
-    async fn read_batch_scroll(&mut self, client: &Client) -> Result<(RecordBatch, OffsetValue)> {
+    async fn read_batch_scroll(
+        &mut self,
+        client: &Client,
+        offset: &OffsetValue,
+    ) -> Result<(RecordBatch, OffsetValue)> {
+        // Restore a live Scroll context when the process restarts before its
+        // keep-alive expires. If it has expired, replay from the beginning;
+        // stable destination IDs make that fallback idempotent.
+        if self.scroll_state.is_none()
+            && let OffsetValue::Custom(value) = offset
+            && value["driver"].as_str() == Some("elasticsearch_scroll")
+            && let (Some(scroll_id), Some(docs_read)) = (
+                value["scroll_id"].as_str(),
+                value["docs_read"].as_u64(),
+            )
+        {
+            self.scroll_state = Some(ScrollState {
+                scroll_id: scroll_id.to_string(),
+                docs_read,
+            });
+        }
+
         // The initial _search response already contains page one. Do not discard it
         // and immediately call _search/scroll, which would skip that page entirely.
         let body = if self.scroll_state.is_none() {
@@ -617,7 +641,17 @@ impl DocumentSource {
                 .ok_or_else(|| DriverError::DataError("No scroll state".to_string()))?
                 .scroll_id
                 .clone();
-            self.continue_scroll(client, &scroll_id).await?
+            match self.continue_scroll(client, &scroll_id).await {
+                Ok(body) => body,
+                Err(error) if error.to_string().contains("HTTP 404") => {
+                    warn!("Saved Scroll context expired; restarting snapshot from the beginning");
+                    self.scroll_state = None;
+                    let (state, first_page) = self.init_scroll(client).await?;
+                    self.scroll_state = Some(state);
+                    first_page
+                }
+                Err(error) => return Err(error),
+            }
         };
 
         // Parse hits
@@ -635,7 +669,11 @@ impl DocumentSource {
         }
         state.docs_read += hits_read;
         let new_docs_read = state.docs_read;
-        let new_offset = OffsetValue::DocumentCount(new_docs_read);
+        let new_offset = OffsetValue::Custom(json!({
+            "driver": "elasticsearch_scroll",
+            "scroll_id": state.scroll_id,
+            "docs_read": new_docs_read
+        }));
 
         debug!(
             "Read batch (Scroll): {} docs, total: {}",
@@ -683,7 +721,7 @@ impl Source for DocumentSource {
 
         match self.api_mode {
             ApiMode::PointInTime => self.read_batch_pit(&client, offset).await,
-            ApiMode::Scroll => self.read_batch_scroll(&client).await,
+            ApiMode::Scroll => self.read_batch_scroll(&client, offset).await,
         }
     }
 
@@ -739,6 +777,7 @@ mod tests {
                     "_id": "doc1",
                     "_index": "test-index",
                     "_type": "_doc",
+                    "_routing": "tenant-1",
                     "_source": {
                         "field1": "value1",
                         "field2": 42
@@ -762,6 +801,7 @@ mod tests {
         let records = batch.into_records();
         assert_eq!(records[0].id.as_ref().unwrap(), "doc1");
         assert_eq!(records[0].get_metadata("_index"), Some("test-index"));
+        assert_eq!(records[0].get_metadata("_routing"), Some("tenant-1"));
         assert_eq!(records[1].id.as_ref().unwrap(), "doc2");
     }
 }

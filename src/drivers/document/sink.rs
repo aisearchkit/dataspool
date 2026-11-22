@@ -186,34 +186,7 @@ impl DocumentSink {
     /// Build bulk request body in NDJSON format
     #[cfg(test)]
     fn build_bulk_body(&self, batch: &RecordBatch) -> String {
-        let mut body = String::new();
-
-        for record in batch.records() {
-            // CDC records may target a concrete index and may represent deletes.
-            let target_index = record
-                .get_metadata("_target_index")
-                .unwrap_or(&self.target_index);
-            let operation = record.get_metadata("_op").unwrap_or("index");
-            let mut action_metadata = serde_json::Map::new();
-            action_metadata.insert("_index".into(), json!(target_index));
-            if let Some(id) = &record.id {
-                action_metadata.insert("_id".into(), json!(id));
-            }
-            let mut action = serde_json::Map::new();
-            action.insert(operation.to_string(), Value::Object(action_metadata));
-            let action = Value::Object(action);
-            body.push_str(&action.to_string());
-            body.push('\n');
-
-            // Delete actions contain no source line in Bulk NDJSON.
-            if operation == "delete" {
-                continue;
-            }
-            body.push_str(&record.payload.to_string());
-            body.push('\n');
-        }
-
-        body
+        Self::build_bulk_body_for(&self.target_index, batch)
     }
 
     /// Last observed write-thread-pool pressure across cluster nodes.
@@ -270,6 +243,9 @@ impl DocumentSink {
             meta.insert("_index".into(), json!(index));
             if let Some(id) = &record.id {
                 meta.insert("_id".into(), json!(id));
+            }
+            if let Some(routing) = record.get_metadata("_routing") {
+                meta.insert("routing".into(), json!(routing));
             }
             let mut action = serde_json::Map::new();
             action.insert(operation.to_string(), Value::Object(meta));
@@ -748,10 +724,12 @@ mod tests {
         let mut record = Record::with_id("doc-1", "elasticsearch_cdc", json!({}));
         record.add_metadata("_op", "delete");
         record.add_metadata("_target_index", "events-2026");
+        record.add_metadata("_routing", "tenant-42");
         let body = sink.build_bulk_body(&RecordBatch::from(vec![record]));
         assert_eq!(body.lines().count(), 1);
         assert!(body.contains(r#""delete""#));
         assert!(body.contains(r#""_index":"events-2026""#));
+        assert!(body.contains(r#""routing":"tenant-42""#));
     }
 
     #[test]

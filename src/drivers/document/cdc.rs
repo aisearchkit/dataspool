@@ -24,6 +24,7 @@ pub struct CdcConfig {
     pub document_id_field: String,
     pub target_index_field: String,
     pub document_field: String,
+    pub routing_field: String,
     pub batch_size: usize,
 }
 
@@ -36,6 +37,7 @@ impl Default for CdcConfig {
             document_id_field: "document_id".into(),
             target_index_field: "target_index".into(),
             document_field: "document".into(),
+            routing_field: "routing".into(),
             batch_size: 1_000,
         }
     }
@@ -99,6 +101,53 @@ impl ElasticsearchCdcSource {
             "driver": "elasticsearch_cdc",
             "last_sequence": self.last_sequence
         }))
+    }
+
+    /// Set the first sequence to consume. Events at or below this watermark
+    /// are already represented by the snapshot and must not be replayed.
+    pub fn set_start_sequence(&mut self, sequence: u64) {
+        self.last_sequence = sequence;
+    }
+
+    /// Capture the current change-log high watermark before opening the
+    /// snapshot PIT. The producer must publish an event only after its source
+    /// mutation is visible to searches, and must retain events after this value.
+    pub async fn capture_watermark(&self) -> Result<u64> {
+        let client = self.client.as_ref().ok_or_else(|| {
+            DriverError::ConnectionFailed("CDC source is not connected".into())
+        })?;
+        let response = client
+            .post(format!("{}/{}/_search", self.base_url, self.cdc.change_index))
+            .json(&json!({
+                "size": 1,
+                "track_total_hits": false,
+                "sort": [{ (&self.cdc.sequence_field): { "order": "desc" } }],
+                "_source": [self.cdc.sequence_field]
+            }))
+            .send()
+            .await
+            .map_err(|e| DriverError::DataError(format!("CDC watermark query failed: {e}")))?;
+        if !response.status().is_success() {
+            return Err(DriverError::DataError(format!(
+                "CDC watermark query returned HTTP {}",
+                response.status()
+            )).into());
+        }
+        let body: Value = response.json().await.map_err(|e| {
+            DriverError::DataError(format!("Invalid CDC watermark response: {e}"))
+        })?;
+        let hits = body["hits"]["hits"].as_array().ok_or_else(|| {
+            DriverError::DataError("CDC watermark response has no hits array".into())
+        })?;
+        match hits.first() {
+            Some(hit) => hit["_source"][&self.cdc.sequence_field]
+                .as_u64()
+                .ok_or_else(|| DriverError::DataError(format!(
+                    "CDC watermark field '{}' is not an unsigned integer",
+                    self.cdc.sequence_field
+                )).into()),
+            None => Ok(0),
+        }
     }
 }
 
@@ -216,6 +265,9 @@ impl Source for ElasticsearchCdcSource {
             let mut record = Record::with_id(id, "elasticsearch_cdc", payload);
             record.add_metadata("_op", operation);
             record.add_metadata("_target_index", target_index);
+            if let Some(routing) = source[&self.cdc.routing_field].as_str() {
+                record.add_metadata("_routing", routing);
+            }
             record.add_metadata("_cdc_sequence", sequence.to_string());
             batch.push(record);
             self.last_sequence = sequence;
