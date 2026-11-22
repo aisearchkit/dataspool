@@ -300,7 +300,10 @@ async fn elasticsearch_pit_search_after_and_bulk_item_errors() {
             cdc_config,
         );
         cdc.connect().await.unwrap();
-        assert!(cdc.is_continuous(), "{label}: CDC source must stay active when idle");
+        assert!(
+            cdc.is_continuous(),
+            "{label}: CDC source must stay active when idle"
+        );
         let (events, watermark) = cdc.read_batch(&OffsetValue::initial(), 10).await.unwrap();
         assert_eq!(events.len(), 2, "{label}: CDC event count");
         assert_eq!(
