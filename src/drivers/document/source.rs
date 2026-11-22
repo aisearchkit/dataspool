@@ -312,7 +312,10 @@ impl DocumentSource {
         // First search to get total count
         let mut search_body = json!({
             "size": self.config.batch_size,
-            "sort": [{"_doc": "asc"}],
+            // _doc is only a per-shard Lucene document position and is not a
+            // globally unique search_after cursor across multiple shards.
+            // _shard_doc is stable and unique within a PIT snapshot.
+            "sort": [{"_shard_doc": "asc"}],
             "pit": {
                 "id": &pit_id,
                 "keep_alive": &keep_alive
@@ -378,7 +381,7 @@ impl DocumentSource {
 
         let mut search_body = json!({
             "size": self.config.batch_size,
-            "sort": [{"_doc": "asc"}],
+            "sort": [{"_shard_doc": "asc"}],
             "pit": {
                 "id": pit_id,
                 "keep_alive": &keep_alive

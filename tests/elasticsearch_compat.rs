@@ -181,7 +181,7 @@ async fn elasticsearch_pit_search_after_and_bulk_item_errors() {
 
         let first_response = http
             .post(format!("{base_url}/_search"))
-            .json(&json!({"size":1,"pit":{"id":&pit_id,"keep_alive":"1m"},"sort":[{"_doc":"asc"}]}))
+            .json(&json!({"size":1,"pit":{"id":&pit_id,"keep_alive":"1m"},"sort":[{"_shard_doc":"asc"}]}))
             .send()
             .await
             .unwrap();
@@ -202,7 +202,7 @@ async fn elasticsearch_pit_search_after_and_bulk_item_errors() {
             .json(&json!({
                 "size": 1,
                 "pit": {"id": &current_pit_id, "keep_alive": "1m"},
-                "sort": [{"_doc":"asc"}],
+                "sort": [{"_shard_doc":"asc"}],
                 "search_after": sort
             }))
             .send()
