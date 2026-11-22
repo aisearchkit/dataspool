@@ -57,7 +57,7 @@ tempfile = "3.12"
 dashmap = "6.1.0"
 aws-sdk-s3 = { version = "1.123.0", default-features = false, features = ["sigv4a", "http-1x", "default-https-client", "rt-tokio"] }
 aws-config = "1.8.14"
-parquet = "57.3.0"
+parquet = "60.1.0"
 arrow = "57.3.0"
 
 # HTTP client for search engine APIs (ES/OpenSearch compatible)
