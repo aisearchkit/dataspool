@@ -20,6 +20,8 @@ use crate::task::store::TaskStore;
 /// Shard execution statistics
 #[derive(Debug, Clone, Default)]
 pub struct ExecutionStats {
+    /// True when the source is a continuous stream and the shard must remain active.
+    pub is_continuous: bool,
     pub docs_read: u64,
     pub docs_written: u64,
     pub docs_indexed: u64,
@@ -108,8 +110,10 @@ impl<S: KvStore + Clone + 'static> ShardExecutor<S> {
             .ok_or_else(|| {
                 DatspoolError::Internal(format!("Shard {shard_id} disappeared during execution"))
             })?;
-        completed.complete(stats.docs_written);
-        self.task_store.save_shard(&completed).await?;
+        if !stats.is_continuous {
+            completed.complete(stats.docs_written);
+            self.task_store.save_shard(&completed).await?;
+        }
 
         info!(
             shard_id,
@@ -136,6 +140,7 @@ impl<S: KvStore + Clone + 'static> ShardExecutor<S> {
         sink: &mut dyn Sink,
     ) -> Result<ExecutionStats> {
         let mut stats = ExecutionStats {
+            is_continuous: source.is_continuous(),
             start_time: Some(std::time::Instant::now()),
             ..Default::default()
         };
@@ -204,6 +209,12 @@ impl<S: KvStore + Clone + 'static> ShardExecutor<S> {
             let (batch, new_offset) = source.read_batch(&offset, self.batch_size).await?;
             let batch_size = batch.len();
             if batch_size == 0 {
+                if source.is_continuous() {
+                    // A drained CDC feed is idle, not complete. Keep the source
+                    // connected and poll again so writes arriving later are copied.
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    continue;
+                }
                 info!("No more data to read for shard {}", shard.shard_id);
                 break;
             }

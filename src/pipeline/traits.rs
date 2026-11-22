@@ -75,12 +75,19 @@ pub trait Source: Send + Sync {
     /// Read a batch of records starting from the given offset
     ///
     /// Returns the batch and the new offset position.
-    /// Empty batch indicates end of data.
+    /// Empty batch indicates end of data for finite sources. Continuous sources
+    /// may return an empty batch when no new events are currently available.
     async fn read_batch(
         &mut self,
         offset: &OffsetValue,
         batch_size: usize,
     ) -> Result<(RecordBatch, OffsetValue)>;
+
+    /// Whether this source remains active after its current backlog is drained.
+    /// Continuous sources (for example, CDC feeds) are polled until execution is stopped.
+    fn is_continuous(&self) -> bool {
+        false
+    }
 
     /// Estimate total number of records (for progress calculation)
     ///

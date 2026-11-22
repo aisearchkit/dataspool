@@ -228,6 +228,10 @@ impl Source for ElasticsearchCdcSource {
         Ok((batch, self.checkpoint()))
     }
 
+    fn is_continuous(&self) -> bool {
+        true
+    }
+
     async fn estimate_count(&self) -> Result<Option<u64>> {
         Ok(None)
     }
@@ -292,6 +296,15 @@ pub async fn switch_alias_after_catchup(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cdc_source_is_continuous() {
+        let source = ElasticsearchCdcSource::new(
+            crate::drivers::document::DocumentConfig::local("change-log"),
+            CdcConfig::default(),
+        );
+        assert!(source.is_continuous());
+    }
 
     #[test]
     fn cdc_offset_round_trips() {
