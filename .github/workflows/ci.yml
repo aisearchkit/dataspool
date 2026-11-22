@@ -104,3 +104,52 @@ jobs:
         with:
           name: dataspool-linux-x64
           path: target/release/dataspool
+
+  tag-dependency-update:
+    name: Tag successful Dependabot update
+    runs-on: ubuntu-latest
+    needs: [format, clippy, test, audit, elasticsearch-multinode, build]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    permissions:
+      contents: write
+      pull-requests: read
+    steps:
+      - name: Checkout merged commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+
+      - name: Create dependency-update tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          COMMIT_SHA: ${{ github.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          prs="$(gh api "repos/${GH_REPO}/commits/${COMMIT_SHA}/pulls")"
+          pr="$(jq -c '[.[] | select(.user.login == "dependabot[bot]" and .merged_at != null)] | first // empty' <<<"$prs")"
+          if [[ -z "$pr" ]]; then
+            echo "No merged Dependabot PR is associated with this commit; skipping tag."
+            exit 0
+          fi
+
+          pr_number="$(jq -r '.number' <<<"$pr")"
+          files="$(gh api "repos/${GH_REPO}/pulls/${pr_number}/files?per_page=100")"
+          if ! jq -e 'length > 0 and all(.[]; .filename == "Cargo.toml" or .filename == "Cargo.lock" or (.filename | startswith(".github/workflows/")) or .filename == ".github/dependabot.yml")' <<<"$files" >/dev/null; then
+            echo "Dependabot PR #${pr_number} changes files outside the dependency/CI allowlist; skipping tag."
+            exit 0
+          fi
+
+          short_sha="${COMMIT_SHA:0:7}"
+          tag="deps-$(date -u +%Y%m%d)-${short_sha}"
+          if git ls-remote --exit-code --tags origin "refs/tags/${tag}" >/dev/null 2>&1; then
+            echo "Tag ${tag} already exists; nothing to do."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$tag" "$COMMIT_SHA" -m "Dependabot dependency update PR #${pr_number} (CI passed)"
+          git push origin "refs/tags/${tag}"
+          echo "Created ${tag} after all CI jobs passed."

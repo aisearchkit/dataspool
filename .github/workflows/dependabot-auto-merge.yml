@@ -1,0 +1,67 @@
+name: Dependabot Auto Merge
+
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize, ready_for_review]
+    branches: [main]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  merge-after-ci:
+    name: Merge Dependabot update after CI succeeds
+    if: >-
+      github.event.pull_request.user.login == 'dependabot[bot]' &&
+      github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - name: Read Dependabot update metadata
+        id: metadata
+        uses: dependabot/fetch-metadata@v2
+        with:
+          github-token: "${{ secrets.GITHUB_TOKEN }}"
+
+      - name: Wait for the complete CI matrix and squash-merge
+        if: >-
+          steps.metadata.outputs.update-type == 'version-update:semver-minor' ||
+          steps.metadata.outputs.update-type == 'version-update:semver-patch'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected='["Format Check","Clippy Lints","Test Suite","Security Audit","Elasticsearch 7102 three-node soak","Elasticsearch 717 three-node soak","Elasticsearch 8x three-node soak","Elasticsearch 9x three-node soak","Build Release"]'
+          deadline=$((SECONDS + 3 * 60 * 60))
+
+          while (( SECONDS < deadline )); do
+            checks="$(gh api "repos/${GH_REPO}/commits/${PR_HEAD_SHA}/check-runs?per_page=100")"
+            if jq -e --argjson expected "$expected" '
+              .check_runs as $runs |
+              any($expected[]; . as $name | any($runs[]; .name == $name and .status == "completed" and .conclusion != "success"))
+            ' <<<"$checks" >/dev/null; then
+              echo "At least one required CI job failed; Dependabot PR will not be merged." >&2
+              jq -r '.check_runs[] | select(.status == "completed" and .conclusion != "success") | "\(.name): \(.conclusion)"' <<<"$checks" >&2
+              exit 1
+            fi
+
+            if jq -e --argjson expected "$expected" '
+              .check_runs as $runs |
+              all($expected[]; . as $name | any($runs[]; .name == $name and .status == "completed" and .conclusion == "success"))
+            ' <<<"$checks" >/dev/null; then
+              echo "All nine CI jobs passed for ${PR_HEAD_SHA}; merging ${PR_URL}."
+              gh pr merge --squash --delete-branch "$PR_URL"
+              exit 0
+            fi
+
+            echo "Waiting for all nine CI jobs to complete..."
+            sleep 30
+          done
+
+          echo "Timed out waiting for the complete CI matrix; Dependabot PR was not merged." >&2
+          exit 1
