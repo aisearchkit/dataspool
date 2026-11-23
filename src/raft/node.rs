@@ -798,8 +798,13 @@ mod cluster_tests {
                 .unwrap()
                 .unwrap();
             assert_eq!(current.fencing_token, second_token);
-            assert!(
-                matches!(current.state, ShardState::Running { ref node_id, .. } if node_id.as_str() == "worker-b")
+            assert!(matches!(current.state, ShardState::Completed { .. }));
+            assert_eq!(
+                current
+                    .last_owner_node_id
+                    .as_ref()
+                    .map(|node| node.as_str()),
+                Some("worker-b")
             );
         }
 
