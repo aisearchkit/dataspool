@@ -177,21 +177,29 @@ impl RaftNode {
 
     pub async fn propose(&self, command: Command) -> Result<super::CommandResponse> {
         let mut last_error = None;
-        for attempt in 0..3 {
-            let known_leader = self.raft.current_leader().await;
-            if known_leader.is_none() || known_leader == Some(self.node_id) {
-                match tokio::time::timeout(std::time::Duration::from_secs(20), self.raft.client_write(command.clone())).await {
-                    Ok(Ok(response)) => return Ok(response.data),
-                    Ok(Err(error)) => last_error = Some(error.to_string()),
-                    Err(_) => last_error = Some("Raft proposal timed out".to_string()),
+        // Followers may learn the elected leader slightly later than the leader
+        // itself. Do not block in client_write while the leader is unknown: that
+        // prevents the forwarding/retry path from ever running.
+        for attempt in 0..20 {
+            match self.raft.current_leader().await {
+                Some(leader_id) if leader_id == self.node_id => {
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(10),
+                        self.raft.client_write(command.clone()),
+                    ).await {
+                        Ok(Ok(response)) => return Ok(response.data),
+                        Ok(Err(error)) => last_error = Some(error.to_string()),
+                        Err(_) => last_error = Some("Raft proposal timed out".to_string()),
+                    }
                 }
+                Some(_) => match self.forward_proposal(command.clone()).await {
+                    Ok(response) => return Ok(response),
+                    Err(error) => last_error = Some(error.to_string()),
+                },
+                None => last_error = Some("Raft leader is not known yet".to_string()),
             }
-            match self.forward_proposal(command.clone()).await {
-                Ok(response) => return Ok(response),
-                Err(error) => last_error = Some(error.to_string()),
-            }
-            if attempt < 2 {
-                tokio::time::sleep(std::time::Duration::from_millis(200 * (attempt + 1))).await;
+            if attempt < 19 {
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
             }
         }
         Err(DatspoolError::Raft(crate::error::RaftError::ProposalFailed(
@@ -340,6 +348,8 @@ mod cluster_tests {
         // shard execution is distributed across all members, not leader-only.
         let worker_index = (leader_index + 1) % nodes.len();
         let worker_node = nodes[worker_index].clone();
+        let known_leader = worker_node.wait_for_leader(Duration::from_secs(5)).await.unwrap();
+        assert_eq!(known_leader, leader.node_id());
         let worker_store = Arc::new(TaskStore::new(stores[worker_index].clone()));
         let claimer = ShardClaimer::new("worker-a".into(), worker_store.clone(), Arc::new(worker_node.clone()));
         let mut lease = claimer.try_claim().await.unwrap().expect("follower should claim pending shard");

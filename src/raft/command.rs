@@ -175,7 +175,7 @@ impl Command {
                 format!("ImportLegacyCache({}, {}, {} records)", shard_id, batch_id, records.len())
             }
             Command::BootstrapComplete => "BootstrapComplete".to_string(),
-            Command::CacheBatch { shard_id, node_id, batch_id, records, .. } => {
+            Command::CacheBatch { shard_id, node_id: _, batch_id, records, .. } => {
                 format!("CacheBatch({}, {}, {} records)", shard_id, batch_id, records.len())
             }
             Command::PersistDeadLetters { shard_id, failures, .. } => {
