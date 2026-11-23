@@ -281,8 +281,9 @@ impl RaftNode {
             });
             (leader_id, address)
         };
-        let leader_id = leader_id
-            .ok_or_else(|| DatspoolError::Raft(crate::error::RaftError::NotLeader(None)))?;
+        let leader_id = leader_id.ok_or(DatspoolError::Raft(
+            crate::error::RaftError::NotLeader(None),
+        ))?;
         let address = leader_addr.ok_or_else(|| {
             DatspoolError::Raft(crate::error::RaftError::NotLeader(Some(
                 leader_id.to_string(),
