@@ -117,7 +117,7 @@ Dataspool 旨在解决以上痛点，提供一个延迟低、扩展性强、部�
 
 ## 6. 配置文件规范
 
-### 5.1 集群配置示例 (dataspool-cluster.yaml)
+### 5.1 集群配置示例 (config/dataspool-cluster.yaml)
 
 ```yaml
 cluster:

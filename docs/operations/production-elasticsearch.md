@@ -42,9 +42,9 @@ Without a write barrier/final watermark protocol, a producer can append events b
 Run the Docker matrix with:
 
 ```bash
-docker compose -f docker-compose.elasticsearch-compat.yml up -d --wait
+docker compose -f deploy/compose/elasticsearch-compat.yml up -d --wait
 ./tests/run_es_compat.sh
-docker compose -f docker-compose.elasticsearch-compat.yml down -v
+docker compose -f deploy/compose/elasticsearch-compat.yml down -v
 ```
 
 Or provide `ES_7102_URL`, `ES_717_URL`, `ES_8X_URL`, and `ES_9X_URL` separately. The test validates version detection, per-item mapping failures, PIT/search_after and `DocumentSource` restart recovery, CDC index/delete events, alias cutover/watermark guard, concurrent Bulk delivery and an overload probe that reports observed HTTP 429 responses. A zero 429 count means the cluster did not reject during that probe; it is not evidence that the 429 path was exercised.

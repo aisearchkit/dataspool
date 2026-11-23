@@ -144,7 +144,7 @@ Structured JSON logging with fields: `timestamp`, `level`, `target`, `message`, 
 
 ### Configuration
 
-System configured via `dataspool-cluster.yaml` (YAML format):
+System configured via `config/dataspool-cluster.yaml` (YAML format):
 - Environment variables can override any config: `DATASPOOL_<PATH_IN_UPPERCASE>`
 - Example: `server.http_port` → `DATASPOOL_SERVER_HTTP_PORT`
 - Sensitive values (passwords, secrets) must use env vars, never hardcoded

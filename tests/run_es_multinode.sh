@@ -16,7 +16,7 @@ export ES_EXPECT_NODES="${ES_EXPECT_NODES:-3}"
 export ES_SOAK_SECONDS="${ES_SOAK_SECONDS:-300}"
 export ES_REQUIRE_429="${ES_REQUIRE_429:-1}"
 export ES_REQUIRE_LIVE=1
-COMPOSE=(docker compose -f docker-compose.elasticsearch-multinode.yml --profile "$PROFILE")
+COMPOSE=(docker compose -f "$ROOT_DIR/deploy/compose/elasticsearch-multinode.yml" --profile "$PROFILE")
 cleanup() { "${COMPOSE[@]}" down -v; }
 trap cleanup EXIT
 sudo sysctl -w vm.max_map_count=262144

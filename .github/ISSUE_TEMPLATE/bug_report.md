@@ -35,7 +35,7 @@ assignees: ''
 ## 配置文件 / Configuration
 
 ```yaml
-# 粘贴相关的 dataspool-cluster.yaml 配置
+# 粘贴相关的 config/dataspool-cluster.yaml 配置
 # 请移除敏感信息（密码、API Key 等）
 ```
 

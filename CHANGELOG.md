@@ -24,4 +24,4 @@ No unreleased changes.
 
 ### Limitations
 - This is an early preview focused on Elasticsearch HTTP migration. MySQL/PostgreSQL sink completeness, production Raft consensus, full gRPC cluster/task APIs, local Lucene reading, and a complete Control/Agent production orchestration lifecycle are not claimed as supported in this release.
-- The automated release workflow currently publishes a Linux x86_64 artifact as a draft prerelease. Other platform binaries and production deployment/upgrade procedures are not included.
+- The automated release workflow currently publishes a Linux x86_64 artifact as a GitHub pre-release. Other platform binaries and production deployment/upgrade procedures are not included.

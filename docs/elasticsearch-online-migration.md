@@ -73,7 +73,7 @@ Cutover is guarded by `switch_alias_after_catchup`: it refuses to update aliases
 
 ## Compatibility test matrix
 
-`docker-compose.elasticsearch-compat.yml` starts Elasticsearch 7.10.2, 7.17.28 and 8.19.8. Run `docker compose -f docker-compose.elasticsearch-compat.yml up -d`, wait for health checks, then execute `tests/run_es_compat.sh`. The test creates a temporary index, validates Bulk item-level errors, opens a PIT and exercises `search_after`. Existing clusters can be tested by setting `ES_7102_URL`, `ES_717_URL` and `ES_8X_URL` (and optional matching `_USER` / `_PASSWORD` variables).
+`deploy/compose/elasticsearch-compat.yml` starts Elasticsearch 7.10.2, 7.17.28 and 8.19.8. Run `docker compose -f deploy/compose/elasticsearch-compat.yml up -d`, wait for health checks, then execute `tests/run_es_compat.sh`. The test creates a temporary index, validates Bulk item-level errors, opens a PIT and exercises `search_after`. Existing clusters can be tested by setting `ES_7102_URL`, `ES_717_URL` and `ES_8X_URL` (and optional matching `_USER` / `_PASSWORD` variables).
 
 ## Snapshot-plus-CDC source (implemented foundation)
 
