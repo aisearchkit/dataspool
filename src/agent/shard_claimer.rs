@@ -194,7 +194,7 @@ impl<S: KvStore + Clone + 'static> ShardClaimer<S> {
                     let owner_matches = matches!(&shard.state, ShardState::Running { node_id, .. } if node_id == &self.node_id);
                     if owner_matches
                         && shard.fencing_token == fencing_token
-                        && shard.lease_expires_at.as_ref().is_some_and(|current| current >= &expires_at)
+                        && shard.lease_expires_at.as_ref().is_some_and(|current| current.timestamp_millis() >= expires_at.timestamp_millis())
                     {
                         return Ok(());
                     }
