@@ -334,9 +334,7 @@ impl<S: KvStore + Clone + 'static> ShardExecutor<S> {
                         executor.persist_progress(lease_for_delivery.as_ref(), &shard_id, source_count, next_offset).await?;
                     }
                     Ok(())
-                }, move |cache_key| {
-                    let cache_key = cache_key.to_string();
-                    async move {
+                }, move |cache_key| async move {
                     if let Some(lease) = lease_for_ack.as_ref() {
                         executor_for_ack.ensure_lease(lease).await?;
                         let response = executor_for_ack.raft.as_ref()
@@ -353,7 +351,6 @@ impl<S: KvStore + Clone + 'static> ShardExecutor<S> {
                         }
                     }
                     Ok(())
-                    }
                 })
                 .await?;
             if !delivered {
@@ -480,9 +477,7 @@ impl<S: KvStore + Clone + 'static> ShardExecutor<S> {
                         executor.persist_progress(lease_for_delivery.as_ref(), &shard_id, source_count, next_offset).await?;
                     }
                     Ok(())
-                }, move |cache_key| {
-                    let cache_key = cache_key.to_string();
-                    async move {
+                }, move |cache_key| async move {
                     if let Some(lease) = lease_for_ack.as_ref() {
                         executor_for_ack.ensure_lease(lease).await?;
                         let response = executor_for_ack.raft.as_ref()
@@ -499,7 +494,6 @@ impl<S: KvStore + Clone + 'static> ShardExecutor<S> {
                         }
                     }
                     Ok(())
-                    }
                 })
                 .await?;
 

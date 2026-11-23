@@ -211,13 +211,13 @@ impl<S: KvStore> LocalBatchCache<S> {
     where
         F: FnOnce(RecordBatch, Option<OffsetValue>, u64) -> Fut,
         Fut: std::future::Future<Output = Result<()>>,
-        A: FnOnce(&str) -> AFut,
+        A: FnOnce(String) -> AFut,
         AFut: std::future::Future<Output = Result<()>>,
     {
         let Some((key, entry)) = self.peek_entry().await? else { return Ok(false) };
         deliver(entry.records.into(), entry.next_offset, entry.source_count).await?;
         // Replicate the acknowledgement before deleting the local cache copy.
-        acknowledge(&key).await?;
+        acknowledge(key.clone()).await?;
         self.ack(&key).await?;
         Ok(true)
     }
