@@ -22,6 +22,12 @@ pub struct TaskStore<S: KvStore> {
     store: S,
 }
 
+impl<S: KvStore> std::fmt::Debug for TaskStore<S> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("TaskStore").finish_non_exhaustive()
+    }
+}
+
 impl<S: KvStore + Clone> Clone for TaskStore<S> {
     fn clone(&self) -> Self {
         Self::new(self.store.clone())
@@ -407,6 +413,7 @@ mod tests {
         let (store, _temp) = create_test_store().await;
         let marker = serde_json::to_vec(&serde_json::json!({"last_applied": 42})).unwrap();
         store.set_raft_applied_state(&marker).await.unwrap();
+        store.mark_bootstrap_complete().await.unwrap();
         store.kv_store().flush_durable().await.unwrap();
 
         let snapshot = store.export_snapshot().await.unwrap();
@@ -417,6 +424,7 @@ mod tests {
         let (restored, _restored_temp) = create_test_store().await;
         restored.replace_snapshot(snapshot).await.unwrap();
         assert_eq!(restored.raft_applied_state().await.unwrap(), Some(marker));
+        assert!(restored.bootstrap_complete().await.unwrap());
     }
 
     #[tokio::test]

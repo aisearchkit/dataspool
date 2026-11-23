@@ -7,9 +7,6 @@ use std::ops::RangeBounds;
 use std::path::Path;
 use std::sync::Arc;
 
-use byteorder::BigEndian;
-use byteorder::ReadBytesExt;
-use byteorder::WriteBytesExt;
 use openraft::storage::LogFlushed;
 use openraft::storage::LogState;
 use openraft::storage::RaftLogStorage;
@@ -25,6 +22,7 @@ use openraft::OptionalSend;
 use openraft::RaftLogReader;
 use openraft::RaftSnapshotBuilder;
 use openraft::RaftTypeConfig;
+use openraft::RaftLogId;
 use openraft::SnapshotMeta;
 use openraft::StorageError;
 use openraft::StorageIOError;
@@ -38,6 +36,7 @@ use rocksdb::DB;
 use serde::{Deserialize, Serialize};
 use crate::raft::{Command, CommandResponse};
 use crate::storage::RocksDbStore;
+use crate::storage::kv::KvStore;
 use crate::task::{TaskStore, TaskStoreSnapshot};
 
 pub type RocksNodeId = u64;
@@ -70,11 +69,19 @@ pub struct StateMachine {
 
 /// Raft metadata is kept in the Raft RocksDB; replicated application data and
 /// its applied-log marker are committed together in the task RocksDB.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct RocksStateMachine {
     db: Arc<DB>,
     sm: StateMachine,
     task_store: TaskStore<RocksDbStore>,
+}
+
+impl Debug for RocksStateMachine {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("RocksStateMachine")
+            .field("state_machine", &self.sm)
+            .finish_non_exhaustive()
+    }
 }
 
 impl RocksStateMachine {
@@ -125,13 +132,11 @@ type StorageResult<T> = Result<T, StorageError<RocksNodeId>>;
 /// converts an id to a byte vector for storing in the database.
 /// Note that we're using big endian encoding to ensure correct sorting of keys
 fn id_to_bin(id: u64) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(8);
-    buf.write_u64::<BigEndian>(id).unwrap();
-    buf
+    id.to_be_bytes().to_vec()
 }
 
 fn bin_to_id(buf: &[u8]) -> u64 {
-    (&buf[0..8]).read_u64::<BigEndian>().unwrap()
+    u64::from_be_bytes(buf[..8].try_into().expect("Raft log keys are exactly 8 bytes"))
 }
 
 /// Meta data of a raft-store.

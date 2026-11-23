@@ -39,7 +39,7 @@ impl RaftNode {
         let config = Arc::new(config.validate().map_err(|e| DatspoolError::Configuration(e.to_string()))?);
         let (log_store, state_machine) = storage::new(raft_data_dir, task_store).await
             .map_err(|e| DatspoolError::Raft(crate::error::RaftError::Storage(e)))?;
-        let raft = Raft::new(node_id, config, NetworkFactory::new(raft_token), log_store, state_machine)
+        let raft = Raft::new(node_id, config, NetworkFactory::new(raft_token.clone()), log_store, state_machine)
             .await
             .map_err(|e| DatspoolError::Raft(crate::error::RaftError::Storage(e.to_string())))?;
         Ok(Self { node_id, raft: Arc::new(raft), raft_token })

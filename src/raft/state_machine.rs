@@ -283,7 +283,7 @@ impl<S: KvStore + Clone> MetaStateMachine<S> {
     ) -> Result<CommandResponse> {
         let parsed_shard_id = parse_shard_id(&shard_id)?;
         let expected_prefix = crate::pipeline::cache::LocalBatchCache::<S>::prefix_for_shard(&shard_id);
-        let batch_id = match cache_key.as_bytes().strip_prefix(&expected_prefix) {
+        let batch_id = match cache_key.as_bytes().strip_prefix(expected_prefix.as_slice()) {
             Some(value) => match std::str::from_utf8(value) {
                 Ok(value) if valid_batch_id(value) => value.to_string(),
                 _ => return Ok(rejected("Invalid replicated cache key")),
@@ -429,6 +429,45 @@ mod tests {
     use crate::storage::RocksDbStore;
     use crate::task::{ShardMeta, TaskMeta};
     use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn legacy_cache_import_is_idempotent_and_closed_after_bootstrap() {
+        use crate::pipeline::{OffsetValue, Record};
+        use serde_json::json;
+
+        let dir = tempdir().unwrap();
+        let db = RocksDbStore::open(dir.path()).unwrap();
+        let store = TaskStore::new(db);
+        let task = TaskMeta::new("bootstrap-import".into(), "{}".into(), "{}".into());
+        let task_id = task.task_id;
+        let shard = ShardMeta::new(task_id, 0, "{}".into());
+        let shard_id = shard.shard_id;
+        let mut sm = MetaStateMachine::new(store.kv_store().clone());
+        let created = sm.apply_command(Command::CreateTask {
+            task: Box::new(task),
+            shards: vec![shard],
+        }).await.unwrap();
+        assert!(created.success);
+
+        let import = Command::ImportLegacyCache {
+            shard_id: shard_id.to_string(),
+            batch_id: "0000000000000000-000000".into(),
+            records: vec![Record::with_id("legacy-1", "elasticsearch", json!({"v": 1}))],
+            next_offset: Some(OffsetValue::DocumentCount(1)),
+            source_count: 1,
+        };
+        assert!(sm.apply_command(import.clone()).await.unwrap().success);
+        assert!(sm.apply_command(import.clone()).await.unwrap().success);
+        assert_eq!(store.cache_batch_count(&shard_id.to_string()).await.unwrap(), 1);
+
+        assert!(sm.apply_command(Command::BootstrapComplete).await.unwrap().success);
+        let mut late_import = import;
+        if let Command::ImportLegacyCache { batch_id, .. } = &mut late_import {
+            *batch_id = "0000000000000000-000001".into();
+        }
+        assert!(!sm.apply_command(late_import).await.unwrap().success);
+        assert_eq!(store.cache_batch_count(&shard_id.to_string()).await.unwrap(), 1);
+    }
 
     #[tokio::test]
     async fn stale_fencing_token_cannot_renew_or_complete_reclaimed_shard() {

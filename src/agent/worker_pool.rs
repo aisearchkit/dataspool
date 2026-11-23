@@ -106,9 +106,10 @@ impl<S: KvStore + Clone + 'static> WorkerPool<S> {
                             workers.spawn(async move {
                                 let mut lease = lease;
                                 let execution_lease = lease.clone();
+                                let execution_shard_id = shard_id.clone();
                                 let worker_cancel = worker_shutdown.clone();
                                 let mut execution = tokio::spawn(async move {
-                                    executor.execute_with_lease(&shard_id, execution_lease, worker_cancel).await
+                                    executor.execute_with_lease(&execution_shard_id, execution_lease, worker_cancel).await
                                 });
                                 let renew_interval = std::time::Duration::from_secs(8);
                                 loop {
