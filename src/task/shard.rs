@@ -224,6 +224,7 @@ impl ShardMeta {
     }
 
     pub fn complete_at(&mut self, docs_processed: u64, at: chrono::DateTime<chrono::Utc>) {
+        self.records_processed = self.records_processed.max(docs_processed);
         self.lease_expires_at = None;
         self.lease_id = None;
         self.state = ShardState::Completed {

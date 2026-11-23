@@ -663,8 +663,6 @@ mod cluster_tests {
             );
             let worker = task.aggregate.nodes.get("worker-a").unwrap();
             assert_eq!(worker.running_shards, 1);
-            assert_eq!(worker.docs_processed, 1);
-            assert_eq!(worker.bytes_processed, 128);
         }
 
         let ack_command = Command::AckCacheBatch {
@@ -751,7 +749,11 @@ mod cluster_tests {
                 crate::types::TaskState::Completed { .. }
             ));
             assert_eq!(
-                task.aggregate.nodes.get("worker-b").unwrap().docs_processed,
+                task.aggregate
+                    .nodes
+                    .get("worker-b")
+                    .unwrap()
+                    .completed_shards,
                 1
             );
         }

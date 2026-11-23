@@ -26,8 +26,6 @@ pub struct NodeTaskAggregate {
     pub running_shards: u32,
     pub completed_shards: u32,
     pub failed_shards: u32,
-    pub docs_processed: u64,
-    pub bytes_processed: u64,
 }
 
 /// Last committed checkpoint for one shard.
@@ -244,8 +242,6 @@ impl TaskMeta {
                 node.running_shards += u32::from(state == 1);
                 node.completed_shards += u32::from(state == 2);
                 node.failed_shards += u32::from(state == 3);
-                node.docs_processed = node.docs_processed.saturating_add(shard.records_processed);
-                node.bytes_processed = node.bytes_processed.saturating_add(shard.bytes_processed);
             }
             aggregate.checkpoints.push(ShardCheckpoint {
                 shard_id: shard.shard_id,
