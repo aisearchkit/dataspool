@@ -835,13 +835,13 @@ mod cluster_tests {
         // two members retain quorum and continue committing state.
         let isolated_index = (leader_index + 2) % nodes.len();
         let isolated_id = ids[isolated_index];
-        for index in 0..nodes.len() {
+        for (index, node) in nodes.iter().enumerate() {
             if index == isolated_index {
                 for peer_id in ids.iter().copied().filter(|peer| *peer != isolated_id) {
-                    nodes[index].set_peer_blocked(peer_id, true).await;
+                    node.set_peer_blocked(peer_id, true).await;
                 }
             } else {
-                nodes[index].set_peer_blocked(isolated_id, true).await;
+                node.set_peer_blocked(isolated_id, true).await;
             }
         }
         let recovery_task = TaskMeta::new("snapshot-recovery".into(), "{}".into(), "{}".into());
