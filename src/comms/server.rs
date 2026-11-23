@@ -380,8 +380,8 @@ fn task_to_response(task: TaskMeta, shards: Vec<ShardMeta>) -> task::GetTaskResp
 
 #[cfg(test)]
 mod task_query_tests {
-    use super::generated::task::task_service_server::TaskService;
     use super::*;
+    use crate::comms::generated::task::task_service_server::TaskService;
     use crate::storage::RocksDbStore;
     use crate::task::{ShardMeta, TaskMeta};
     use crate::types::TaskId;
@@ -458,7 +458,7 @@ mod task_query_tests {
         assert!(response.shards[0].checkpoint.contains("42"));
 
         shutdown.cancel();
-        server_task.await.unwrap().unwrap();
+        server_task.await.unwrap();
     }
 
     #[tokio::test]
