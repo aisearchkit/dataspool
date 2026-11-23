@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - Cooperative worker-pool shutdown using cancellation tokens. Active continuous/CDC shards finish in-flight writes and checkpoint acknowledgements, close their source and sink, and return to Pending for safe reassignment.
+- Application startup now optionally loads `DATASPOOL_CONFIG`, starts the configured single-node Agent alongside the DLQ API, recovers interrupted local shards, and coordinates SIGINT/SIGTERM shutdown.
 
 ## [0.1.0] - 2026-11-23
 

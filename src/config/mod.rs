@@ -296,8 +296,8 @@ impl DatspoolConfig {
 
     /// Get or generate node ID
     pub fn node_id(&self) -> NodeId {
-        if let Some(ref id) = self.node.id {
-            NodeId::new(id.clone())
+        if let Some(id) = self.node.id.as_deref().filter(|id| !id.trim().is_empty()) {
+            NodeId::new(id.to_string())
         } else {
             // Generate based on node name and hostname
             let hostname = hostname::get()
@@ -358,6 +358,40 @@ observability:
         assert_eq!(config.server.grpc_port, 50051);
         assert_eq!(config.cluster.peers.len(), 2);
         assert!(config.agent.enabled);
+    }
+
+    #[test]
+    fn test_empty_node_id_uses_hostname_fallback() {
+        let config = DatspoolConfig {
+            node: NodeConfig {
+                name: "dataspool-test".to_string(),
+                id: Some("  ".to_string()),
+            },
+            cluster: ClusterConfig {
+                peers: vec![],
+                election_timeout: Duration::from_secs(5),
+                heartbeat_interval: Duration::from_millis(500),
+            },
+            server: ServerConfig {
+                grpc_port: 50051,
+                http_port: 8080,
+                bind_addr: "127.0.0.1".to_string(),
+                tls: TlsConfig::default(),
+            },
+            agent: AgentConfig {
+                enabled: true,
+                resources: AgentResources::default(),
+                tags: vec![],
+            },
+            storage: StorageConfig {
+                data_dir: PathBuf::from("/tmp/dataspool"),
+                engine: StorageEngine::RocksDb,
+            },
+            auth: AuthConfig::default(),
+            observability: ObservabilityConfig::default(),
+        };
+
+        assert!(config.node_id().as_str().starts_with("dataspool-test-"));
     }
 
     #[test]

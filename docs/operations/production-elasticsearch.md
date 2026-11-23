@@ -74,3 +74,24 @@ worker.await??;
 ```
 
 Shutdown stops new shard claims, signals active executors, and waits for them to exit. Executors do not cancel an in-flight destination write or its checkpoint/cache-ack sequence. They stop before the next source read (or during the idle CDC poll), close both drivers, and return the shard to `Pending` with its last committed offset so another worker can resume it. The process supervisor should still enforce an overall termination deadline.
+
+
+## Running the Agent and graceful process shutdown
+
+The application binary can start the Agent worker pool alongside the DLQ admin API. Provide a configuration file with `DATASPOOL_CONFIG`; the example configuration currently enables the single-node Agent mode:
+
+```bash
+export DATASPOOL_CONFIG=/etc/dataspool/dataspool-cluster.yaml
+export DATASPOOL_ADMIN_TOKEN="$(openssl rand -hex 32)"
+export DATASPOOL_DB_PATH=/var/lib/dataspool  # optional; overrides storage.data_dir
+export DATASPOOL_HTTP_BIND=127.0.0.1:8080    # optional; overrides server.bind_addr/http_port
+./dataspool
+```
+
+Without `DATASPOOL_CONFIG`, the binary remains in its backwards-compatible admin-API-only mode. Set `agent.enabled: false` for control/API-only operation. `DATASPOOL_CONFIG` uses the YAML settings for node identity, storage path, HTTP listener, and Agent concurrency.
+
+**Important execution boundary:** the current worker claimer uses a local, non-Raft claim path. The binary refuses to start the Agent when `cluster.peers` contains more than one entry. Do not deploy multiple Agent processes against a shared task store until Raft-backed atomic shard claiming and lease fencing are implemented. The sample config therefore has an empty peer list. The binary currently supports RocksDB only and expects TLS termination at a trusted reverse proxy.
+
+On startup, the Agent resets only `Running` shards whose recorded owner matches this node ID to `Pending`; remote-owned shards are left untouched. This recovers work left behind by an unclean process exit while preserving the last committed source offset. Set a stable, non-empty `node.id` across restarts so the process can identify its own interrupted work; an empty ID falls back to a hostname-derived ID.
+
+On SIGINT or SIGTERM, the HTTP server stops accepting new requests and drains active requests. The worker pool stops claiming shards, lets in-flight destination writes and checkpoint acknowledgements finish, closes drivers, and waits for workers to exit. Configure the service manager's termination grace period longer than the maximum expected sink write/flush duration; a forced kill can still interrupt an in-flight operation.

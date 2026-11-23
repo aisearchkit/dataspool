@@ -127,6 +127,27 @@ impl<S: KvStore> TaskStore<S> {
             .collect())
     }
 
+    /// Return shards left Running by this node to Pending during process startup.
+    /// Only the local node's leases are recovered; another node may still own
+    /// and actively execute its shards.
+    pub async fn recover_interrupted_shards(&self, node_id: &str) -> Result<usize> {
+        let tasks = self.list_tasks().await?;
+        let mut recovered = 0;
+        for task in tasks {
+            let shards = self
+                .list_shards_by_state(&task.task_id, |state| {
+                    matches!(state, ShardState::Running { node_id: owner, .. } if owner.as_str() == node_id)
+                })
+                .await?;
+            for mut shard in shards {
+                shard.set_state(ShardState::Pending);
+                self.save_shard(&shard).await?;
+                recovered += 1;
+            }
+        }
+        Ok(recovered)
+    }
+
     /// Delete shard metadata
     pub async fn delete_shard(&self, shard: &ShardMeta) -> Result<()> {
         let key = format!("shard:{}", shard.shard_id);
@@ -256,6 +277,28 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(completed_shards.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_recover_only_shards_owned_by_restarting_node() {
+        let (store, _temp) = create_test_store().await;
+        let task = TaskMeta::new("recovery-test".to_string(), "{}".to_string(), "{}".to_string());
+        let task_id = task.task_id;
+        store.save_task(&task).await.unwrap();
+
+        let mut local = ShardMeta::new(task_id, 0, "{}".to_string());
+        local.start(NodeId::new("node-local"));
+        let local_id = local.shard_id;
+        store.save_shard(&local).await.unwrap();
+
+        let mut remote = ShardMeta::new(task_id, 1, "{}".to_string());
+        remote.start(NodeId::new("node-remote"));
+        let remote_id = remote.shard_id;
+        store.save_shard(&remote).await.unwrap();
+
+        assert_eq!(store.recover_interrupted_shards("node-local").await.unwrap(), 1);
+        assert!(matches!(store.get_shard(&local_id).await.unwrap().unwrap().state, ShardState::Pending));
+        assert!(matches!(store.get_shard(&remote_id).await.unwrap().unwrap().state, ShardState::Running { .. }));
     }
 
     #[tokio::test]
