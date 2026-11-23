@@ -1,0 +1,122 @@
+name: Extended Validation and Elasticsearch Soak
+
+on:
+  # Run only after a PR has actually been merged into main.
+  pull_request:
+    types: [ closed ]
+    branches: [ main ]
+    paths:
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'build.rs'
+      - 'rust-toolchain*'
+      - '.cargo/**'
+      - '.github/workflows/**'
+      - 'proto/**'
+      - 'src/**'
+      - 'tests/**'
+      - 'config/**'
+      - 'deploy/compose/**'
+      - 'scripts/**'
+  # Weekly full compatibility/soak run, independent of code changes.
+  schedule:
+    - cron: '17 3 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: elasticsearch-soak-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  CXXFLAGS: -include cstdint
+
+jobs:
+  format:
+    if: github.event_name != 'pull_request' || github.event.pull_request.merged == true
+    name: Format Check
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install native build dependencies
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler clang libclang-dev llvm-dev
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+  clippy:
+    if: github.event_name != 'pull_request' || github.event.pull_request.merged == true
+    name: Clippy Lints
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install native build dependencies
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler clang libclang-dev llvm-dev
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Run clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+  audit:
+    if: github.event_name != 'pull_request' || github.event.pull_request.merged == true
+    name: Security Audit
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install native build dependencies
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler clang libclang-dev llvm-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      - name: Audit locked dependencies
+        run: cargo audit --deny unsound --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2026-0459
+
+  elasticsearch-multinode:
+    if: github.event_name != 'pull_request' || github.event.pull_request.merged == true
+    name: Elasticsearch ${{ matrix.version }} three-node soak
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        version: [7102, 717, 8x, 9x]
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install native build dependencies
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler clang libclang-dev llvm-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run three-node compatibility, retry and soak suite
+        env:
+          ES_SOAK_SECONDS: 300
+          ES_REQUIRE_429: 1
+          ES_REQUIRE_LIVE: 1
+          ES_EXPECT_NODES: 3
+        run: tests/run_es_multinode.sh ${{ matrix.version }}
+
+  build:
+    if: github.event_name != 'pull_request' || github.event.pull_request.merged == true
+    name: Build Release
+    runs-on: ubuntu-24.04
+    needs: [format, clippy, audit, elasticsearch-multinode]
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install native build dependencies
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler clang libclang-dev llvm-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build release binary
+        run: cargo build --locked --release --verbose
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: dataspool-linux-x64
+          path: target/release/dataspool

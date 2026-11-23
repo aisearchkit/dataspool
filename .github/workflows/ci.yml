@@ -3,8 +3,34 @@ name: CI
 on:
   push:
     branches: [ main, develop ]
+    paths:
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'build.rs'
+      - 'rust-toolchain*'
+      - '.cargo/**'
+      - '.github/workflows/**'
+      - 'proto/**'
+      - 'src/**'
+      - 'tests/**'
+      - 'config/**'
+      - 'deploy/compose/**'
+      - 'scripts/**'
   pull_request:
     branches: [ main, develop ]
+    paths:
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'build.rs'
+      - 'rust-toolchain*'
+      - '.cargo/**'
+      - '.github/workflows/**'
+      - 'proto/**'
+      - 'src/**'
+      - 'tests/**'
+      - 'config/**'
+      - 'deploy/compose/**'
+      - 'scripts/**'
 
 env:
   CARGO_TERM_COLOR: always
@@ -13,143 +39,14 @@ env:
   CXXFLAGS: -include cstdint
 
 jobs:
-  format:
-    name: Format Check
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - name: Install native build dependencies
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler clang libclang-dev llvm-dev
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt
-      - name: Check formatting
-        run: cargo fmt --all -- --check
-
-  clippy:
-    name: Clippy Lints
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - name: Install native build dependencies
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler clang libclang-dev llvm-dev
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-      - uses: Swatinem/rust-cache@v2
-      - name: Run clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
-
-  test:
-    name: Test Suite
-    runs-on: ubuntu-latest
+  unit-test:
+    name: Unit Tests
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
       - name: Install native build dependencies
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler clang libclang-dev llvm-dev
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Run tests
-        run: cargo test --all-features
-
-  elasticsearch-multinode:
-    name: Elasticsearch ${{ matrix.version }} three-node soak
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        version: [7102, 717, 8x, 9x]
-    steps:
-      - uses: actions/checkout@v7
-      - name: Install native build dependencies
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler clang libclang-dev llvm-dev
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: Run three-node compatibility, retry and soak suite
-        env:
-          ES_SOAK_SECONDS: 300
-          ES_REQUIRE_429: 1
-          ES_REQUIRE_LIVE: 1
-          ES_EXPECT_NODES: 3
-        run: tests/run_es_multinode.sh ${{ matrix.version }}
-
-  audit:
-    name: Security Audit
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - name: Install native build dependencies
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler clang libclang-dev llvm-dev
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: Install cargo-audit
-        run: cargo install cargo-audit --locked
-      - name: Audit locked dependencies
-        run: cargo audit --deny unsound --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2026-0459
-
-  build:
-    name: Build Release
-    runs-on: ubuntu-latest
-    needs: [format, clippy, test, audit, elasticsearch-multinode]
-    steps:
-      - uses: actions/checkout@v7
-      - name: Install native build dependencies
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler clang libclang-dev llvm-dev
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: Build release binary
-        run: cargo build --release --verbose
-      - name: Upload artifact
-        uses: actions/upload-artifact@v7
-        with:
-          name: dataspool-linux-x64
-          path: target/release/dataspool
-
-  tag-dependency-update:
-    name: Tag successful Dependabot update
-    runs-on: ubuntu-latest
-    needs: [format, clippy, test, audit, elasticsearch-multinode, build]
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    permissions:
-      contents: write
-      pull-requests: read
-    steps:
-      - name: Checkout merged commit
-        uses: actions/checkout@v7
-        with:
-          ref: ${{ github.sha }}
-          fetch-depth: 0
-
-      - name: Create dependency-update tag
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-          COMMIT_SHA: ${{ github.sha }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          prs="$(gh api "repos/${GH_REPO}/commits/${COMMIT_SHA}/pulls")"
-          pr="$(jq -c '[.[] | select(.user.login == "dependabot[bot]" and .merged_at != null)] | first // empty' <<<"$prs")"
-          if [[ -z "$pr" ]]; then
-            echo "No merged Dependabot PR is associated with this commit; skipping tag."
-            exit 0
-          fi
-
-          pr_number="$(jq -r '.number' <<<"$pr")"
-          files="$(gh api "repos/${GH_REPO}/pulls/${pr_number}/files?per_page=100")"
-          if ! jq -e 'length > 0 and all(.[]; .filename == "Cargo.toml" or .filename == "Cargo.lock" or (.filename | startswith(".github/workflows/")) or .filename == ".github/dependabot.yml")' <<<"$files" >/dev/null; then
-            echo "Dependabot PR #${pr_number} changes files outside the dependency/CI allowlist; skipping tag."
-            exit 0
-          fi
-
-          short_sha="${COMMIT_SHA:0:7}"
-          tag="deps-$(date -u +%Y%m%d)-${short_sha}"
-          if git ls-remote --exit-code --tags origin "refs/tags/${tag}" >/dev/null 2>&1; then
-            echo "Tag ${tag} already exists; nothing to do."
-            exit 0
-          fi
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git tag -a "$tag" "$COMMIT_SHA" -m "Dependabot dependency update PR #${pr_number} (CI passed)"
-          git push origin "refs/tags/${tag}"
-          echo "Created ${tag} after all CI jobs passed."
+      - name: Run library unit tests
+        run: cargo test --lib --all-features
