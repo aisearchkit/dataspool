@@ -50,7 +50,10 @@ pub(crate) fn normalize_command_timestamp(command: &mut Command) -> Result<()> {
             *issued_at_ms = now;
             *lease_expires_at_ms = now.saturating_add(duration);
         }
-        Command::ReleaseShardLease { issued_at_ms, .. }
+        Command::RegisterNode { issued_at_ms, .. }
+        | Command::UpdateNodeHeartbeat { issued_at_ms, .. }
+        | Command::MarkNodeOffline { issued_at_ms, .. }
+        | Command::ReleaseShardLease { issued_at_ms, .. }
         | Command::CacheBatch { issued_at_ms, .. }
         | Command::PersistDeadLetters { issued_at_ms, .. }
         | Command::AckCacheBatch { issued_at_ms, .. }

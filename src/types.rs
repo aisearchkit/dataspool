@@ -122,6 +122,17 @@ impl From<String> for NodeId {
     }
 }
 
+/// Replicated node liveness record maintained by Raft.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodeMeta {
+    pub node_id: NodeId,
+    pub address: String,
+    pub tags: std::collections::HashMap<String, String>,
+    pub registered_at_ms: i64,
+    pub last_heartbeat_ms: i64,
+    pub status: NodeStatus,
+}
+
 /// Node role in the cluster
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NodeRole {

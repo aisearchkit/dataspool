@@ -16,7 +16,9 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-use dataspool::{CancellationToken, DatspoolConfig, DatspoolError, Result, TaskStore, WorkerPool};
+use dataspool::{
+    CancellationToken, DatspoolConfig, DatspoolError, NodeLifecycle, Result, TaskStore, WorkerPool,
+};
 use openraft::BasicNode;
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -77,6 +79,7 @@ async fn main() -> Result<()> {
     let shutdown = CancellationToken::new();
     let mut raft_node = None;
     let mut raft_server_task = None;
+    let mut node_lifecycle_task = None;
     let worker = if let Some(config) = config.as_ref().filter(|value| value.agent.enabled) {
         let node_name = config.node_id().to_string();
         let node_id = dataspool::raft::stable_node_id(&node_name);
@@ -98,7 +101,7 @@ async fn main() -> Result<()> {
             return Err(DatspoolError::Configuration("Set DATASPOOL_RAFT_ADVERTISE_ADDR to a routable address when running a multi-node cluster".into()));
         }
         let mut members = BTreeMap::new();
-        members.insert(node_id, BasicNode::new(raft_advertise));
+        members.insert(node_id, BasicNode::new(raft_advertise.clone()));
         for peer in &config.cluster.peers {
             let (peer_id, address) = peer
                 .split_once('@')
@@ -187,6 +190,33 @@ async fn main() -> Result<()> {
                 .await?;
         }
 
+        let node_tags = config
+            .agent
+            .tags
+            .iter()
+            .map(|tag| (tag.clone(), "true".to_string()))
+            .collect();
+        let failure_timeout = config
+            .cluster
+            .election_timeout
+            .saturating_mul(3)
+            .max(config.cluster.heartbeat_interval.saturating_mul(10))
+            .max(std::time::Duration::from_secs(10));
+        let lifecycle = NodeLifecycle::new(
+            node_name.clone(),
+            raft_advertise,
+            node_tags,
+            tasks.clone(),
+            Arc::new(raft.clone()),
+            config.cluster.heartbeat_interval,
+            failure_timeout,
+        );
+        lifecycle.register().await?;
+        let lifecycle_shutdown = shutdown.clone();
+        node_lifecycle_task = Some(tokio::spawn(async move {
+            lifecycle.run_until_cancelled(lifecycle_shutdown).await
+        }));
+
         let index_store = Arc::new(RwLock::new(
             dataspool::storage::index::TieredIndexStore::new(
                 dataspool::storage::index::TieredConfig::default(),
@@ -230,6 +260,11 @@ async fn main() -> Result<()> {
         worker
             .await
             .map_err(|e| DatspoolError::Internal(format!("Agent worker task failed: {e}")))??;
+    }
+    if let Some(lifecycle) = node_lifecycle_task {
+        lifecycle
+            .await
+            .map_err(|e| DatspoolError::Internal(format!("Node lifecycle task failed: {e}")))??;
     }
     if let Some(raft_server) = raft_server_task {
         raft_server

@@ -45,6 +45,55 @@ impl<S: KvStore> TaskStore<S> {
         &self.store
     }
 
+    /// Persist a replicated cluster node record.
+    pub async fn save_node(&self, node: &crate::types::NodeMeta) -> Result<()> {
+        let key = format!("node:{}", node.node_id);
+        self.store
+            .put_cf(cf::META, key.as_bytes(), &serde_json::to_vec(node)?)
+            .await?;
+        Ok(())
+    }
+
+    /// Read a replicated cluster node record.
+    pub async fn get_node(
+        &self,
+        node_id: &crate::types::NodeId,
+    ) -> Result<Option<crate::types::NodeMeta>> {
+        let key = format!("node:{node_id}");
+        self.store
+            .get_cf(cf::META, key.as_bytes())
+            .await?
+            .map(|value| serde_json::from_slice(&value).map_err(Into::into))
+            .transpose()
+    }
+
+    /// List all replicated cluster node records.
+    pub async fn list_nodes(&self) -> Result<Vec<crate::types::NodeMeta>> {
+        self.store
+            .prefix_scan_cf(cf::META, b"node:")
+            .await?
+            .into_iter()
+            .map(|(_, value)| serde_json::from_slice(&value).map_err(Into::into))
+            .collect()
+    }
+
+    /// Atomically publish a node status transition and all shard requeues caused by it.
+    pub(crate) async fn save_node_and_shards(
+        &self,
+        node: &crate::types::NodeMeta,
+        shards: &[ShardMeta],
+    ) -> Result<()> {
+        let mut batch = crate::storage::WriteBatch::new();
+        let node_key = format!("node:{}", node.node_id);
+        batch.put_cf(cf::META, node_key, serde_json::to_vec(node)?);
+        for shard in shards {
+            let shard_key = format!("shard:{}", shard.shard_id);
+            batch.put_cf(cf::META, shard_key, serde_json::to_vec(shard)?);
+        }
+        self.store.write_batch(batch).await?;
+        Ok(())
+    }
+
     /// Save task metadata
     pub async fn save_task(&self, task: &TaskMeta) -> Result<()> {
         let key = format!("task:{}", task.task_id);

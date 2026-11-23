@@ -133,16 +133,18 @@ pub enum Command {
         node_id: String,
         address: String,
         tags: std::collections::HashMap<String, String>,
+        issued_at_ms: i64,
     },
 
-    /// Update node heartbeat
-    UpdateNodeHeartbeat {
+    /// Update node heartbeat using the leader's authoritative clock.
+    UpdateNodeHeartbeat { node_id: String, issued_at_ms: i64 },
+
+    /// Mark a node offline only when its last committed heartbeat is older than the timeout.
+    MarkNodeOffline {
         node_id: String,
-        timestamp: i64, // Unix timestamp
+        issued_at_ms: i64,
+        heartbeat_timeout_ms: i64,
     },
-
-    /// Mark node as offline
-    MarkNodeOffline { node_id: String },
 
     // ==================== Configuration ====================
     /// Update cluster configuration
@@ -259,7 +261,7 @@ impl Command {
             Command::UpdateNodeHeartbeat { node_id, .. } => {
                 format!("UpdateNodeHeartbeat({})", node_id)
             }
-            Command::MarkNodeOffline { node_id } => {
+            Command::MarkNodeOffline { node_id, .. } => {
                 format!("MarkNodeOffline({})", node_id)
             }
             Command::UpdateConfig { key, .. } => {

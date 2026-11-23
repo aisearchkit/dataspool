@@ -6,9 +6,11 @@
 //! Agent worker pool - distributed task execution
 
 mod executor;
+mod node_lifecycle;
 mod shard_claimer;
 mod worker_pool;
 
 pub use executor::{ExecutionStats, ShardExecutor};
+pub use node_lifecycle::NodeLifecycle;
 pub use shard_claimer::{ShardClaimer, ShardLease};
 pub use worker_pool::{ResourceLimits, WorkerPool};

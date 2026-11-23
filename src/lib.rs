@@ -38,7 +38,7 @@ pub mod task;
 pub mod types;
 
 pub use admin::DlqApi;
-pub use agent::{ShardClaimer, ShardExecutor, WorkerPool};
+pub use agent::{NodeLifecycle, ShardClaimer, ShardExecutor, WorkerPool};
 pub use comms::{GrpcClient, GrpcServer};
 pub use config::DatspoolConfig;
 pub use error::{ConfigError, DatspoolError, DriverError, RaftError, Result, StorageError};

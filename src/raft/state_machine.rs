@@ -209,13 +209,133 @@ impl<S: KvStore + Clone> MetaStateMachine<S> {
                 )
                 .await
             }
+            Command::RegisterNode {
+                node_id,
+                address,
+                tags,
+                issued_at_ms,
+            } => {
+                self.apply_register_node(node_id, address, tags, issued_at_ms)
+                    .await
+            }
+            Command::UpdateNodeHeartbeat {
+                node_id,
+                issued_at_ms,
+            } => self.apply_node_heartbeat(node_id, issued_at_ms).await,
+            Command::MarkNodeOffline {
+                node_id,
+                issued_at_ms,
+                heartbeat_timeout_ms,
+            } => {
+                self.apply_mark_node_offline(node_id, issued_at_ms, heartbeat_timeout_ms)
+                    .await
+            }
             Command::UpdateTaskState { .. }
             | Command::DeleteTask { .. }
-            | Command::RegisterNode { .. }
-            | Command::UpdateNodeHeartbeat { .. }
-            | Command::MarkNodeOffline { .. }
             | Command::UpdateConfig { .. } => Ok(rejected("Command is not implemented")),
         }
+    }
+
+    async fn apply_register_node(
+        &self,
+        node_id: String,
+        address: String,
+        tags: std::collections::HashMap<String, String>,
+        issued_at_ms: i64,
+    ) -> Result<CommandResponse> {
+        if node_id.trim().is_empty() || address.trim().is_empty() {
+            return Ok(rejected("Node ID and advertised address are required"));
+        }
+        let existing = self
+            .task_store
+            .get_node(&NodeId::new(node_id.clone()))
+            .await?;
+        let registered_at_ms = existing
+            .as_ref()
+            .map(|node| node.registered_at_ms)
+            .unwrap_or(issued_at_ms);
+        let node = crate::types::NodeMeta {
+            node_id: NodeId::new(node_id.clone()),
+            address,
+            tags,
+            registered_at_ms,
+            last_heartbeat_ms: issued_at_ms,
+            status: crate::types::NodeStatus::Healthy,
+        };
+        self.task_store.save_node(&node).await?;
+        Ok(accepted(
+            "Node registered",
+            serde_json::json!({"node_id": node_id, "status": "healthy"}),
+        ))
+    }
+
+    async fn apply_node_heartbeat(
+        &self,
+        node_id: String,
+        issued_at_ms: i64,
+    ) -> Result<CommandResponse> {
+        let id = NodeId::new(node_id.clone());
+        let Some(mut node) = self.task_store.get_node(&id).await? else {
+            return Ok(rejected("Node must register before sending heartbeats"));
+        };
+        if issued_at_ms < node.last_heartbeat_ms {
+            return Ok(rejected("Heartbeat timestamp cannot move backwards"));
+        }
+        node.last_heartbeat_ms = issued_at_ms;
+        node.status = crate::types::NodeStatus::Healthy;
+        self.task_store.save_node(&node).await?;
+        Ok(accepted(
+            "Node heartbeat recorded",
+            serde_json::json!({"node_id": node_id, "last_heartbeat_ms": issued_at_ms}),
+        ))
+    }
+
+    async fn apply_mark_node_offline(
+        &self,
+        node_id: String,
+        issued_at_ms: i64,
+        heartbeat_timeout_ms: i64,
+    ) -> Result<CommandResponse> {
+        if heartbeat_timeout_ms < 1_000 {
+            return Ok(rejected("Heartbeat timeout must be at least one second"));
+        }
+        let id = NodeId::new(node_id.clone());
+        let Some(mut node) = self.task_store.get_node(&id).await? else {
+            return Ok(rejected("Node not found"));
+        };
+        if node.status == crate::types::NodeStatus::Offline {
+            return Ok(accepted(
+                "Node already offline",
+                serde_json::json!({"node_id": node_id, "requeued_shards": 0}),
+            ));
+        }
+        let cutoff = issued_at_ms.saturating_sub(heartbeat_timeout_ms);
+        if node.last_heartbeat_ms > cutoff {
+            return Ok(rejected(
+                "Node heartbeat is still within the failure-detection window",
+            ));
+        }
+        node.status = crate::types::NodeStatus::Offline;
+        let at = chrono::DateTime::from_timestamp_millis(issued_at_ms)
+            .ok_or_else(|| DatspoolError::Serialization("Invalid node-offline timestamp".into()))?;
+        let mut requeued_shards = Vec::new();
+        for task in self.task_store.list_tasks().await? {
+            for mut shard in self.task_store.list_task_shards(&task.task_id).await? {
+                let owned = matches!(&shard.state, ShardState::Running { node_id: owner, .. } if owner == &id);
+                if owned {
+                    shard.set_state_at(ShardState::Pending, at);
+                    requeued_shards.push(shard);
+                }
+            }
+        }
+        let requeued = requeued_shards.len();
+        self.task_store
+            .save_node_and_shards(&node, &requeued_shards)
+            .await?;
+        Ok(accepted(
+            "Node marked offline; owned shards atomically returned to pending",
+            serde_json::json!({"node_id": node_id, "requeued_shards": requeued}),
+        ))
     }
 
     async fn apply_create_task(
@@ -264,6 +384,16 @@ impl<S: KvStore + Clone> MetaStateMachine<S> {
         lease_expires_at_ms: i64,
     ) -> Result<CommandResponse> {
         let shard_id = parse_shard_id(&shard_id)?;
+        if self
+            .task_store
+            .get_node(&NodeId::new(node_id.clone()))
+            .await?
+            .is_some_and(|node| node.status == crate::types::NodeStatus::Offline)
+        {
+            return Ok(rejected(
+                "Offline nodes cannot claim shards until they re-register",
+            ));
+        }
         let mut shard = match self.task_store.get_shard(&shard_id).await? {
             Some(shard) => shard,
             None => return Ok(rejected("Shard not found")),
@@ -875,6 +1005,128 @@ mod tests {
                 .unwrap(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn node_heartbeat_failure_atomically_requeues_owned_shards_and_fences_old_owner() {
+        let dir = tempdir().unwrap();
+        let db = RocksDbStore::open(dir.path()).unwrap();
+        let store = TaskStore::new(db);
+        let task = TaskMeta::new("node-failure".into(), "{}".into(), "{}".into());
+        let task_id = task.task_id;
+        let shard = ShardMeta::new(task_id, 0, "{}".into());
+        let shard_id = shard.shard_id;
+        store.save_task(&task).await.unwrap();
+        store.save_shard(&shard).await.unwrap();
+        let mut sm = MetaStateMachine::new(store.kv_store().clone());
+        let now = chrono::Utc::now().timestamp_millis();
+
+        assert!(
+            sm.apply_command(Command::RegisterNode {
+                node_id: "worker-a".into(),
+                address: "127.0.0.1:9300".into(),
+                tags: std::collections::HashMap::new(),
+                issued_at_ms: now,
+            })
+            .await
+            .unwrap()
+            .success
+        );
+        let claim = sm
+            .apply_command(Command::ClaimShard {
+                shard_id: shard_id.to_string(),
+                node_id: "worker-a".into(),
+                claim_id: "claim-a".into(),
+                issued_at_ms: now,
+                lease_expires_at_ms: now + 60_000,
+            })
+            .await
+            .unwrap();
+        assert!(claim.success);
+
+        let heartbeat = sm
+            .apply_command(Command::UpdateNodeHeartbeat {
+                node_id: "worker-a".into(),
+                issued_at_ms: now + 15_000,
+            })
+            .await
+            .unwrap();
+        assert!(heartbeat.success);
+        let too_early = sm
+            .apply_command(Command::MarkNodeOffline {
+                node_id: "worker-a".into(),
+                issued_at_ms: now + 20_000,
+                heartbeat_timeout_ms: 10_000,
+            })
+            .await
+            .unwrap();
+        assert!(!too_early.success);
+
+        let offline = sm
+            .apply_command(Command::MarkNodeOffline {
+                node_id: "worker-a".into(),
+                issued_at_ms: now + 26_000,
+                heartbeat_timeout_ms: 10_000,
+            })
+            .await
+            .unwrap();
+        assert!(offline.success);
+        assert_eq!(offline.data.unwrap()["requeued_shards"], 1);
+        assert_eq!(
+            store
+                .get_node(&NodeId::new("worker-a"))
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            crate::types::NodeStatus::Offline
+        );
+        let requeued = store.get_shard(&shard_id).await.unwrap().unwrap();
+        assert!(matches!(requeued.state, ShardState::Pending));
+        assert_eq!(
+            requeued.fencing_token,
+            crate::task::shard::FENCING_TOKEN_BASE + 1
+        );
+
+        let offline_claim = sm
+            .apply_command(Command::ClaimShard {
+                shard_id: shard_id.to_string(),
+                node_id: "worker-a".into(),
+                claim_id: "stale-worker-claim".into(),
+                issued_at_ms: now + 27_000,
+                lease_expires_at_ms: now + 57_000,
+            })
+            .await
+            .unwrap();
+        assert!(!offline_claim.success);
+
+        let reassigned = sm
+            .apply_command(Command::ClaimShard {
+                shard_id: shard_id.to_string(),
+                node_id: "worker-b".into(),
+                claim_id: "claim-b".into(),
+                issued_at_ms: now + 27_000,
+                lease_expires_at_ms: now + 57_000,
+            })
+            .await
+            .unwrap();
+        assert!(reassigned.success);
+        assert_eq!(
+            reassigned.data.unwrap()["fencing_token"],
+            crate::task::shard::FENCING_TOKEN_BASE + 2
+        );
+
+        let stale_renewal = sm
+            .apply_command(Command::RenewShardLease {
+                shard_id: shard_id.to_string(),
+                node_id: "worker-a".into(),
+                fencing_token: crate::task::shard::FENCING_TOKEN_BASE + 1,
+                issued_at_ms: now + 28_000,
+                lease_expires_at_ms: now + 58_000,
+            })
+            .await
+            .unwrap();
+        assert!(!stale_renewal.success);
     }
 
     #[tokio::test]
