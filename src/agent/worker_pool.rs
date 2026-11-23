@@ -7,6 +7,8 @@
 
 use std::sync::Arc;
 use tokio::sync::{RwLock, Semaphore};
+use tokio::task::JoinSet;
+use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use super::{ShardClaimer, ShardExecutor};
@@ -53,65 +55,92 @@ impl<S: KvStore + Clone + 'static> WorkerPool<S> {
         })
     }
 
-    /// Start the worker pool main loop
+    /// Start the worker pool main loop. Use run_until_cancelled when the
+    /// embedding service needs coordinated shutdown.
     pub async fn run(&mut self) -> Result<()> {
+        self.run_until_cancelled(CancellationToken::new()).await
+    }
+
+    /// Stop claiming work when cancelled, signal active shard executors, and
+    /// wait for their in-flight writes/checkpoints and connection cleanup.
+    pub async fn run_until_cancelled(&mut self, shutdown: CancellationToken) -> Result<()> {
         info!("Starting worker pool on node {}", self.node_id);
+        let mut workers = JoinSet::new();
 
         loop {
-            // Try to claim a shard if we have capacity
-            let permit = self
-                .semaphore
-                .clone()
-                .acquire_owned()
-                .await
-                .map_err(|e| DatspoolError::Internal(format!("Semaphore error: {}", e)))?;
+            while let Some(joined) = workers.try_join_next() {
+                if let Err(error) = joined {
+                    warn!("Shard worker task panicked: {}", error);
+                }
+            }
 
-            match self.claimer.try_claim().await {
-                Ok(Some(shard_id)) => {
-                    info!("Claimed shard: {}", shard_id);
+            tokio::select! {
+                _ = shutdown.cancelled() => {
+                    info!("Worker pool shutdown requested on node {}", self.node_id);
+                    break;
+                }
+                permit = self.semaphore.clone().acquire_owned() => {
+                    let permit = permit.map_err(|e| {
+                        DatspoolError::Internal(format!("Semaphore error: {}", e))
+                    })?;
+                    if shutdown.is_cancelled() {
+                        drop(permit);
+                        break;
+                    }
 
-                    // Track active shard
-                    self.active_shards.write().await.push(shard_id.clone());
+                    match self.claimer.try_claim().await {
+                        Ok(Some(shard_id)) => {
+                            info!("Claimed shard: {}", shard_id);
+                            self.active_shards.write().await.push(shard_id.clone());
 
-                    // Spawn shard execution task
-                    let executor = self.executor.clone();
-                    let active_shards = self.active_shards.clone();
-                    let shard_id_clone = shard_id.clone();
+                            let executor = self.executor.clone();
+                            let active_shards = self.active_shards.clone();
+                            let shard_id_clone = shard_id.clone();
+                            let worker_shutdown = shutdown.clone();
 
-                    tokio::spawn(async move {
-                        match executor.execute(&shard_id).await {
-                            Ok(stats) => {
-                                info!(
-                                    "Shard {} completed: {} docs read, {} docs written in {:?}",
-                                    shard_id,
-                                    stats.docs_read,
-                                    stats.docs_written,
-                                    stats.duration()
-                                );
-                            }
-                            Err(e) => warn!("Shard {} failed: {}", shard_id, e),
+                            workers.spawn(async move {
+                                if let Err(error) = executor
+                                    .execute_with_cancellation(&shard_id, worker_shutdown)
+                                    .await
+                                {
+                                    warn!("Shard {} failed: {}", shard_id, error);
+                                }
+
+                                active_shards
+                                    .write()
+                                    .await
+                                    .retain(|id| id != &shard_id_clone);
+                                drop(permit);
+                            });
                         }
-
-                        // Remove from active shards
-                        active_shards
-                            .write()
-                            .await
-                            .retain(|id| id != &shard_id_clone);
-                        drop(permit); // Release semaphore
-                    });
-                }
-                Ok(None) => {
-                    // No shards available, wait before retrying
-                    drop(permit);
-                    tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
-                }
-                Err(e) => {
-                    warn!("Failed to claim shard: {}", e);
-                    drop(permit);
-                    tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+                        Ok(None) => {
+                            drop(permit);
+                            tokio::select! {
+                                _ = shutdown.cancelled() => break,
+                                _ = tokio::time::sleep(tokio::time::Duration::from_secs(5)) => {}
+                            }
+                        }
+                        Err(error) => {
+                            warn!("Failed to claim shard: {}", error);
+                            drop(permit);
+                            tokio::select! {
+                                _ = shutdown.cancelled() => break,
+                                _ = tokio::time::sleep(tokio::time::Duration::from_secs(10)) => {}
+                            }
+                        }
+                    }
                 }
             }
         }
+
+        while let Some(joined) = workers.join_next().await {
+            if let Err(error) = joined {
+                warn!("Shard worker task failed during shutdown: {}", error);
+            }
+        }
+
+        info!("Worker pool stopped on node {}", self.node_id);
+        Ok(())
     }
 
     /// Get current resource usage
@@ -127,6 +156,26 @@ mod tests {
     use crate::storage::index::TieredConfig;
     use crate::storage::rocksdb::RocksDbStore;
     use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn worker_pool_exits_when_shutdown_is_cancelled() {
+        let dir = tempdir().unwrap();
+        let db = RocksDbStore::open(dir.path()).unwrap();
+        let task_store = Arc::new(TaskStore::new(db.clone()));
+        let index_store = Arc::new(RwLock::new(TieredIndexStore::new(
+            TieredConfig::default(),
+            Arc::new(db),
+        )));
+        let mut pool =
+            WorkerPool::new("node-shutdown-test".to_string(), 1, task_store, index_store)
+                .unwrap();
+        let shutdown = CancellationToken::new();
+        shutdown.cancel();
+
+        pool.run_until_cancelled(shutdown).await.unwrap();
+
+        assert_eq!(pool.get_usage().await.0, 0);
+    }
 
     #[test]
     fn test_worker_pool_creation() {

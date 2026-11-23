@@ -21,7 +21,9 @@ let replayed = dlq.replay(&mut sink, &selected_ids).await?;
 // replay removes only successfully written entries; failures remain and increment attempts
 ```
 
-Call `sink.connect()` before replay. Passing an empty `selected_ids` slice replays all entries in that shard's queue. `remove(id)` is an explicit operator discard operation; use it only after reviewing the entry. The current DLQ API is a storage/library interface; a secured HTTP admin endpoint and UI are not yet implemented.
+Call `sink.connect()` before replay. The library rejects an empty ID list, so replay is always explicit and bounded to selected entries. `remove(id)` is an explicit operator discard operation; use it only after reviewing the entry.
+
+A secured bearer-token HTTP API and operator page are available through `DlqApi`. See [DLQ administration API](dlq-admin-api.md) for endpoints, authentication, and UI usage. The API requires an administrator token of at least 32 bytes; expose it only behind TLS and network access controls.
 
 ## CDC and cutover safety
 
@@ -54,3 +56,21 @@ The local compose configuration intentionally uses a one-entry write queue to ma
 ## Snapshot plus CDC task configuration
 
 The `elasticsearch_online` source runs a snapshot first and then tails the append-only change index. It captures the change-log maximum sequence before opening the snapshot and persists both phase and cursor in the shard checkpoint. See [online migration design](../elasticsearch-online-migration.md) for the producer ordering contract and the full YAML example. This is a continuous source: the worker remains active when the change-log backlog is empty. It does not imply native Elasticsearch CDC; a transactional outbox or external CDC producer is still required.
+
+## Graceful worker shutdown
+
+The worker pool supports cooperative shutdown through a `CancellationToken`:
+
+```rust,ignore
+let shutdown = CancellationToken::new();
+let worker_shutdown = shutdown.clone();
+let worker = tokio::spawn(async move {
+    pool.run_until_cancelled(worker_shutdown).await
+});
+
+// On SIGTERM / deployment shutdown:
+shutdown.cancel();
+worker.await??;
+```
+
+Shutdown stops new shard claims, signals active executors, and waits for them to exit. Executors do not cancel an in-flight destination write or its checkpoint/cache-ack sequence. They stop before the next source read (or during the idle CDC poll), close both drivers, and return the shard to `Pending` with its last committed offset so another worker can resume it. The process supervisor should still enforce an overall termination deadline.

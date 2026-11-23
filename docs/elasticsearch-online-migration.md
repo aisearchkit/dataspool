@@ -68,7 +68,7 @@ Cutover is guarded by `switch_alias_after_catchup`: it refuses to update aliases
 
 - PIT checkpoints contain the current PIT ID, `search_after` values and read count. A PIT is server-side and expires after `keep_alive`; if it expires before recovery, the snapshot phase must be restarted or use a separately materialized immutable snapshot. A PIT cursor is not a permanent bookmark.
 - The durable batch queue is shard-scoped. The executor commits the shard cursor after successful destination delivery and before cache acknowledgement. A crash between checkpoint and acknowledgement can replay the same batch; stable IDs make this at-least-once protocol idempotent.
-- Permanent mapping/validation failures remain in the durable cache and stop the shard rather than silently advancing its checkpoint. A production dead-letter workflow and operator resolution API are still required.
+- Permanent mapping/validation failures are persisted to the shard-scoped DLQ before the cache entry is acknowledged. Operators can inspect, explicitly replay, or discard entries through the secured DLQ admin API; see [DLQ administration](operations/dlq-admin-api.md).
 - The current CDC source assumes an append-only change index with a unique sequence. It is not a direct Elasticsearch translog or `_changes` API integration.
 
 ## Compatibility test matrix

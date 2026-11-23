@@ -7,7 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-No unreleased changes.
+### Added
+- Cooperative worker-pool shutdown using cancellation tokens. Active continuous/CDC shards finish in-flight writes and checkpoint acknowledgements, close their source and sink, and return to Pending for safe reassignment.
 
 ## [0.1.0] - 2026-11-23
 

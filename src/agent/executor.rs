@@ -7,6 +7,7 @@
 
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use tokio_util::sync::CancellationToken;
 use tracing::info;
 
 use crate::drivers::factory::{SinkConfig, SourceConfig, create_sink, create_source};
@@ -22,6 +23,8 @@ use crate::task::store::TaskStore;
 pub struct ExecutionStats {
     /// True when the source is a continuous stream and the shard must remain active.
     pub is_continuous: bool,
+    /// True when execution stopped because its cancellation token was signalled.
+    pub cancelled: bool,
     pub docs_read: u64,
     pub docs_written: u64,
     pub docs_indexed: u64,
@@ -76,6 +79,18 @@ impl<S: KvStore + Clone + 'static> ShardExecutor<S> {
 
     /// Load source/sink configurations from the owning task and execute a shard.
     pub async fn execute(&self, shard_id: &str) -> Result<ExecutionStats> {
+        self.execute_with_cancellation(shard_id, CancellationToken::new())
+            .await
+    }
+
+    /// Execute a shard until completion or until the supplied token is cancelled.
+    /// Cancellation finishes any in-flight destination write, persists its checkpoint,
+    /// closes both connections, and returns the shard to Pending for another worker.
+    pub async fn execute_with_cancellation(
+        &self,
+        shard_id: &str,
+        cancellation: CancellationToken,
+    ) -> Result<ExecutionStats> {
         use std::str::FromStr;
 
         info!("Executing shard: {}", shard_id);
@@ -87,6 +102,15 @@ impl<S: KvStore + Clone + 'static> ShardExecutor<S> {
             .get_shard(&shard_key)
             .await?
             .ok_or_else(|| DatspoolError::Internal(format!("Shard {shard_id} not found")))?;
+        if cancellation.is_cancelled() {
+            let mut pending = shard.clone();
+            pending.set_state(crate::types::ShardState::Pending);
+            self.task_store.save_shard(&pending).await?;
+            return Ok(ExecutionStats {
+                cancelled: true,
+                ..Default::default()
+            });
+        }
         let task = self
             .task_store
             .get_task(&shard.task_id)
@@ -100,9 +124,33 @@ impl<S: KvStore + Clone + 'static> ShardExecutor<S> {
         let mut source = create_source(&source_config)?;
         let mut sink = create_sink(&sink_config)?;
 
-        let stats = self
-            .execute_pipeline_with_instances(&shard, source.as_mut(), sink.as_mut())
-            .await?;
+        let execution = self
+            .execute_pipeline_with_cancellation(
+                &shard,
+                source.as_mut(),
+                sink.as_mut(),
+                cancellation.clone(),
+            )
+            .await;
+        let should_requeue = match &execution {
+            Ok(stats) => stats.cancelled,
+            Err(_) => cancellation.is_cancelled(),
+        };
+        if should_requeue {
+            let mut pending = self
+                .task_store
+                .get_shard(&shard_key)
+                .await?
+                .ok_or_else(|| {
+                    DatspoolError::Internal(format!(
+                        "Shard {shard_id} disappeared during shutdown"
+                    ))
+                })?;
+            pending.set_state(crate::types::ShardState::Pending);
+            self.task_store.save_shard(&pending).await?;
+            return execution;
+        }
+        let stats = execution?;
         let mut completed = self
             .task_store
             .get_shard(&shard_key)
@@ -139,6 +187,24 @@ impl<S: KvStore + Clone + 'static> ShardExecutor<S> {
         source: &mut dyn Source,
         sink: &mut dyn Sink,
     ) -> Result<ExecutionStats> {
+        self.execute_pipeline_with_cancellation(
+            shard,
+            source,
+            sink,
+            CancellationToken::new(),
+        )
+        .await
+    }
+
+    /// Execute with cooperative cancellation. A cancellation never interrupts
+    /// an in-flight sink write or the checkpoint/ack sequence that follows it.
+    pub async fn execute_pipeline_with_cancellation(
+        &self,
+        shard: &ShardMeta,
+        source: &mut dyn Source,
+        sink: &mut dyn Sink,
+        cancellation: CancellationToken,
+    ) -> Result<ExecutionStats> {
         let mut stats = ExecutionStats {
             is_continuous: source.is_continuous(),
             start_time: Some(std::time::Instant::now()),
@@ -163,6 +229,10 @@ impl<S: KvStore + Clone + 'static> ShardExecutor<S> {
 
         // Replay durable batches before reading new source data after a restart.
         while cache.pending().await? > 0 {
+            if cancellation.is_cancelled() {
+                stats.cancelled = true;
+                break;
+            }
             let task_store = self.task_store.clone();
             let shard_id = shard.shard_id;
             let sink_ref = &mut *sink;
@@ -205,8 +275,20 @@ impl<S: KvStore + Clone + 'static> ShardExecutor<S> {
         }
 
         loop {
-            // Read batch from source. The source receives the committed cursor.
-            let (batch, new_offset) = source.read_batch(&offset, self.batch_size).await?;
+            if cancellation.is_cancelled() {
+                stats.cancelled = true;
+                break;
+            }
+            // Read batch from source. Cancellation may interrupt a source read,
+            // but never interrupts the sink write/checkpoint/ack critical section.
+            let read = tokio::select! {
+                _ = cancellation.cancelled() => {
+                    stats.cancelled = true;
+                    break;
+                },
+                result = source.read_batch(&offset, self.batch_size) => result?,
+            };
+            let (batch, new_offset) = read;
             let batch_size = batch.len();
             if batch_size == 0 {
                 if source.is_continuous() {
@@ -230,7 +312,13 @@ impl<S: KvStore + Clone + 'static> ShardExecutor<S> {
                     }
                     // A drained CDC feed is idle, not complete. Keep the source
                     // connected and poll again so writes arriving later are copied.
-                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    tokio::select! {
+                        _ = cancellation.cancelled() => {
+                            stats.cancelled = true;
+                            break;
+                        },
+                        _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
+                    }
                     continue;
                 }
                 info!("No more data to read for shard {}", shard.shard_id);
@@ -295,9 +383,11 @@ impl<S: KvStore + Clone + 'static> ShardExecutor<S> {
             }
         }
 
-        // Close connections
-        source.close().await?;
-        sink.close().await?;
+        // Attempt both closes even if one driver reports a cleanup error.
+        let source_close = source.close().await;
+        let sink_close = sink.close().await;
+        source_close?;
+        sink_close?;
 
         stats.end_time = Some(std::time::Instant::now());
         Ok(stats)
@@ -306,9 +396,122 @@ impl<S: KvStore + Clone + 'static> ShardExecutor<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pipeline::{OffsetValue, RecordBatch, WriteResult};
     use crate::storage::index::TieredConfig;
     use crate::storage::rocksdb::RocksDbStore;
+    use crate::task::shard::ShardMeta;
+    use crate::types::TaskId;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use tempfile::tempdir;
+
+    struct IdleContinuousSource {
+        closed: Arc<AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl Source for IdleContinuousSource {
+        async fn connect(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        async fn read_batch(
+            &mut self,
+            offset: &OffsetValue,
+            _batch_size: usize,
+        ) -> Result<(RecordBatch, OffsetValue)> {
+            Ok((RecordBatch::new(), offset.clone()))
+        }
+
+        fn is_continuous(&self) -> bool {
+            true
+        }
+
+        async fn estimate_count(&self) -> Result<Option<u64>> {
+            Ok(None)
+        }
+
+        async fn close(&mut self) -> Result<()> {
+            self.closed.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn source_type(&self) -> &str {
+            "idle-test"
+        }
+    }
+
+    struct CloseTrackingSink {
+        closed: Arc<AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl Sink for CloseTrackingSink {
+        async fn connect(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        async fn write_batch(&mut self, batch: RecordBatch) -> Result<WriteResult> {
+            Ok(WriteResult::success(batch.len(), 0))
+        }
+
+        async fn flush(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        async fn close(&mut self) -> Result<()> {
+            self.closed.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn sink_type(&self) -> &str {
+            "close-tracking-test"
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_closes_continuous_source_and_sink() {
+        let dir = tempdir().unwrap();
+        let db = RocksDbStore::open(dir.path()).unwrap();
+        let task_store = Arc::new(TaskStore::new(db.clone()));
+        let index_store = Arc::new(RwLock::new(TieredIndexStore::new(
+            TieredConfig::default(),
+            Arc::new(db),
+        )));
+        let executor = ShardExecutor::new(task_store, index_store);
+        let source_closed = Arc::new(AtomicBool::new(false));
+        let sink_closed = Arc::new(AtomicBool::new(false));
+        let mut source = IdleContinuousSource {
+            closed: source_closed.clone(),
+        };
+        let mut sink = CloseTrackingSink {
+            closed: sink_closed.clone(),
+        };
+        let shard = ShardMeta::new(TaskId::new(), 0, "{}".into());
+        let cancellation = CancellationToken::new();
+        let cancel = cancellation.clone();
+
+        let cancel_task = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            cancel.cancel();
+        });
+
+        let stats = executor
+            .execute_pipeline_with_cancellation(
+                &shard,
+                &mut source,
+                &mut sink,
+                cancellation,
+            )
+            .await
+            .unwrap();
+        cancel_task.await.unwrap();
+
+        assert!(stats.is_continuous);
+        assert!(stats.cancelled);
+        assert!(stats.end_time.is_some());
+        assert!(source_closed.load(Ordering::SeqCst));
+        assert!(sink_closed.load(Ordering::SeqCst));
+    }
 
     #[test]
     fn test_executor_creation() {
