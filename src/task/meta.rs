@@ -313,7 +313,10 @@ impl TaskMeta {
             }
         } else if !matches!(
             self.state,
-            TaskState::Pausing | TaskState::Paused | TaskState::Canceling
+            TaskState::Pausing
+                | TaskState::Paused
+                | TaskState::Canceling
+                | TaskState::Cancelled { .. }
         ) {
             if aggregate.running_shards > 0
                 || aggregate.completed_shards > 0
@@ -387,7 +390,7 @@ impl TaskMeta {
     pub fn is_terminal(&self) -> bool {
         matches!(
             self.state,
-            TaskState::Completed { .. } | TaskState::Failed { .. }
+            TaskState::Completed { .. } | TaskState::Failed { .. } | TaskState::Cancelled { .. }
         )
     }
 

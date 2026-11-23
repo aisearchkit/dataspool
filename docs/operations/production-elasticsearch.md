@@ -130,3 +130,27 @@ grpcurl -plaintext -d '{"task_id":"<task-uuid>"}' \
 ```
 
 Clients can also use the existing GrpcClient::task() generated client accessor. The gRPC server is started and gracefully stopped by the main Dataspool process alongside the HTTP and Raft listeners.
+
+## Distributed Task Control Plane
+
+Task mutations are submitted as OpenRaft client writes. The gRPC handlers do not mutate RocksDB directly: CreateTask, PauseTask, ResumeTask, CancelTask, RetryTask, and ControlNodeExecution all call `RaftNode::propose`; the deterministic state machine applies the committed command to replicated metadata. Mutations are unavailable when Raft is not configured, rather than silently falling back to a local write.
+
+The TaskService exposes these operations:
+
+- `CreateTask`: requires a non-empty `request_id`; its task UUID is deterministically derived from that key, so client retries address the same task. Reusing the key with a different task payload is rejected.
+- `PauseTask` / `ResumeTask`: pause prevents new shard claims while allowing already leased shards to finish their in-flight batch; resume reopens claims.
+- `CancelTask`: marks the task terminal and rejects subsequent claims, progress checkpoints, completion, and failure updates. A destination write already in flight at cancellation time may finish; cancellation is cooperative at the batch boundary.
+- `RetryTask`: requeues failed shards and preserves their durable offsets and processed counters. Completed shards are not rerun.
+- `ControlNodeExecution`: `paused=true` prevents that node from claiming new shards. Existing leases may finish or expire; heartbeat traffic does not implicitly resume a manually paused node. `paused=false` resumes claims.
+
+All control requests require a caller-generated `request_id` (1-128 characters). The replicated state machine records request IDs and rejects reuse with a different operation/payload; repeated committed requests are acknowledged without repeating the mutation. Task and node control responses indicate whether the command was accepted by the committed state machine. A successful gRPC transport alone is not a substitute for checking the response `success` field.
+
+Example:
+
+```bash
+grpcurl -plaintext -d '{"task_id":"<task-uuid>","request_id":"pause-<unique-id>"}' \
+  127.0.0.1:50052 dataspool.task.TaskService/PauseTask
+
+grpcurl -plaintext -d '{"node_id":"worker-1","paused":true,"request_id":"node-pause-<unique-id>"}' \
+  127.0.0.1:50052 dataspool.task.TaskService/ControlNodeExecution
+```

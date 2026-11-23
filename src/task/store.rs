@@ -77,6 +77,28 @@ impl<S: KvStore> TaskStore<S> {
             .collect()
     }
 
+    /// Read the committed payload associated with a control-plane idempotency key.
+    pub async fn get_control_request(&self, request_id: &str) -> Result<Option<String>> {
+        let key = format!("control_request:{request_id}");
+        self.store
+            .get_cf(cf::META, key.as_bytes())
+            .await?
+            .map(|value| {
+                String::from_utf8(value.to_vec())
+                    .map_err(|error| crate::error::DatspoolError::Serialization(error.to_string()))
+            })
+            .transpose()
+    }
+
+    /// Persist a control-plane idempotency key on every state-machine replica.
+    pub async fn save_control_request(&self, request_id: &str, payload: &str) -> Result<()> {
+        let key = format!("control_request:{request_id}");
+        self.store
+            .put_cf(cf::META, key.as_bytes(), payload.as_bytes())
+            .await?;
+        Ok(())
+    }
+
     /// Save task metadata
     pub async fn save_task(&self, task: &TaskMeta) -> Result<()> {
         let key = format!("task:{}", task.task_id);

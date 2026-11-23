@@ -242,10 +242,223 @@ impl<S: KvStore + Clone> MetaStateMachine<S> {
                 self.apply_mark_node_offline(node_id, issued_at_ms, heartbeat_timeout_ms)
                     .await
             }
+            Command::ControlTask {
+                task_id,
+                action,
+                request_id,
+            } => self.apply_control_task(task_id, action, request_id).await,
+            Command::RetryTask {
+                task_id,
+                request_id,
+            } => self.apply_retry_task(task_id, request_id).await,
+            Command::ControlNodeExecution {
+                node_id,
+                paused,
+                request_id,
+            } => self.apply_control_node(node_id, paused, request_id).await,
             Command::UpdateTaskState { .. }
             | Command::DeleteTask { .. }
             | Command::UpdateConfig { .. } => Ok(rejected("Command is not implemented")),
         }
+    }
+
+    async fn apply_control_task(
+        &self,
+        task_id: String,
+        action: String,
+        request_id: String,
+    ) -> Result<CommandResponse> {
+        if request_id.trim().is_empty() || request_id.len() > 128 {
+            return Ok(rejected("request_id must contain 1-128 characters"));
+        }
+        let request_payload = format!("task:{task_id}:{action}");
+        if let Some(existing) = self.task_store.get_control_request(&request_id).await? {
+            return if existing == request_payload {
+                Ok(accepted(
+                    "Control request already committed",
+                    serde_json::json!({"task_id": task_id, "request_id": request_id}),
+                ))
+            } else {
+                Ok(rejected(
+                    "request_id was already used for a different command",
+                ))
+            };
+        }
+        let id: crate::types::TaskId = match task_id.parse() {
+            Ok(id) => id,
+            Err(_) => return Ok(rejected("Invalid task ID")),
+        };
+        let Some(mut task) = self.task_store.get_task(&id).await? else {
+            return Ok(rejected("Task not found"));
+        };
+        let next = match action.as_str() {
+            "pause" => match &task.state {
+                crate::types::TaskState::Pending | crate::types::TaskState::Running { .. } => {
+                    crate::types::TaskState::Paused
+                }
+                crate::types::TaskState::Paused => crate::types::TaskState::Paused,
+                _ => return Ok(rejected("Only pending or running tasks can be paused")),
+            },
+            "resume" => match &task.state {
+                crate::types::TaskState::Paused | crate::types::TaskState::Pausing => {
+                    crate::types::TaskState::Running {
+                        started_at: task.started_at.unwrap_or_else(chrono::Utc::now),
+                        shard_count: task.shard_count,
+                    }
+                }
+                crate::types::TaskState::Running { .. } => task.state.clone(),
+                _ => return Ok(rejected("Only paused tasks can be resumed")),
+            },
+            "cancel" => match &task.state {
+                crate::types::TaskState::Cancelled { .. } => task.state.clone(),
+                crate::types::TaskState::Completed { .. }
+                | crate::types::TaskState::Failed { .. } => {
+                    return Ok(rejected("Terminal tasks cannot be cancelled"));
+                }
+                _ => crate::types::TaskState::Cancelled {
+                    cancelled_at: chrono::Utc::now(),
+                },
+            },
+            _ => return Ok(rejected("Unsupported task action")),
+        };
+        task.set_state(next);
+        self.task_store.save_task(&task).await?;
+        self.task_store
+            .save_control_request(&request_id, &request_payload)
+            .await?;
+        Ok(accepted(
+            "Task control command committed",
+            serde_json::json!({"task_id": task_id, "action": action, "request_id": request_id}),
+        ))
+    }
+
+    async fn apply_retry_task(
+        &self,
+        task_id: String,
+        request_id: String,
+    ) -> Result<CommandResponse> {
+        if request_id.trim().is_empty() || request_id.len() > 128 {
+            return Ok(rejected("request_id must contain 1-128 characters"));
+        }
+        let request_payload = format!("task:{task_id}:retry");
+        if let Some(existing) = self.task_store.get_control_request(&request_id).await? {
+            return if existing == request_payload {
+                Ok(accepted(
+                    "Retry request already committed",
+                    serde_json::json!({"task_id": task_id, "request_id": request_id}),
+                ))
+            } else {
+                Ok(rejected(
+                    "request_id was already used for a different command",
+                ))
+            };
+        }
+        let id: crate::types::TaskId = match task_id.parse() {
+            Ok(id) => id,
+            Err(_) => return Ok(rejected("Invalid task ID")),
+        };
+        let Some(mut task) = self.task_store.get_task(&id).await? else {
+            return Ok(rejected("Task not found"));
+        };
+        if matches!(
+            &task.state,
+            crate::types::TaskState::Cancelled { .. } | crate::types::TaskState::Completed { .. }
+        ) {
+            return Ok(rejected("Cancelled or completed tasks cannot be retried"));
+        }
+        let mut shards = self.task_store.list_task_shards(&id).await?;
+        let mut retried = 0usize;
+        for shard in &mut shards {
+            if matches!(shard.state, ShardState::Failed { .. }) {
+                shard.set_state_at(ShardState::Pending, chrono::Utc::now());
+                retried += 1;
+            }
+        }
+        if retried == 0 {
+            self.task_store
+                .save_control_request(&request_id, &request_payload)
+                .await?;
+            return Ok(accepted(
+                "No failed shards to retry",
+                serde_json::json!({"task_id": task_id, "retried_shards": 0}),
+            ));
+        }
+        task.state = crate::types::TaskState::Running {
+            started_at: task.started_at.unwrap_or_else(chrono::Utc::now),
+            shard_count: task.shard_count,
+        };
+        task.refresh_from_shards(&shards, chrono::Utc::now());
+        let mut batch = crate::storage::WriteBatch::new();
+        for shard in &shards {
+            batch.put_cf(
+                crate::storage::cf::META,
+                format!("shard:{}", shard.shard_id),
+                serde_json::to_vec(shard)?,
+            );
+        }
+        batch.put_cf(
+            crate::storage::cf::META,
+            format!("task:{}", task.task_id),
+            serde_json::to_vec(&task)?,
+        );
+        self.task_store.kv_store().write_batch(batch).await?;
+        self.task_store
+            .save_control_request(&request_id, &request_payload)
+            .await?;
+        Ok(accepted(
+            "Failed shards requeued; committed checkpoints preserved",
+            serde_json::json!({"task_id": task_id, "retried_shards": retried, "request_id": request_id}),
+        ))
+    }
+
+    async fn apply_control_node(
+        &self,
+        node_id: String,
+        paused: bool,
+        request_id: String,
+    ) -> Result<CommandResponse> {
+        if request_id.trim().is_empty() || request_id.len() > 128 {
+            return Ok(rejected("request_id must contain 1-128 characters"));
+        }
+        let request_payload = format!("node:{node_id}:paused={paused}");
+        if let Some(existing) = self.task_store.get_control_request(&request_id).await? {
+            return if existing == request_payload {
+                Ok(accepted(
+                    "Node control request already committed",
+                    serde_json::json!({"node_id": node_id, "paused": paused}),
+                ))
+            } else {
+                Ok(rejected(
+                    "request_id was already used for a different command",
+                ))
+            };
+        }
+        let id = NodeId::new(node_id.clone());
+        let Some(mut node) = self.task_store.get_node(&id).await? else {
+            return Ok(rejected("Node not found"));
+        };
+        if !paused && node.status == crate::types::NodeStatus::Offline {
+            return Ok(rejected(
+                "Offline nodes must re-register before execution can resume",
+            ));
+        }
+        node.status = if paused {
+            crate::types::NodeStatus::Paused
+        } else {
+            crate::types::NodeStatus::Healthy
+        };
+        self.task_store.save_node(&node).await?;
+        self.task_store
+            .save_control_request(&request_id, &request_payload)
+            .await?;
+        Ok(accepted(
+            if paused {
+                "Node execution paused; active leases are allowed to expire or finish"
+            } else {
+                "Node execution resumed"
+            },
+            serde_json::json!({"node_id": node_id, "paused": paused, "request_id": request_id}),
+        ))
     }
 
     async fn apply_register_node(
@@ -294,7 +507,9 @@ impl<S: KvStore + Clone> MetaStateMachine<S> {
             return Ok(rejected("Heartbeat timestamp cannot move backwards"));
         }
         node.last_heartbeat_ms = issued_at_ms;
-        node.status = crate::types::NodeStatus::Healthy;
+        if node.status != crate::types::NodeStatus::Paused {
+            node.status = crate::types::NodeStatus::Healthy;
+        }
         self.task_store.save_node(&node).await?;
         Ok(accepted(
             "Node heartbeat recorded",
@@ -405,7 +620,20 @@ impl<S: KvStore + Clone> MetaStateMachine<S> {
             }
         }
         // Re-applying a committed entry after a crash must be safe.
-        if self.task_store.get_task(&task_id).await?.is_none() {
+        if let Some(existing) = self.task_store.get_task(&task_id).await? {
+            if existing.name != task.name
+                || existing.source_config != task.source_config
+                || existing.sink_config != task.sink_config
+                || existing.transform_configs != task.transform_configs
+                || existing.sharding_config != task.sharding_config
+                || existing.priority != task.priority
+                || existing.metadata != task.metadata
+            {
+                return Ok(rejected(
+                    "Task creation idempotency key was reused with a different payload",
+                ));
+            }
+        } else {
             self.task_store.save_task(&task).await?;
         }
         for shard in &shards {
@@ -445,16 +673,25 @@ impl<S: KvStore + Clone> MetaStateMachine<S> {
             .task_store
             .get_node(&NodeId::new(node_id.clone()))
             .await?
-            .is_some_and(|node| node.status == crate::types::NodeStatus::Offline)
+            .is_some_and(|node| node.status != crate::types::NodeStatus::Healthy)
         {
             return Ok(rejected(
-                "Offline nodes cannot claim shards until they re-register",
+                "Paused or offline nodes cannot claim shards until execution is resumed",
             ));
         }
         let mut shard = match self.task_store.get_shard(&shard_id).await? {
             Some(shard) => shard,
             None => return Ok(rejected("Shard not found")),
         };
+        let Some(task) = self.task_store.get_task(&shard.task_id).await? else {
+            return Ok(rejected("Parent task not found"));
+        };
+        if !matches!(
+            &task.state,
+            crate::types::TaskState::Pending | crate::types::TaskState::Running { .. }
+        ) {
+            return Ok(rejected("Task is not accepting new shard claims"));
+        }
         let previous_expiry = shard
             .lease_expires_at
             .as_ref()
@@ -622,6 +859,14 @@ impl<S: KvStore + Clone> MetaStateMachine<S> {
             Some(shard) => shard,
             None => return Ok(rejected("Shard not found")),
         };
+        if self
+            .task_store
+            .get_task(&shard.task_id)
+            .await?
+            .is_some_and(|task| matches!(task.state, crate::types::TaskState::Cancelled { .. }))
+        {
+            return Ok(rejected("Task has been cancelled"));
+        }
         let at = chrono::DateTime::from_timestamp_millis(issued_at_ms)
             .ok_or_else(|| DatspoolError::Serialization("Invalid cache batch timestamp".into()))?;
         if !lease_matches(&shard, &node_id, fencing_token, at) {
@@ -831,6 +1076,14 @@ impl<S: KvStore + Clone> MetaStateMachine<S> {
             Some(shard) => shard,
             None => return Ok(rejected("Shard not found")),
         };
+        if self
+            .task_store
+            .get_task(&shard.task_id)
+            .await?
+            .is_some_and(|task| matches!(task.state, crate::types::TaskState::Cancelled { .. }))
+        {
+            return Ok(rejected("Task has been cancelled"));
+        }
         if !lease_matches(
             &shard,
             &node_id,
@@ -865,6 +1118,14 @@ impl<S: KvStore + Clone> MetaStateMachine<S> {
             Some(shard) => shard,
             None => return Ok(rejected("Shard not found")),
         };
+        if self
+            .task_store
+            .get_task(&shard.task_id)
+            .await?
+            .is_some_and(|task| matches!(task.state, crate::types::TaskState::Cancelled { .. }))
+        {
+            return Ok(rejected("Task has been cancelled"));
+        }
         if matches!(&shard.state, ShardState::Completed { .. })
             && shard.fencing_token == fencing_token
         {
@@ -905,6 +1166,14 @@ impl<S: KvStore + Clone> MetaStateMachine<S> {
             Some(shard) => shard,
             None => return Ok(rejected("Shard not found")),
         };
+        if self
+            .task_store
+            .get_task(&shard.task_id)
+            .await?
+            .is_some_and(|task| matches!(task.state, crate::types::TaskState::Cancelled { .. }))
+        {
+            return Ok(rejected("Task has been cancelled"));
+        }
         if matches!(&shard.state, ShardState::Failed { .. }) && shard.fencing_token == fencing_token
         {
             return Ok(accepted(
@@ -1364,5 +1633,205 @@ mod tests {
         assert!(
             matches!(current.state, ShardState::Running { ref node_id, .. } if node_id.as_str() == "node-b")
         );
+    }
+
+    #[tokio::test]
+    async fn task_control_transitions_are_committed_and_idempotent() {
+        let dir = tempdir().unwrap();
+        let db = RocksDbStore::open(dir.path()).unwrap();
+        let store = TaskStore::new(db);
+        let task = TaskMeta::new("control-plane".into(), "{}".into(), "{}".into());
+        let task_id = task.task_id;
+        let shard = ShardMeta::new(task_id, 0, "{}".into());
+        let mut sm = MetaStateMachine::new(store.kv_store().clone());
+        assert!(
+            sm.apply_command(Command::CreateTask {
+                task: Box::new(task),
+                shards: vec![shard]
+            })
+            .await
+            .unwrap()
+            .success
+        );
+
+        let pause = Command::ControlTask {
+            task_id: task_id.to_string(),
+            action: "pause".into(),
+            request_id: "pause-1".into(),
+        };
+        assert!(sm.apply_command(pause.clone()).await.unwrap().success);
+        assert!(sm.apply_command(pause).await.unwrap().success);
+        assert!(matches!(
+            store.get_task(&task_id).await.unwrap().unwrap().state,
+            crate::types::TaskState::Paused
+        ));
+        let shard_id = store.list_task_shards(&task_id).await.unwrap()[0].shard_id;
+        let now = chrono::Utc::now().timestamp_millis();
+        let paused_claim = Command::ClaimShard {
+            shard_id: shard_id.to_string(),
+            node_id: "worker-paused-task".into(),
+            claim_id: "paused-claim".into(),
+            issued_at_ms: now,
+            lease_expires_at_ms: now + 30_000,
+        };
+        assert!(
+            !sm.apply_command(paused_claim).await.unwrap().success,
+            "paused tasks must reject new claims"
+        );
+
+        let resume = Command::ControlTask {
+            task_id: task_id.to_string(),
+            action: "resume".into(),
+            request_id: "resume-1".into(),
+        };
+        assert!(sm.apply_command(resume).await.unwrap().success);
+        assert!(matches!(
+            store.get_task(&task_id).await.unwrap().unwrap().state,
+            crate::types::TaskState::Running { .. }
+        ));
+
+        let cancel = Command::ControlTask {
+            task_id: task_id.to_string(),
+            action: "cancel".into(),
+            request_id: "cancel-1".into(),
+        };
+        assert!(sm.apply_command(cancel.clone()).await.unwrap().success);
+        assert!(sm.apply_command(cancel).await.unwrap().success);
+        assert!(matches!(
+            store.get_task(&task_id).await.unwrap().unwrap().state,
+            crate::types::TaskState::Cancelled { .. }
+        ));
+        let conflicting = Command::ControlTask {
+            task_id: task_id.to_string(),
+            action: "resume".into(),
+            request_id: "cancel-1".into(),
+        };
+        assert!(!sm.apply_command(conflicting).await.unwrap().success);
+    }
+
+    #[tokio::test]
+    async fn node_execution_pause_blocks_new_claims_until_resumed() {
+        let dir = tempdir().unwrap();
+        let db = RocksDbStore::open(dir.path()).unwrap();
+        let store = TaskStore::new(db);
+        let mut sm = MetaStateMachine::new(store.kv_store().clone());
+        assert!(
+            sm.apply_command(Command::RegisterNode {
+                node_id: "worker-control".into(),
+                address: "127.0.0.1:9000".into(),
+                tags: Default::default(),
+                issued_at_ms: 1_000
+            })
+            .await
+            .unwrap()
+            .success
+        );
+        let task = TaskMeta::new("node-control".into(), "{}".into(), "{}".into());
+        let task_id = task.task_id;
+        let shard = ShardMeta::new(task_id, 0, "{}".into());
+        let shard_id = shard.shard_id;
+        assert!(
+            sm.apply_command(Command::CreateTask {
+                task: Box::new(task),
+                shards: vec![shard]
+            })
+            .await
+            .unwrap()
+            .success
+        );
+        assert!(
+            sm.apply_command(Command::ControlNodeExecution {
+                node_id: "worker-control".into(),
+                paused: true,
+                request_id: "node-pause-1".into()
+            })
+            .await
+            .unwrap()
+            .success
+        );
+        assert!(
+            sm.apply_command(Command::UpdateNodeHeartbeat {
+                node_id: "worker-control".into(),
+                issued_at_ms: 2_000,
+            })
+            .await
+            .unwrap()
+            .success
+        );
+        assert_eq!(
+            store
+                .get_node(&NodeId::new("worker-control"))
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            crate::types::NodeStatus::Paused
+        );
+        let now = chrono::Utc::now().timestamp_millis();
+        let claim = || Command::ClaimShard {
+            shard_id: shard_id.to_string(),
+            node_id: "worker-control".into(),
+            claim_id: "claim-control".into(),
+            issued_at_ms: now,
+            lease_expires_at_ms: now + 30_000,
+        };
+        assert!(!sm.apply_command(claim()).await.unwrap().success);
+        assert!(
+            sm.apply_command(Command::ControlNodeExecution {
+                node_id: "worker-control".into(),
+                paused: false,
+                request_id: "node-resume-1".into()
+            })
+            .await
+            .unwrap()
+            .success
+        );
+        assert!(sm.apply_command(claim()).await.unwrap().success);
+    }
+
+    #[tokio::test]
+    async fn retry_task_requeues_failed_shards_without_losing_checkpoint() {
+        let dir = tempdir().unwrap();
+        let db = RocksDbStore::open(dir.path()).unwrap();
+        let store = TaskStore::new(db);
+        let task = TaskMeta::new("retry-control".into(), "{}".into(), "{}".into());
+        let task_id = task.task_id;
+        let mut shard = ShardMeta::new(task_id, 0, "{}".into());
+        shard.offset = crate::pipeline::OffsetValue::DocumentCount(42);
+        shard.records_processed = 42;
+        shard.bytes_processed = 8192;
+        shard.set_state_at(
+            ShardState::Failed {
+                error: "temporary".into(),
+                attempts: 1,
+            },
+            chrono::Utc::now(),
+        );
+        let shard_id = shard.shard_id;
+        let mut sm = MetaStateMachine::new(store.kv_store().clone());
+        assert!(
+            sm.apply_command(Command::CreateTask {
+                task: Box::new(task),
+                shards: vec![shard]
+            })
+            .await
+            .unwrap()
+            .success
+        );
+        let retry = Command::RetryTask {
+            task_id: task_id.to_string(),
+            request_id: "retry-1".into(),
+        };
+        let result = sm.apply_command(retry.clone()).await.unwrap();
+        assert!(result.success, "{}", result.message);
+        assert!(sm.apply_command(retry).await.unwrap().success);
+        let restored = store.get_shard(&shard_id).await.unwrap().unwrap();
+        assert!(matches!(restored.state, ShardState::Pending));
+        assert_eq!(
+            restored.offset,
+            crate::pipeline::OffsetValue::DocumentCount(42)
+        );
+        assert_eq!(restored.records_processed, 42);
+        assert_eq!(restored.bytes_processed, 8192);
     }
 }

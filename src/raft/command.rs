@@ -27,6 +27,23 @@ pub enum Command {
         state: String, // JSON-serialized TaskState
     },
 
+    /// Apply a task lifecycle transition through the committed state machine.
+    ControlTask {
+        task_id: String,
+        action: String,
+        request_id: String,
+    },
+
+    /// Requeue failed shards without resetting their durable checkpoints.
+    RetryTask { task_id: String, request_id: String },
+
+    /// Pause or resume new shard claims on a worker node.
+    ControlNodeExecution {
+        node_id: String,
+        paused: bool,
+        request_id: String,
+    },
+
     /// Delete a task (soft delete - mark as archived)
     DeleteTask { task_id: String },
 
@@ -165,6 +182,13 @@ impl Command {
             Command::UpdateTaskState { task_id, .. } => {
                 format!("UpdateTaskState({})", task_id)
             }
+            Command::ControlTask {
+                task_id, action, ..
+            } => format!("ControlTask({}, {})", task_id, action),
+            Command::RetryTask { task_id, .. } => format!("RetryTask({})", task_id),
+            Command::ControlNodeExecution {
+                node_id, paused, ..
+            } => format!("ControlNodeExecution({}, paused={})", node_id, paused),
             Command::DeleteTask { task_id } => {
                 format!("DeleteTask({})", task_id)
             }

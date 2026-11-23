@@ -17,6 +17,7 @@ message CreateTaskRequest {
   string sharding_strategy = 5;  // JSON-serialized ShardingStrategy
   int32 priority = 6;  // 0=Low, 1=Normal, 2=High, 3=Critical
   map<string, string> tags = 7;
+  string request_id = 8;  // Idempotency key for client retries
 }
 
 message CreateTaskResponse {
@@ -127,12 +128,22 @@ message FailShardResponse {
   bool should_retry = 1;
 }
 
+message TaskControlRequest { string task_id = 1; string request_id = 2; }
+message TaskControlResponse { bool success = 1; string message = 2; }
+message NodeExecutionControlRequest { string node_id = 1; bool paused = 2; string request_id = 3; }
+message NodeExecutionControlResponse { bool success = 1; string message = 2; }
+
 // ==================== Service Definition ====================
 
 service TaskService {
   // Task CRUD
   rpc CreateTask(CreateTaskRequest) returns (CreateTaskResponse);
   rpc GetTask(GetTaskRequest) returns (GetTaskResponse);
+  rpc PauseTask(TaskControlRequest) returns (TaskControlResponse);
+  rpc ResumeTask(TaskControlRequest) returns (TaskControlResponse);
+  rpc CancelTask(TaskControlRequest) returns (TaskControlResponse);
+  rpc RetryTask(TaskControlRequest) returns (TaskControlResponse);
+  rpc ControlNodeExecution(NodeExecutionControlRequest) returns (NodeExecutionControlResponse);
   
   // Task execution (called by Agents)
   rpc AssignShard(AssignShardRequest) returns (AssignShardResponse);

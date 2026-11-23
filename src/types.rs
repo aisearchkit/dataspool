@@ -145,6 +145,7 @@ pub enum NodeRole {
 pub enum NodeStatus {
     Healthy,
     Degraded,
+    Paused,
     Offline,
 }
 
@@ -159,6 +160,9 @@ pub enum TaskState {
     Pausing,
     Paused,
     Canceling,
+    Cancelled {
+        cancelled_at: chrono::DateTime<chrono::Utc>,
+    },
     Completed {
         finished_at: chrono::DateTime<chrono::Utc>,
         stats: TaskStats,

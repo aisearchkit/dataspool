@@ -12,7 +12,7 @@ use tracing::{info, warn};
 
 use crate::raft::RaftNode;
 use crate::storage::RocksDbStore;
-use crate::task::{ShardMeta, TaskMeta, TaskStore};
+use crate::task::{ShardGenerator, ShardMeta, ShardingStrategy, TaskMeta, TaskPriority, TaskStore};
 use crate::types::{ShardState, TaskState};
 
 use super::generated::{cluster, log, task};
@@ -78,6 +78,10 @@ impl GrpcServer {
     }
 }
 
+fn raft_status(error: impl std::fmt::Display) -> Status {
+    Status::unavailable(format!("Raft command could not be committed: {error}"))
+}
+
 // ==================== ClusterService Implementation ====================
 
 #[derive(Default)]
@@ -139,6 +143,38 @@ struct TaskServiceImpl {
     raft_node: Option<Arc<RaftNode>>,
 }
 
+async fn control_task(
+    service: &Arc<RwLock<TaskServiceImpl>>,
+    req: task::TaskControlRequest,
+    action: &str,
+) -> std::result::Result<Response<task::TaskControlResponse>, Status> {
+    if req.request_id.trim().is_empty() {
+        return Err(Status::invalid_argument("request_id is required"));
+    }
+    let task_id: crate::types::TaskId = req
+        .task_id
+        .parse()
+        .map_err(|e| Status::invalid_argument(format!("Invalid task_id: {e}")))?;
+    let raft = service
+        .read()
+        .await
+        .raft_node
+        .clone()
+        .ok_or_else(|| Status::unavailable("Task mutations require Raft"))?;
+    let result = raft
+        .propose(crate::raft::Command::ControlTask {
+            task_id: task_id.to_string(),
+            action: action.to_string(),
+            request_id: req.request_id,
+        })
+        .await
+        .map_err(raft_status)?;
+    Ok(Response::new(task::TaskControlResponse {
+        success: result.success,
+        message: result.message,
+    }))
+}
+
 #[tonic::async_trait]
 impl task::task_service_server::TaskService for Arc<RwLock<TaskServiceImpl>> {
     async fn create_task(
@@ -146,12 +182,138 @@ impl task::task_service_server::TaskService for Arc<RwLock<TaskServiceImpl>> {
         request: Request<task::CreateTaskRequest>,
     ) -> std::result::Result<Response<task::CreateTaskResponse>, Status> {
         let req = request.into_inner();
-        warn!("CreateTask called (not implemented yet): name={}", req.name);
-
+        if req.name.trim().is_empty()
+            || req.request_id.trim().is_empty()
+            || req.request_id.len() > 128
+        {
+            return Err(Status::invalid_argument(
+                "name is required and request_id must contain 1-128 characters",
+            ));
+        }
+        let raft = self.read().await.raft_node.clone().ok_or_else(|| {
+            Status::unavailable("Task mutations require an initialized Raft control plane")
+        })?;
+        let strategy = if req.sharding_strategy.trim().is_empty() {
+            ShardingStrategy::None
+        } else {
+            serde_json::from_str(&req.sharding_strategy)
+                .map_err(|e| Status::invalid_argument(format!("Invalid sharding_strategy: {e}")))?
+        };
+        let deterministic_id = uuid::Uuid::new_v5(
+            &uuid::Uuid::NAMESPACE_URL,
+            format!("dataspool:create-task:{}", req.request_id).as_bytes(),
+        );
+        let mut task_meta = TaskMeta::new(req.name, req.source_config, req.sink_config);
+        task_meta.task_id = crate::types::TaskId::from_uuid(deterministic_id);
+        task_meta.priority = match req.priority {
+            0 => TaskPriority::Low,
+            1 => TaskPriority::Normal,
+            2 => TaskPriority::High,
+            3 => TaskPriority::Critical,
+            _ => return Err(Status::invalid_argument("priority must be between 0 and 3")),
+        };
+        task_meta.transform_configs =
+            (!req.transform_config.trim().is_empty()).then_some(req.transform_config);
+        task_meta.sharding_config = (!req.sharding_strategy.trim().is_empty()).then_some(
+            serde_json::to_string(&strategy).map_err(|e| Status::internal(e.to_string()))?,
+        );
+        task_meta.metadata = req.tags;
+        let shards =
+            ShardGenerator::generate(task_meta.task_id, &strategy, &task_meta.source_config);
+        let task_id = task_meta.task_id.to_string();
+        let response = raft
+            .propose(crate::raft::Command::CreateTask {
+                task: Box::new(task_meta),
+                shards,
+            })
+            .await
+            .map_err(raft_status)?;
         Ok(Response::new(task::CreateTaskResponse {
-            success: false,
-            task_id: String::new(),
-            message: "Not implemented yet".to_string(),
+            success: response.success,
+            task_id: if response.success {
+                task_id
+            } else {
+                String::new()
+            },
+            message: response.message,
+        }))
+    }
+
+    async fn pause_task(
+        &self,
+        request: Request<task::TaskControlRequest>,
+    ) -> std::result::Result<Response<task::TaskControlResponse>, Status> {
+        control_task(self, request.into_inner(), "pause").await
+    }
+    async fn resume_task(
+        &self,
+        request: Request<task::TaskControlRequest>,
+    ) -> std::result::Result<Response<task::TaskControlResponse>, Status> {
+        control_task(self, request.into_inner(), "resume").await
+    }
+    async fn cancel_task(
+        &self,
+        request: Request<task::TaskControlRequest>,
+    ) -> std::result::Result<Response<task::TaskControlResponse>, Status> {
+        control_task(self, request.into_inner(), "cancel").await
+    }
+    async fn retry_task(
+        &self,
+        request: Request<task::TaskControlRequest>,
+    ) -> std::result::Result<Response<task::TaskControlResponse>, Status> {
+        let req = request.into_inner();
+        if req.request_id.trim().is_empty() {
+            return Err(Status::invalid_argument("request_id is required"));
+        }
+        let task_id: crate::types::TaskId = req
+            .task_id
+            .parse()
+            .map_err(|e| Status::invalid_argument(format!("Invalid task_id: {e}")))?;
+        let raft = self
+            .read()
+            .await
+            .raft_node
+            .clone()
+            .ok_or_else(|| Status::unavailable("Task mutations require Raft"))?;
+        let result = raft
+            .propose(crate::raft::Command::RetryTask {
+                task_id: task_id.to_string(),
+                request_id: req.request_id,
+            })
+            .await
+            .map_err(raft_status)?;
+        Ok(Response::new(task::TaskControlResponse {
+            success: result.success,
+            message: result.message,
+        }))
+    }
+    async fn control_node_execution(
+        &self,
+        request: Request<task::NodeExecutionControlRequest>,
+    ) -> std::result::Result<Response<task::NodeExecutionControlResponse>, Status> {
+        let req = request.into_inner();
+        if req.node_id.trim().is_empty() || req.request_id.trim().is_empty() {
+            return Err(Status::invalid_argument(
+                "node_id and request_id are required",
+            ));
+        }
+        let raft = self
+            .read()
+            .await
+            .raft_node
+            .clone()
+            .ok_or_else(|| Status::unavailable("Node control requires Raft"))?;
+        let result = raft
+            .propose(crate::raft::Command::ControlNodeExecution {
+                node_id: req.node_id,
+                paused: req.paused,
+                request_id: req.request_id,
+            })
+            .await
+            .map_err(raft_status)?;
+        Ok(Response::new(task::NodeExecutionControlResponse {
+            success: result.success,
+            message: result.message,
         }))
     }
 
@@ -283,6 +445,7 @@ fn task_state_name(state: &TaskState) -> &'static str {
         TaskState::Pausing => "Pausing",
         TaskState::Paused => "Paused",
         TaskState::Canceling => "Canceling",
+        TaskState::Cancelled { .. } => "Cancelled",
         TaskState::Completed { .. } => "Completed",
         TaskState::Failed { .. } => "Failed",
     }
@@ -301,6 +464,7 @@ fn task_to_response(task: TaskMeta, shards: Vec<ShardMeta>) -> task::GetTaskResp
     let completed_at = match &task.state {
         TaskState::Completed { finished_at, .. } => Some(timestamp_from_datetime(*finished_at)),
         TaskState::Failed { failed_at, .. } => Some(timestamp_from_datetime(*failed_at)),
+        TaskState::Cancelled { cancelled_at } => Some(timestamp_from_datetime(*cancelled_at)),
         _ => None,
     };
     let started_at = task

@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Added the Raft-committed Distributed Task Control Plane: CreateTask, PauseTask, ResumeTask, CancelTask, RetryTask, and per-node execution pause/resume commands. Task creation uses deterministic request-key-derived IDs; control request IDs are replicated for idempotency and conflicting reuse is rejected.
+- Added task lifecycle states and claim gating: paused tasks/nodes stop accepting new shard claims, cancellation blocks subsequent progress/terminal mutations, and retry requeues failed shards while preserving checkpoints.
 - Implemented TaskService.GetTask over gRPC with live Task/shard aggregation, per-node throughput, checkpoint offsets, fencing generations, lease deadlines, timestamps, and a Raft linearizable read barrier on the leader.
 - Added a separate Task API gRPC listener (default loopback 127.0.0.1:50052) while preserving the existing Raft RPC port; wired graceful lifecycle into the main process.
 - Added bidirectional Raft network-partition fault injection and worker-process restart coverage that verifies lease reclamation and checkpoint preservation.

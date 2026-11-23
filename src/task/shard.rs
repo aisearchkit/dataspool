@@ -283,7 +283,7 @@ impl ShardGenerator {
         strategy: &ShardingStrategy,
         source_config: &str,
     ) -> Vec<ShardMeta> {
-        match strategy {
+        let mut shards = match strategy {
             ShardingStrategy::None => {
                 vec![ShardMeta::new(task_id, 0, source_config.to_string())]
             }
@@ -335,7 +335,15 @@ impl ShardGenerator {
                 // Placeholder - would generate time-based shards
                 vec![ShardMeta::new(task_id, 0, source_config.to_string())]
             }
+        };
+        // Stable shard IDs make CreateTask retries converge on the same shard set.
+        for shard in &mut shards {
+            shard.shard_id = ShardId::from_uuid(uuid::Uuid::new_v5(
+                task_id.as_uuid(),
+                &shard.shard_index.to_be_bytes(),
+            ));
         }
+        shards
     }
 }
 
@@ -343,6 +351,24 @@ impl ShardGenerator {
 mod tests {
     use super::*;
     use crate::types::TaskId;
+
+    #[test]
+    fn generated_shard_ids_are_stable_for_task_retries() {
+        let task_id = TaskId::new();
+        let strategy = ShardingStrategy::ByHash {
+            field: "id".into(),
+            num_shards: 4,
+        };
+        let first = ShardGenerator::generate(task_id, &strategy, "{}");
+        let second = ShardGenerator::generate(task_id, &strategy, "{}");
+        assert_eq!(
+            first.iter().map(|shard| shard.shard_id).collect::<Vec<_>>(),
+            second
+                .iter()
+                .map(|shard| shard.shard_id)
+                .collect::<Vec<_>>()
+        );
+    }
 
     #[test]
     fn test_shard_meta_new() {
