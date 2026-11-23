@@ -70,6 +70,8 @@ pub struct RaftNode {
     node_id: RocksNodeId,
     raft: Arc<Raft>,
     raft_token: String,
+    #[cfg(test)]
+    network: NetworkFactory,
 }
 
 impl RaftNode {
@@ -88,19 +90,16 @@ impl RaftNode {
         let (log_store, state_machine) = storage::new(raft_data_dir, task_store)
             .await
             .map_err(|e| DatspoolError::Raft(crate::error::RaftError::Storage(e)))?;
-        let raft = Raft::new(
-            node_id,
-            config,
-            NetworkFactory::new(raft_token.clone()),
-            log_store,
-            state_machine,
-        )
-        .await
-        .map_err(|e| DatspoolError::Raft(crate::error::RaftError::Storage(e.to_string())))?;
+        let network = NetworkFactory::new(raft_token.clone());
+        let raft = Raft::new(node_id, config, network.clone(), log_store, state_machine)
+            .await
+            .map_err(|e| DatspoolError::Raft(crate::error::RaftError::Storage(e.to_string())))?;
         Ok(Self {
             node_id,
             raft: Arc::new(raft),
             raft_token,
+            #[cfg(test)]
+            network,
         })
     }
 
@@ -110,6 +109,11 @@ impl RaftNode {
 
     pub fn node_id(&self) -> RocksNodeId {
         self.node_id
+    }
+
+    #[cfg(test)]
+    pub async fn set_peer_blocked(&self, node_id: RocksNodeId, blocked: bool) {
+        self.network.set_peer_blocked(node_id, blocked).await;
     }
 
     pub async fn is_initialized(&self) -> Result<bool> {
@@ -158,6 +162,22 @@ impl RaftNode {
                 }
             }
         }
+    }
+
+    /// Confirm this node is the current leader and that its state machine is
+    /// applied through a quorum-confirmed read index before serving a read.
+    pub async fn ensure_linearizable(&self) -> Result<()> {
+        self.raft
+            .ensure_linearizable()
+            .await
+            .map(|_| ())
+            .map_err(|error| {
+                DatspoolError::Raft(crate::error::RaftError::ProposalFailed(error.to_string()))
+            })
+    }
+
+    pub async fn current_leader(&self) -> Option<RocksNodeId> {
+        self.raft.current_leader().await
     }
 
     pub async fn wait_for_leader(&self, timeout: std::time::Duration) -> Result<RocksNodeId> {
@@ -509,6 +529,9 @@ mod cluster_tests {
         .await
         .expect("Raft cluster did not elect a leader");
         let leader = &nodes[leader_index];
+        leader.ensure_linearizable().await.unwrap();
+        let follower_index = (leader_index + 1) % nodes.len();
+        assert!(nodes[follower_index].ensure_linearizable().await.is_err());
 
         let task = TaskMeta::new("raft-fencing-integration".into(), "{}".into(), "{}".into());
         let task_id = task.task_id;
@@ -807,11 +830,20 @@ mod cluster_tests {
             );
         }
 
-        // Partition one follower from inbound Raft traffic while the two-node
-        // quorum continues committing state. Force a snapshot and purge its log
-        // prefix so the returning follower must recover from the snapshot.
+        // Create a bidirectional network partition: block every outbound RPC
+        // from the isolated follower and every inbound RPC to it. The remaining
+        // two members retain quorum and continue committing state.
         let isolated_index = (leader_index + 2) % nodes.len();
-        server_tasks[isolated_index].abort();
+        let isolated_id = ids[isolated_index];
+        for index in 0..nodes.len() {
+            if index == isolated_index {
+                for peer_id in ids.iter().copied().filter(|peer| *peer != isolated_id) {
+                    nodes[index].set_peer_blocked(peer_id, true).await;
+                }
+            } else {
+                nodes[index].set_peer_blocked(isolated_id, true).await;
+            }
+        }
         let recovery_task = TaskMeta::new("snapshot-recovery".into(), "{}".into(), "{}".into());
         let recovery_task_id = recovery_task.task_id;
         let recovery_shard = ShardMeta::new(recovery_task_id, 0, "{}".into());
@@ -828,13 +860,13 @@ mod cluster_tests {
             .await
             .unwrap();
 
-        let listener = tokio::net::TcpListener::bind(&addresses[isolated_index])
-            .await
-            .unwrap();
-        let router = super::super::network::router(nodes[isolated_index].handle(), token.clone());
-        server_tasks[isolated_index] = tokio::spawn(async move {
-            let _ = axum::serve(listener, router).await;
-        });
+        // Heal both directions; the returning member must install the snapshot
+        // after its compacted log prefix has been purged.
+        for node in &nodes {
+            for peer_id in ids {
+                node.set_peer_blocked(peer_id, false).await;
+            }
+        }
         tokio::time::timeout(Duration::from_secs(15), async {
             loop {
                 if TaskStore::new(stores[isolated_index].clone())

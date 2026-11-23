@@ -139,14 +139,26 @@ impl<S: KvStore> TaskStore<S> {
         Ok(rebuilt.len())
     }
 
-    /// Read a task together with a freshly computed aggregate, without trusting a cached view.
-    pub async fn get_task_with_aggregate(&self, task_id: &TaskId) -> Result<Option<TaskMeta>> {
+    /// Read a task and the exact shard set used to compute its live aggregate.
+    /// Returning both from one shard scan keeps the API aggregate and shard rows aligned.
+    pub async fn get_task_with_aggregate_and_shards(
+        &self,
+        task_id: &TaskId,
+    ) -> Result<Option<(TaskMeta, Vec<ShardMeta>)>> {
         let Some(mut task) = self.get_task(task_id).await? else {
             return Ok(None);
         };
         let shards = self.list_task_shards(task_id).await?;
         task.refresh_from_shards(&shards, chrono::Utc::now());
-        Ok(Some(task))
+        Ok(Some((task, shards)))
+    }
+
+    /// Read a task together with a freshly computed aggregate, without trusting a cached view.
+    pub async fn get_task_with_aggregate(&self, task_id: &TaskId) -> Result<Option<TaskMeta>> {
+        Ok(self
+            .get_task_with_aggregate_and_shards(task_id)
+            .await?
+            .map(|(task, _)| task))
     }
 
     /// Delete task metadata

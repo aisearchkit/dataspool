@@ -14,8 +14,16 @@ pub use generated::*;
 pub use server::GrpcServer;
 
 use crate::error::Result;
+use crate::raft::RaftNode;
+use crate::storage::RocksDbStore;
+use crate::task::TaskStore;
+use std::sync::Arc;
 
 /// Initialize the gRPC communication layer
-pub async fn init_comms(bind_addr: &str) -> Result<GrpcServer> {
-    GrpcServer::new(bind_addr).await
+pub async fn init_comms(
+    bind_addr: &str,
+    task_store: Arc<TaskStore<RocksDbStore>>,
+    raft_node: Option<Arc<RaftNode>>,
+) -> Result<GrpcServer> {
+    GrpcServer::new(bind_addr, task_store, raft_node).await
 }

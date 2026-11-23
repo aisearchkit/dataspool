@@ -298,6 +298,209 @@ mod tests {
         assert!(next_lease > second);
     }
 
+    struct CheckpointProbeSource {
+        observed: Arc<std::sync::Mutex<Option<crate::pipeline::OffsetValue>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::pipeline::Source for CheckpointProbeSource {
+        async fn connect(&mut self) -> Result<()> {
+            Ok(())
+        }
+        async fn read_batch(
+            &mut self,
+            offset: &crate::pipeline::OffsetValue,
+            _batch_size: usize,
+        ) -> Result<(crate::pipeline::RecordBatch, crate::pipeline::OffsetValue)> {
+            *self.observed.lock().unwrap() = Some(offset.clone());
+            Ok((crate::pipeline::RecordBatch::new(), offset.clone()))
+        }
+        async fn estimate_count(&self) -> Result<Option<u64>> {
+            Ok(None)
+        }
+        async fn close(&mut self) -> Result<()> {
+            Ok(())
+        }
+        fn source_type(&self) -> &str {
+            "checkpoint-probe"
+        }
+    }
+
+    struct CheckpointProbeSink;
+
+    #[async_trait::async_trait]
+    impl crate::pipeline::Sink for CheckpointProbeSink {
+        async fn connect(&mut self) -> Result<()> {
+            Ok(())
+        }
+        async fn write_batch(
+            &mut self,
+            batch: crate::pipeline::RecordBatch,
+        ) -> Result<crate::pipeline::WriteResult> {
+            Ok(crate::pipeline::WriteResult::success(batch.len(), 0))
+        }
+        async fn flush(&mut self) -> Result<()> {
+            Ok(())
+        }
+        async fn close(&mut self) -> Result<()> {
+            Ok(())
+        }
+        fn sink_type(&self) -> &str {
+            "checkpoint-probe"
+        }
+    }
+
+    #[tokio::test]
+    async fn worker_process_restart_reclaims_lease_and_preserves_checkpoint() {
+        use crate::raft::{Command, RaftNode, default_raft_config};
+        use crate::task::{ShardMeta, TaskMeta};
+        use openraft::BasicNode;
+        use std::collections::BTreeMap;
+
+        let dir = tempdir().unwrap();
+        let db = RocksDbStore::open(dir.path().join("app")).unwrap();
+        let store = Arc::new(TaskStore::new(db.clone()));
+        let token = "worker-restart-test-token-0123456789".to_string();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let raft_path = dir.path().join("raft");
+        let raft = RaftNode::new(
+            1,
+            &raft_path,
+            (*store).clone(),
+            default_raft_config(),
+            token.clone(),
+        )
+        .await
+        .unwrap();
+        let router = crate::raft_router(raft.handle(), token.clone());
+        let rpc_server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        raft.initialize(BTreeMap::from([(1, BasicNode::new(address.to_string()))]))
+            .await
+            .unwrap();
+        raft.wait_for_leader(std::time::Duration::from_secs(10))
+            .await
+            .unwrap();
+
+        let task = TaskMeta::new("worker-restart-checkpoint".into(), "{}".into(), "{}".into());
+        let task_id = task.task_id;
+        let shard = ShardMeta::new(task_id, 0, "{}".into());
+        let shard_id = shard.shard_id;
+        let created = raft
+            .propose(Command::CreateTask {
+                task: Box::new(task),
+                shards: vec![shard],
+            })
+            .await
+            .unwrap();
+        assert!(created.success, "{}", created.message);
+
+        let first_claimer =
+            ShardClaimer::new("worker-a".into(), store.clone(), Arc::new(raft.clone()))
+                .with_lease_seconds(3)
+                .unwrap();
+        let first_lease = first_claimer.try_claim().await.unwrap().unwrap();
+        let checkpoint = crate::pipeline::OffsetValue::DocumentCount(17);
+        let progress = raft
+            .propose(Command::UpdateShardProgress {
+                shard_id: shard_id.to_string(),
+                node_id: first_lease.node_id.to_string(),
+                fencing_token: first_lease.fencing_token,
+                issued_at_ms: Utc::now().timestamp_millis(),
+                processed_records: 17,
+                processed_bytes: 1_700,
+                offset: serde_json::to_string(&checkpoint).unwrap(),
+            })
+            .await
+            .unwrap();
+        assert!(progress.success, "{}", progress.message);
+
+        // Simulate a worker process crash: Raft and the worker's local client
+        // disappear, but the durable Raft log and application checkpoint remain.
+        drop(first_claimer);
+        rpc_server.abort();
+        let _ = rpc_server.await;
+        raft.shutdown().await.unwrap();
+        drop(raft);
+
+        let listener = tokio::net::TcpListener::bind(address).await.unwrap();
+        let restarted_raft = RaftNode::new(
+            1,
+            &raft_path,
+            (*store).clone(),
+            default_raft_config(),
+            token.clone(),
+        )
+        .await
+        .unwrap();
+        let router = crate::raft_router(restarted_raft.handle(), token);
+        let restarted_rpc = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        restarted_raft
+            .wait_for_leader(std::time::Duration::from_secs(10))
+            .await
+            .unwrap();
+
+        let persisted = store.get_shard(&shard_id).await.unwrap().unwrap();
+        assert_eq!(persisted.records_processed, 17);
+        assert_eq!(persisted.bytes_processed, 1_700);
+        assert_eq!(persisted.offset, checkpoint);
+        assert_eq!(persisted.fencing_token, first_lease.fencing_token);
+
+        let wait = (first_lease.expires_at - Utc::now())
+            .to_std()
+            .unwrap_or_default()
+            + std::time::Duration::from_millis(100);
+        tokio::time::sleep(wait).await;
+        let restarted_claimer = ShardClaimer::new(
+            "worker-a".into(),
+            store.clone(),
+            Arc::new(restarted_raft.clone()),
+        )
+        .with_lease_seconds(3)
+        .unwrap();
+        let next_lease = restarted_claimer.try_claim().await.unwrap().unwrap();
+        assert!(next_lease.fencing_token > first_lease.fencing_token);
+        let recovered = store.get_shard(&shard_id).await.unwrap().unwrap();
+        assert_eq!(recovered.records_processed, 17);
+        assert_eq!(recovered.bytes_processed, 1_700);
+        assert_eq!(recovered.offset, checkpoint);
+        assert_eq!(recovered.fencing_token, next_lease.fencing_token);
+
+        // A newly constructed executor must seek from the durable checkpoint,
+        // not replay from the beginning after the worker process restarts.
+        let index_store = Arc::new(tokio::sync::RwLock::new(
+            crate::storage::index::TieredIndexStore::new(
+                crate::storage::index::TieredConfig::default(),
+                Arc::new(db.clone()),
+            ),
+        ));
+        let executor = crate::agent::ShardExecutor::new_with_raft(
+            store.clone(),
+            index_store,
+            Arc::new(restarted_raft.clone()),
+        );
+        let observed_offset = Arc::new(std::sync::Mutex::new(None));
+        let mut source = CheckpointProbeSource {
+            observed: observed_offset.clone(),
+        };
+        let mut sink = CheckpointProbeSink;
+        executor
+            .execute_pipeline_with_instances(&recovered, &mut source, &mut sink)
+            .await
+            .unwrap();
+        assert_eq!(observed_offset.lock().unwrap().as_ref(), Some(&checkpoint));
+
+        drop(executor);
+        drop(restarted_claimer);
+        restarted_rpc.abort();
+        let _ = restarted_rpc.await;
+        restarted_raft.shutdown().await.unwrap();
+    }
+
     #[tokio::test]
     async fn rejects_unreasonably_short_leases() {
         let dir = tempdir().unwrap();

@@ -26,9 +26,16 @@ cluster:
 
 # ==================== Server Configuration ====================
 server:
-  # gRPC port for inter-node communication
+  # Raft HTTP RPC port for inter-node consensus traffic (private network only)
   grpc_port: 50051
-  
+
+  # TaskService gRPC API port (GetTask exposes committed task aggregates)
+  task_api_port: 50052
+
+  # Loopback by default because TaskService currently has no native auth/TLS.
+  # Set to 0.0.0.0 only behind a trusted TLS/authentication proxy.
+  task_api_bind_addr: "127.0.0.1"
+
   # HTTP port for REST API and UI
   http_port: 8080
   
@@ -36,7 +43,8 @@ server:
   bind_addr: "0.0.0.0"
   
   # Raft HTTP RPC is bound to grpc_port and should be restricted to the
-  # private cluster network. TLS termination is not built into this listener.
+  # private cluster network. TaskService gRPC is bound to task_api_port.
+  # Terminate TLS at a trusted proxy; native TLS is not enabled.
   tls:
     enabled: false
     cert_file: "/etc/dataspool/certs/server.crt"
@@ -45,8 +53,7 @@ server:
 
 # ==================== Agent Configuration ====================
 agent:
-  # Enable the single-node Agent worker pool.
-  # Multi-node execution is rejected until Raft-backed claiming is integrated.
+  # Enable the Raft-backed Agent worker pool.
   enabled: true
   
   # Resource limits

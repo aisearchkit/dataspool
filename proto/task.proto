@@ -37,7 +37,7 @@ message GetTaskResponse {
 message TaskInfo {
   string task_id = 1;
   string name = 2;
-  string state = 3;  // Pending, Running, Completed, Failed
+  string state = 3;
   google.protobuf.Timestamp created_at = 4;
   google.protobuf.Timestamp started_at = 5;
   google.protobuf.Timestamp completed_at = 6;
@@ -45,6 +45,25 @@ message TaskInfo {
   uint64 completed_shards = 8;
   uint64 failed_shards = 9;
   uint64 processed_records = 10;
+  uint64 pending_shards = 11;
+  uint64 running_shards = 12;
+  uint64 processed_bytes = 13;
+  uint64 elapsed_ms = 14;
+  double throughput_docs_per_sec = 15;
+  double throughput_bytes_per_sec = 16;
+  repeated NodeTaskInfo nodes = 17;
+}
+
+message NodeTaskInfo {
+  string node_id = 1;
+  uint64 pending_shards = 2;
+  uint64 running_shards = 3;
+  uint64 completed_shards = 4;
+  uint64 failed_shards = 5;
+  uint64 processed_records = 6;
+  uint64 processed_bytes = 7;
+  double throughput_docs_per_sec = 8;
+  double throughput_bytes_per_sec = 9;
 }
 
 message ShardInfo {
@@ -54,6 +73,11 @@ message ShardInfo {
   string assigned_node = 4;
   uint64 processed_records = 5;
   uint64 total_records = 6;
+  uint64 processed_bytes = 7;
+  uint64 fencing_token = 8;
+  google.protobuf.Timestamp lease_expires_at = 9;
+  string checkpoint = 10;
+  google.protobuf.Timestamp updated_at = 11;
 }
 
 // ==================== Task Control ====================

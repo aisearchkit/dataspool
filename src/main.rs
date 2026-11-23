@@ -17,7 +17,8 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 use dataspool::{
-    CancellationToken, DatspoolConfig, DatspoolError, NodeLifecycle, Result, TaskStore, WorkerPool,
+    CancellationToken, DatspoolConfig, DatspoolError, GrpcServer, NodeLifecycle, Result, TaskStore,
+    WorkerPool,
 };
 use openraft::BasicNode;
 use std::collections::BTreeMap;
@@ -242,6 +243,16 @@ async fn main() -> Result<()> {
         None
     };
 
+    let grpc_api_addr = config
+        .as_ref()
+        .map(|value| value.task_api_addr().to_string())
+        .unwrap_or_else(|| "127.0.0.1:50052".to_string());
+    let grpc_raft = raft_node.as_ref().map(|raft| Arc::new(raft.clone()));
+    let grpc_api = GrpcServer::new(&grpc_api_addr, tasks.clone(), grpc_raft).await?;
+    let grpc_shutdown = shutdown.clone();
+    let grpc_api_task =
+        tokio::spawn(async move { grpc_api.serve_until_cancelled(grpc_shutdown).await });
+
     info!(%bind, %db_path, "Starting Dataspool DLQ admin API");
     if !bind.starts_with("127.0.0.1:") && !bind.starts_with("[::1]:") {
         warn!(
@@ -256,6 +267,9 @@ async fn main() -> Result<()> {
         .map_err(|e| DatspoolError::Internal(format!("HTTP server failed: {e}")));
     shutdown.cancel();
 
+    grpc_api_task
+        .await
+        .map_err(|e| DatspoolError::Internal(format!("Task API gRPC task failed: {e}")))??;
     if let Some(worker) = worker {
         worker
             .await

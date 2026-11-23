@@ -109,3 +109,24 @@ Read a task with a fresh projection through TaskStore::get_task_with_aggregate; 
 A shard's last owner is retained in ShardMeta.last_owner_node_id, so completed/failed work remains attributable after its lease is cleared. A later claim transfers current shard attribution to the new owner; the shard checkpoint and total processed counters remain intact.
 
 The Raft recovery integration test exercises a three-member cluster: it isolates a follower from inbound Raft traffic, commits additional task state on the remaining quorum, creates and purges a snapshot, reconnects the follower and verifies snapshot catch-up, then shuts down the leader and verifies that the surviving quorum elects a replacement leader and commits new work. Duplicate completion and failure proposals are checked for idempotency. Snapshot restoration also rebuilds the aggregate from committed shard metadata rather than trusting the serialized projection.
+
+## TaskService gRPC query API
+
+The control-plane TaskService runs independently from the Raft transport. server.grpc_port remains the authenticated internal Raft HTTP RPC listener for compatibility; server.task_api_port is the TaskService gRPC listener (default 50052). server.task_api_bind_addr defaults to 127.0.0.1 because the current TaskService does not yet implement native authentication or TLS. Keep it loopback-only, or expose it only through a trusted TLS/authentication proxy. The corresponding environment overrides are DATASPOOL_SERVER_TASK_API_PORT and DATASPOOL_SERVER_TASK_API_BIND_ADDR.
+
+TaskService.GetTask accepts a UUID task_id and returns:
+- The live task state and aggregate shard counts (pending/running/completed/failed).
+- Processed documents/bytes, elapsed time, and document/byte throughput.
+- Per-node shard counts, processed totals, and throughput.
+- Every shard's current state, last owner, checkpoint offset (JSON-encoded), fencing token, lease expiry, processed documents/bytes, and update timestamp.
+
+In Raft mode, the service accepts reads only on the elected leader and runs OpenRaft's quorum-confirmed linearizable read barrier before accessing storage. A follower returns FAILED_PRECONDITION with leader_id; a missing leader or lost quorum returns UNAVAILABLE. In non-Raft admin-only mode, the service reads the local store. The service computes the aggregate from the same shard scan used to construct the returned shard list; it does not trust the cached TaskMeta.aggregate projection. Invalid IDs return INVALID_ARGUMENT, unknown tasks return NOT_FOUND, and storage failures return INTERNAL. ShardInfo.total_records is zero when the source total is unknown; ShardMeta currently stores processed counts but not an independent source cardinality estimate.
+
+Example (on the local node):
+
+```bash
+grpcurl -plaintext -d '{"task_id":"<task-uuid>"}' \
+  127.0.0.1:50052 dataspool.task.TaskService/GetTask
+```
+
+Clients can also use the existing GrpcClient::task() generated client accessor. The gRPC server is started and gracefully stopped by the main Dataspool process alongside the HTTP and Raft listeners.

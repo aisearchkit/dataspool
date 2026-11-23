@@ -5,7 +5,12 @@
 
 //! OpenRaft HTTP transport. RPC endpoints are internal cluster traffic only.
 
+#[cfg(test)]
+use std::collections::HashSet;
+use std::io;
 use std::sync::Arc;
+#[cfg(test)]
+use tokio::sync::RwLock;
 
 use axum::{
     Json, Router,
@@ -32,6 +37,8 @@ use super::storage::{RocksNodeId, TypeConfig};
 pub struct NetworkFactory {
     client: Client,
     token: String,
+    #[cfg(test)]
+    blocked_nodes: Arc<RwLock<HashSet<RocksNodeId>>>,
 }
 
 impl NetworkFactory {
@@ -43,6 +50,18 @@ impl NetworkFactory {
                 .build()
                 .expect("HTTP client"),
             token,
+            #[cfg(test)]
+            blocked_nodes: Arc::new(RwLock::new(HashSet::new())),
+        }
+    }
+
+    #[cfg(test)]
+    pub async fn set_peer_blocked(&self, node_id: RocksNodeId, blocked: bool) {
+        let mut nodes = self.blocked_nodes.write().await;
+        if blocked {
+            nodes.insert(node_id);
+        } else {
+            nodes.remove(&node_id);
         }
     }
 }
@@ -51,6 +70,10 @@ pub struct NetworkConnection {
     client: Client,
     base_url: String,
     token: String,
+    #[cfg(test)]
+    target: RocksNodeId,
+    #[cfg(test)]
+    blocked_nodes: Arc<RwLock<HashSet<RocksNodeId>>>,
 }
 
 impl NetworkConnection {
@@ -60,31 +83,47 @@ impl NetworkConnection {
         RPCError::Network(NetworkError::new(&error))
     }
 
-    async fn post<Req, Resp>(&self, path: &str, request: &Req) -> Result<Resp, reqwest::Error>
+    async fn post<Req, Resp>(&self, path: &str, request: &Req) -> Result<Resp, io::Error>
     where
         Req: serde::Serialize + ?Sized,
         Resp: serde::de::DeserializeOwned,
     {
+        #[cfg(test)]
+        if self.blocked_nodes.read().await.contains(&self.target) {
+            return Err(io::Error::new(
+                io::ErrorKind::ConnectionRefused,
+                format!("test network partition blocks Raft peer {}", self.target),
+            ));
+        }
         self.client
             .post(format!("{}{path}", self.base_url))
             .header("x-dataspool-raft-token", &self.token)
             .json(request)
             .send()
-            .await?
-            .error_for_status()?
+            .await
+            .map_err(io::Error::other)?
+            .error_for_status()
+            .map_err(io::Error::other)?
             .json()
             .await
+            .map_err(io::Error::other)
     }
 }
 
 impl RaftNetworkFactory<TypeConfig> for NetworkFactory {
     type Network = NetworkConnection;
 
-    async fn new_client(&mut self, _target: RocksNodeId, node: &BasicNode) -> Self::Network {
+    async fn new_client(&mut self, target: RocksNodeId, node: &BasicNode) -> Self::Network {
+        #[cfg(not(test))]
+        let _ = target;
         NetworkConnection {
             client: self.client.clone(),
             base_url: format!("http://{}", node.addr),
             token: self.token.clone(),
+            #[cfg(test)]
+            target,
+            #[cfg(test)]
+            blocked_nodes: self.blocked_nodes.clone(),
         }
     }
 }
@@ -128,7 +167,7 @@ impl OpenRaftNetwork<TypeConfig> for NetworkConnection {
     > {
         self.post("/raft/snapshot", &rpc)
             .await
-            .map_err(|e| RPCError::Network(NetworkError::new(&e)))
+            .map_err(|error| RPCError::Network(NetworkError::new(&error)))
     }
 }
 

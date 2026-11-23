@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Implemented TaskService.GetTask over gRPC with live Task/shard aggregation, per-node throughput, checkpoint offsets, fencing generations, lease deadlines, timestamps, and a Raft linearizable read barrier on the leader.
+- Added a separate Task API gRPC listener (default loopback 127.0.0.1:50052) while preserving the existing Raft RPC port; wired graceful lifecycle into the main process.
+- Added bidirectional Raft network-partition fault injection and worker-process restart coverage that verifies lease reclamation and checkpoint preservation.
 - Raft-backed distributed task aggregation derived from committed shard state, including per-node shard counts, records/bytes and throughput, task-wide throughput, durable checkpoints, and failed-shard accounting.
 - Task aggregate rebuild after application startup and Raft snapshot installation; task and shard projections are committed atomically for progress and terminal transitions.
 - Three-node recovery coverage for follower network isolation, snapshot catch-up, leader shutdown/election, replicated task aggregation, and idempotent completion/failure commands.

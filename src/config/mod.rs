@@ -66,12 +66,26 @@ fn default_heartbeat_interval() -> Duration {
 /// Server listener configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerConfig {
+    /// Raft HTTP RPC listener (legacy field name retained for config compatibility).
     pub grpc_port: u16,
+    /// TaskService gRPC API listener.
+    #[serde(default = "default_task_api_port")]
+    pub task_api_port: u16,
+    #[serde(default = "default_task_api_bind_addr")]
+    pub task_api_bind_addr: String,
     pub http_port: u16,
     #[serde(default = "default_bind_addr")]
     pub bind_addr: String,
     #[serde(default)]
     pub tls: TlsConfig,
+}
+
+fn default_task_api_port() -> u16 {
+    50052
+}
+
+fn default_task_api_bind_addr() -> String {
+    "127.0.0.1".to_string()
 }
 
 fn default_bind_addr() -> String {
@@ -247,6 +261,15 @@ impl DatspoolConfig {
                 .map_err(|e| ConfigError::Invalid(format!("Invalid gRPC port: {}", e)))?;
         }
 
+        if let Ok(port) = std::env::var("DATASPOOL_SERVER_TASK_API_PORT") {
+            self.server.task_api_port = port
+                .parse()
+                .map_err(|e| ConfigError::Invalid(format!("Invalid Task API gRPC port: {}", e)))?;
+        }
+        if let Ok(address) = std::env::var("DATASPOOL_SERVER_TASK_API_BIND_ADDR") {
+            self.server.task_api_bind_addr = address;
+        }
+
         if let Ok(secret) = std::env::var("DATASPOOL_JWT_SECRET") {
             self.auth.jwt_secret = Some(secret);
         }
@@ -267,6 +290,29 @@ impl DatspoolConfig {
         if self.server.http_port == 0 {
             return Err(ConfigError::Invalid("server.http_port cannot be 0".to_string()).into());
         }
+        if self.server.task_api_port == 0 {
+            return Err(
+                ConfigError::Invalid("server.task_api_port cannot be 0".to_string()).into(),
+            );
+        }
+        let task_api_addr = format!(
+            "{}:{}",
+            self.server.task_api_bind_addr, self.server.task_api_port
+        )
+        .parse::<SocketAddr>()
+        .map_err(|error| ConfigError::Invalid(format!("Invalid Task API gRPC address: {error}")))?;
+        let raft_addr = format!("{}:{}", self.server.bind_addr, self.server.grpc_port)
+            .parse::<SocketAddr>()
+            .map_err(|error| ConfigError::Invalid(format!("Invalid Raft RPC address: {error}")))?;
+        let http_addr = format!("{}:{}", self.server.bind_addr, self.server.http_port)
+            .parse::<SocketAddr>()
+            .map_err(|error| ConfigError::Invalid(format!("Invalid HTTP address: {error}")))?;
+        if task_api_addr == raft_addr || task_api_addr == http_addr {
+            return Err(ConfigError::Invalid(
+                "server.task_api_addr must not overlap the Raft RPC or HTTP listener".to_string(),
+            )
+            .into());
+        }
 
         if self.server.tls.enabled {
             if self.server.tls.cert_file.is_none() {
@@ -285,6 +331,16 @@ impl DatspoolConfig {
         format!("{}:{}", self.server.bind_addr, self.server.grpc_port)
             .parse()
             .expect("Invalid gRPC address")
+    }
+
+    /// Get TaskService gRPC API listen address.
+    pub fn task_api_addr(&self) -> SocketAddr {
+        format!(
+            "{}:{}",
+            self.server.task_api_bind_addr, self.server.task_api_port
+        )
+        .parse()
+        .expect("Invalid Task API gRPC address")
     }
 
     /// Get HTTP listen address
@@ -356,6 +412,8 @@ observability:
 
         assert_eq!(config.node.name, "test-node");
         assert_eq!(config.server.grpc_port, 50051);
+        assert_eq!(config.server.task_api_port, 50052);
+        assert_eq!(config.server.task_api_bind_addr, "127.0.0.1");
         assert_eq!(config.cluster.peers.len(), 2);
         assert!(config.agent.enabled);
     }
@@ -374,6 +432,8 @@ observability:
             },
             server: ServerConfig {
                 grpc_port: 50051,
+                task_api_port: 50052,
+                task_api_bind_addr: "127.0.0.1".to_string(),
                 http_port: 8080,
                 bind_addr: "127.0.0.1".to_string(),
                 tls: TlsConfig::default(),
@@ -408,6 +468,8 @@ observability:
             },
             server: ServerConfig {
                 grpc_port: 50051,
+                task_api_port: 50052,
+                task_api_bind_addr: "127.0.0.1".to_string(),
                 http_port: 8080,
                 bind_addr: "0.0.0.0".to_string(),
                 tls: TlsConfig::default(),
@@ -429,5 +491,8 @@ observability:
 
         config.node.name = "test".to_string();
         assert!(config.validate().is_ok());
+        config.server.task_api_bind_addr = "0.0.0.0".to_string();
+        config.server.task_api_port = config.server.http_port;
+        assert!(config.validate().is_err());
     }
 }
