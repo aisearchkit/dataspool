@@ -79,10 +79,10 @@ impl<S: KvStore + Clone + 'static> NodeLifecycle<S> {
                     if let Err(error) = self.heartbeat().await {
                         warn!(node_id = %self.node_id, %error, "Raft node heartbeat failed; retrying");
                     }
-                    if self.raft.is_leader().await {
-                        if let Err(error) = self.detect_failed_nodes().await {
-                            warn!(node_id = %self.node_id, %error, "Node failure detection pass failed");
-                        }
+                    if self.raft.is_leader().await
+                        && let Err(error) = self.detect_failed_nodes().await
+                    {
+                        warn!(node_id = %self.node_id, %error, "Node failure detection pass failed");
                     }
                 }
             }
