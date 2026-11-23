@@ -48,7 +48,5 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler clang libclang-dev llvm-dev
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Run library unit tests
-        run: cargo test --lib --all-features
-      - name: Check application binary
-        run: cargo check --bin dataspool --all-features
+      - name: Run library and binary unit tests
+        run: cargo test --lib --bins --all-features
