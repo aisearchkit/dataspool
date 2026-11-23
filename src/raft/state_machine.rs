@@ -633,6 +633,8 @@ impl<S: KvStore + Clone> MetaStateMachine<S> {
                     "Task creation idempotency key was reused with a different payload",
                 ));
             }
+            // Preserve the committed lifecycle state and timestamps on retries.
+            task = existing;
         } else {
             self.task_store.save_task(&task).await?;
         }
@@ -1633,6 +1635,59 @@ mod tests {
         assert!(
             matches!(current.state, ShardState::Running { ref node_id, .. } if node_id.as_str() == "node-b")
         );
+    }
+
+    #[tokio::test]
+    async fn duplicate_task_creation_preserves_committed_state_and_shard_identity() {
+        let dir = tempdir().unwrap();
+        let db = RocksDbStore::open(dir.path()).unwrap();
+        let store = TaskStore::new(db);
+        let task = TaskMeta::new("create-idempotency".into(), "{}".into(), "{}".into());
+        let task_id = task.task_id;
+        let strategy = crate::task::ShardingStrategy::ByHash {
+            field: "id".into(),
+            num_shards: 2,
+        };
+        let shards = crate::task::ShardGenerator::generate(task_id, &strategy, "{}");
+        let shard_id = shards[0].shard_id;
+        let mut sm = MetaStateMachine::new(store.kv_store().clone());
+        assert!(
+            sm.apply_command(Command::CreateTask {
+                task: Box::new(task.clone()),
+                shards: shards.clone()
+            })
+            .await
+            .unwrap()
+            .success
+        );
+        let now = chrono::Utc::now().timestamp_millis();
+        assert!(
+            sm.apply_command(Command::ClaimShard {
+                shard_id: shard_id.to_string(),
+                node_id: "worker-create".into(),
+                claim_id: "create-claim".into(),
+                issued_at_ms: now,
+                lease_expires_at_ms: now + 30_000
+            })
+            .await
+            .unwrap()
+            .success
+        );
+        assert!(
+            sm.apply_command(Command::CreateTask {
+                task: Box::new(task),
+                shards
+            })
+            .await
+            .unwrap()
+            .success
+        );
+        let committed = store.get_task(&task_id).await.unwrap().unwrap();
+        assert!(matches!(
+            committed.state,
+            crate::types::TaskState::Running { .. }
+        ));
+        assert_eq!(store.list_task_shards(&task_id).await.unwrap().len(), 2);
     }
 
     #[tokio::test]
