@@ -21,6 +21,47 @@ use crate::task::TaskStore;
 
 pub type Raft = openraft::Raft<TypeConfig>;
 
+/// Rewrite client-supplied wall-clock timestamps at the Raft leader. Lease
+/// ownership must be judged against one authoritative clock, not a worker's
+/// potentially skewed clock. Claim/renew durations are preserved, while their
+/// absolute deadlines are rebased onto the leader's current time.
+pub(crate) fn normalize_command_timestamp(command: &mut Command) -> Result<()> {
+    const MIN_LEASE_MILLIS: i64 = 3_000;
+    const MAX_LEASE_MILLIS: i64 = 24 * 60 * 60 * 1_000;
+
+    let now = chrono::Utc::now().timestamp_millis();
+    match command {
+        Command::ClaimShard {
+            issued_at_ms,
+            lease_expires_at_ms,
+            ..
+        }
+        | Command::RenewShardLease {
+            issued_at_ms,
+            lease_expires_at_ms,
+            ..
+        } => {
+            let duration = lease_expires_at_ms.saturating_sub(*issued_at_ms);
+            if !(MIN_LEASE_MILLIS..=MAX_LEASE_MILLIS).contains(&duration) {
+                return Err(DatspoolError::Configuration(format!(
+                    "Shard lease duration must be between {MIN_LEASE_MILLIS}ms and {MAX_LEASE_MILLIS}ms"
+                )));
+            }
+            *issued_at_ms = now;
+            *lease_expires_at_ms = now.saturating_add(duration);
+        }
+        Command::ReleaseShardLease { issued_at_ms, .. }
+        | Command::CacheBatch { issued_at_ms, .. }
+        | Command::PersistDeadLetters { issued_at_ms, .. }
+        | Command::AckCacheBatch { issued_at_ms, .. }
+        | Command::UpdateShardProgress { issued_at_ms, .. }
+        | Command::CompleteShard { issued_at_ms, .. }
+        | Command::FailShard { issued_at_ms, .. } => *issued_at_ms = now,
+        _ => {}
+    }
+    Ok(())
+}
+
 #[derive(Clone)]
 pub struct RaftNode {
     node_id: RocksNodeId,
@@ -239,9 +280,11 @@ impl RaftNode {
         for attempt in 0..20 {
             match self.raft.current_leader().await {
                 Some(leader_id) if leader_id == self.node_id => {
+                    let mut proposal = command.clone();
+                    normalize_command_timestamp(&mut proposal)?;
                     match tokio::time::timeout(
                         std::time::Duration::from_secs(10),
-                        self.raft.client_write(command.clone()),
+                        self.raft.client_write(proposal),
                     )
                     .await
                     {
@@ -343,6 +386,30 @@ mod cluster_tests {
     use std::sync::Arc;
     use std::time::Duration;
     use tempfile::tempdir;
+
+    #[test]
+    fn proposal_timestamps_use_the_leader_clock_and_preserve_lease_duration() {
+        let before = chrono::Utc::now().timestamp_millis();
+        let mut command = Command::ClaimShard {
+            shard_id: "shard-1".into(),
+            node_id: "worker-a".into(),
+            claim_id: "clock-skew-test".into(),
+            issued_at_ms: 1,
+            lease_expires_at_ms: 3_001,
+        };
+        normalize_command_timestamp(&mut command).unwrap();
+        let after = chrono::Utc::now().timestamp_millis();
+        let Command::ClaimShard {
+            issued_at_ms,
+            lease_expires_at_ms,
+            ..
+        } = command
+        else {
+            unreachable!();
+        };
+        assert!((before..=after).contains(&issued_at_ms));
+        assert_eq!(lease_expires_at_ms - issued_at_ms, 3_000);
+    }
 
     #[tokio::test]
     async fn three_node_raft_cluster_replicates_claims_and_rejects_stale_fencing_tokens() {
@@ -458,7 +525,9 @@ mod cluster_tests {
             "worker-a".into(),
             worker_store.clone(),
             Arc::new(worker_node.clone()),
-        );
+        )
+        .with_lease_seconds(3)
+        .unwrap();
         let mut lease = claimer
             .try_claim()
             .await
@@ -575,7 +644,12 @@ mod cluster_tests {
             );
         }
 
-        let takeover_at = lease.expires_at.timestamp_millis() + 1;
+        let remaining_ms =
+            lease.expires_at.timestamp_millis() - chrono::Utc::now().timestamp_millis();
+        if remaining_ms > 0 {
+            tokio::time::sleep(Duration::from_millis(remaining_ms as u64 + 25)).await;
+        }
+        let takeover_at = chrono::Utc::now().timestamp_millis();
         let second = worker_node
             .propose(Command::ClaimShard {
                 shard_id: shard_id.to_string(),

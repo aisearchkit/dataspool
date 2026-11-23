@@ -169,7 +169,21 @@ impl<S: KvStore + Clone + 'static> ShardClaimer<S> {
                                 "Raft claim response omitted fencing token".into(),
                             )
                         })?;
-                    self.wait_for_local_lease(&shard_id, fencing_token, expires_at)
+                    let committed_expiry_ms = response
+                        .data
+                        .as_ref()
+                        .and_then(|data| data.get("lease_expires_at_ms"))
+                        .and_then(serde_json::Value::as_i64)
+                        .ok_or_else(|| {
+                            DatspoolError::Internal(
+                                "Raft claim response omitted lease expiration".into(),
+                            )
+                        })?;
+                    let committed_expiry = DateTime::from_timestamp_millis(committed_expiry_ms)
+                        .ok_or_else(|| {
+                            DatspoolError::Internal("Raft returned invalid lease expiration".into())
+                        })?;
+                    self.wait_for_local_lease(&shard_id, fencing_token, committed_expiry)
                         .await?;
                     info!(%shard_id, node_id = %self.node_id, fencing_token, "Shard lease committed by Raft");
                     return Ok(Some(ShardLease {
@@ -177,7 +191,7 @@ impl<S: KvStore + Clone + 'static> ShardClaimer<S> {
                         node_id: self.node_id.clone(),
                         fencing_token,
                         claim_id,
-                        expires_at,
+                        expires_at: committed_expiry,
                         batch_sequence: Arc::new(AtomicU64::new(0)),
                         sink_sequence: Arc::new(AtomicU64::new(0)),
                     }));
@@ -208,9 +222,21 @@ impl<S: KvStore + Clone + 'static> ShardClaimer<S> {
         .await
         .map_err(|_| DatspoolError::Raft(crate::error::RaftError::ElectionTimeout))??;
         if response.success {
-            self.wait_for_local_lease(&lease.shard_id, lease.fencing_token, expires_at)
+            let committed_expiry_ms = response
+                .data
+                .as_ref()
+                .and_then(|data| data.get("lease_expires_at_ms"))
+                .and_then(serde_json::Value::as_i64)
+                .ok_or_else(|| {
+                    DatspoolError::Internal("Raft renewal response omitted lease expiration".into())
+                })?;
+            let committed_expiry = DateTime::from_timestamp_millis(committed_expiry_ms)
+                .ok_or_else(|| {
+                    DatspoolError::Internal("Raft returned invalid lease expiration".into())
+                })?;
+            self.wait_for_local_lease(&lease.shard_id, lease.fencing_token, committed_expiry)
                 .await?;
-            lease.expires_at = expires_at;
+            lease.expires_at = committed_expiry;
             Ok(true)
         } else {
             warn!(shard_id = %lease.shard_id, fencing_token = lease.fencing_token, reason = %response.message, "Shard lease renewal rejected");

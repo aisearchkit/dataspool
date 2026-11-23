@@ -172,8 +172,9 @@ async fn authorize(
 
 async fn client_write(
     State(state): State<RaftHttpState>,
-    Json(command): Json<super::Command>,
+    Json(mut command): Json<super::Command>,
 ) -> Result<Json<super::CommandResponse>, StatusCode> {
+    super::node::normalize_command_timestamp(&mut command).map_err(|_| StatusCode::BAD_REQUEST)?;
     state
         .raft
         .client_write(command)
