@@ -334,7 +334,9 @@ impl<S: KvStore + Clone + 'static> ShardExecutor<S> {
                         executor.persist_progress(lease_for_delivery.as_ref(), &shard_id, source_count, next_offset).await?;
                     }
                     Ok(())
-                }, move |cache_key| async move {
+                }, move |cache_key| {
+                    let cache_key = cache_key.to_string();
+                    async move {
                     if let Some(lease) = lease_for_ack.as_ref() {
                         executor_for_ack.ensure_lease(lease).await?;
                         let response = executor_for_ack.raft.as_ref()
@@ -344,13 +346,14 @@ impl<S: KvStore + Clone + 'static> ShardExecutor<S> {
                                 node_id: lease.node_id.to_string(),
                                 fencing_token: lease.fencing_token,
                                 issued_at_ms: chrono::Utc::now().timestamp_millis(),
-                                cache_key: cache_key.to_string(),
+                                cache_key,
                             }).await?;
                         if !response.success {
                             return Err(DatspoolError::Internal(format!("Replicated cache acknowledgement rejected: {}", response.message)));
                         }
                     }
                     Ok(())
+                    }
                 })
                 .await?;
             if !delivered {
@@ -477,7 +480,9 @@ impl<S: KvStore + Clone + 'static> ShardExecutor<S> {
                         executor.persist_progress(lease_for_delivery.as_ref(), &shard_id, source_count, next_offset).await?;
                     }
                     Ok(())
-                }, move |cache_key| async move {
+                }, move |cache_key| {
+                    let cache_key = cache_key.to_string();
+                    async move {
                     if let Some(lease) = lease_for_ack.as_ref() {
                         executor_for_ack.ensure_lease(lease).await?;
                         let response = executor_for_ack.raft.as_ref()
@@ -487,13 +492,14 @@ impl<S: KvStore + Clone + 'static> ShardExecutor<S> {
                                 node_id: lease.node_id.to_string(),
                                 fencing_token: lease.fencing_token,
                                 issued_at_ms: chrono::Utc::now().timestamp_millis(),
-                                cache_key: cache_key.to_string(),
+                                cache_key,
                             }).await?;
                         if !response.success {
                             return Err(DatspoolError::Internal(format!("Replicated cache acknowledgement rejected: {}", response.message)));
                         }
                     }
                     Ok(())
+                    }
                 })
                 .await?;
 
