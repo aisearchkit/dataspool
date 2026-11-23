@@ -7,49 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Added
-- Initial project structure
-- Design documentation (requirements, architecture, detailed design, database design)
-- AGPL-3.0 license
-- Conventional Commits guidelines
+No unreleased changes.
 
-### Changed
-- N/A
-
-### Deprecated
-- N/A
-
-### Removed
-- N/A
-
-### Fixed
-- N/A
-
-### Security
-- N/A
-
----
-
-## Template for Future Releases
-
-```markdown
-## [x.y.z] - YYYY-MM-DD
+## [0.1.0] - 2026-11-23
 
 ### Added
-- New features
+- Initial Rust project structure and foundational migration components.
+- Elasticsearch-compatible HTTP source and sink support.
+- Elasticsearch compatibility coverage for 7.10.2, 7.17, 8.x, and 9.x using three-node test clusters.
+- Retry handling and soak coverage for transient Elasticsearch write rejections, including HTTP 429 responses.
+- CI checks for formatting, Clippy, tests, dependency security auditing, and release builds.
+- Automated Dependabot updates for GitHub Actions dependencies, with guarded CI-only auto-merge and dependency-update tags.
 
 ### Changed
-- Changes in existing functionality
+- Improved fixture bulk initialization reliability by retrying transient item-level rejections in compatibility tests.
 
-### Deprecated
-- Soon-to-be removed features
-
-### Removed
-- Removed features
-
-### Fixed
-- Bug fixes
-
-### Security
-- Security fixes and improvements
-```
+### Limitations
+- This is an early preview focused on Elasticsearch HTTP migration. MySQL/PostgreSQL sink completeness, production Raft consensus, full gRPC cluster/task APIs, local Lucene reading, and a complete Control/Agent production orchestration lifecycle are not claimed as supported in this release.
+- The automated release workflow currently publishes a Linux x86_64 artifact as a draft prerelease. Other platform binaries and production deployment/upgrade procedures are not included.
