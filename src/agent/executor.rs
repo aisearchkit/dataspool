@@ -317,6 +317,8 @@ impl<S: KvStore + Clone + 'static> ShardExecutor<S> {
             let sink_ref = &mut *sink;
             let delivered = cache
                 .deliver_one_with_checkpoint_and_ack(|batch, next_offset, source_count| async move {
+                    let batch_bytes = batch.records().iter().map(|record| record.to_bytes().map(|bytes| bytes.len() as u64))
+                        .collect::<std::result::Result<Vec<_>, _>>()?.into_iter().sum();
                     executor.ensure_optional_lease(lease_for_delivery.as_ref()).await?;
                     let write = match lease_for_delivery.as_ref() {
                         Some(lease) => sink_ref.write_batch_fenced(batch, lease.next_sink_version()?).await?,
@@ -348,7 +350,7 @@ impl<S: KvStore + Clone + 'static> ShardExecutor<S> {
                         }
                     }
                     if let Some(next_offset) = next_offset {
-                        executor.persist_progress(lease_for_delivery.as_ref(), &shard_id, source_count, next_offset).await?;
+                        executor.persist_progress(lease_for_delivery.as_ref(), &shard_id, source_count, batch_bytes, next_offset).await?;
                     }
                     Ok(())
                 }, move |cache_key| async move {
@@ -403,6 +405,7 @@ impl<S: KvStore + Clone + 'static> ShardExecutor<S> {
                         self.persist_progress(
                             lease.as_ref(),
                             &shard.shard_id,
+                            0,
                             0,
                             new_offset.clone(),
                         )
@@ -475,6 +478,13 @@ impl<S: KvStore + Clone + 'static> ShardExecutor<S> {
             cache
                 .deliver_one_with_checkpoint_and_ack(
                     |cached_batch, next_offset, source_count| async move {
+                        let batch_bytes = cached_batch
+                            .records()
+                            .iter()
+                            .map(|record| record.to_bytes().map(|bytes| bytes.len() as u64))
+                            .collect::<std::result::Result<Vec<_>, _>>()?
+                            .into_iter()
+                            .sum::<u64>();
                         executor
                             .ensure_optional_lease(lease_for_delivery.as_ref())
                             .await?;
@@ -535,6 +545,7 @@ impl<S: KvStore + Clone + 'static> ShardExecutor<S> {
                                     lease_for_delivery.as_ref(),
                                     &shard_id,
                                     source_count,
+                                    batch_bytes,
                                     next_offset,
                                 )
                                 .await?;
@@ -638,6 +649,7 @@ impl<S: KvStore + Clone + 'static> ShardExecutor<S> {
         lease: Option<&ShardLease>,
         shard_id: &crate::types::ShardId,
         batch_records: u64,
+        batch_bytes: u64,
         offset: crate::pipeline::OffsetValue,
     ) -> Result<()> {
         if let Some(lease) = lease {
@@ -661,6 +673,7 @@ impl<S: KvStore + Clone + 'static> ShardExecutor<S> {
                     fencing_token: lease.fencing_token,
                     issued_at_ms: chrono::Utc::now().timestamp_millis(),
                     processed_records: current.records_processed.saturating_add(batch_records),
+                    processed_bytes: current.bytes_processed.saturating_add(batch_bytes),
                     offset: serde_json::to_string(&offset)
                         .map_err(|e| DatspoolError::Serialization(e.to_string()))?,
                 })
@@ -677,7 +690,7 @@ impl<S: KvStore + Clone + 'static> ShardExecutor<S> {
                     DatspoolError::Internal(format!("Shard {shard_id} not found"))
                 })?;
             if current.offset != offset {
-                current.update_progress(batch_records, 0, offset);
+                current.update_progress(batch_records, batch_bytes, offset);
                 self.task_store.save_shard(&current).await?;
             }
         }

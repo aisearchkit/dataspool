@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Raft-backed distributed task aggregation derived from committed shard state, including per-node shard counts, records/bytes, throughput, durable checkpoints, and failed-shard accounting.
+- Task aggregate rebuild after application startup and Raft snapshot installation; task and shard projections are committed atomically for progress and terminal transitions.
+- Three-node recovery coverage for follower network isolation, snapshot catch-up, leader shutdown/election, replicated task aggregation, and idempotent completion/failure commands.
 - Cooperative worker-pool shutdown using cancellation tokens. Active continuous/CDC shards finish in-flight writes and checkpoint acknowledgements, close their source and sink, and return to Pending for safe reassignment.
 - Application startup now optionally loads `DATASPOOL_CONFIG`, starts the configured single-node Agent alongside the DLQ API, recovers interrupted local shards, and coordinates SIGINT/SIGTERM shutdown.
 

@@ -140,6 +140,12 @@ impl RocksStateMachine {
                 .map_err(|e| StorageIOError::write_state_machine(&e))?;
         }
 
+        state_machine
+            .task_store
+            .rebuild_task_aggregates()
+            .await
+            .map_err(|e| StorageIOError::write_state_machine(&e))?;
+
         Ok(state_machine)
     }
 }
@@ -587,6 +593,10 @@ impl RaftStateMachine<TypeConfig> for RocksStateMachine {
 
         self.task_store
             .replace_snapshot(updated_state_machine.task_store)
+            .await
+            .map_err(|e| StorageIOError::write_state_machine(&e))?;
+        self.task_store
+            .rebuild_task_aggregates()
             .await
             .map_err(|e| StorageIOError::write_state_machine(&e))?;
         self.sm = updated_state_machine.state_machine;

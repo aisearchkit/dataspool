@@ -67,6 +67,10 @@ pub struct ShardMeta {
     #[serde(default)]
     pub lease_id: Option<String>,
 
+    /// Last node that owned this shard, retained for historical per-node aggregation.
+    #[serde(default)]
+    pub last_owner_node_id: Option<NodeId>,
+
     /// Shard-specific configuration (JSON string)
     pub config: String,
 
@@ -98,6 +102,7 @@ impl ShardMeta {
             fencing_token: 0,
             lease_expires_at: None,
             lease_id: None,
+            last_owner_node_id: None,
             config,
             offset: OffsetValue::initial(),
             records_processed: 0,
@@ -132,6 +137,7 @@ impl ShardMeta {
         self.fencing_token = self.fencing_token.max(FENCING_TOKEN_BASE).checked_add(1)?;
         self.lease_expires_at = Some(lease_expires_at);
         self.lease_id = Some(lease_id);
+        self.last_owner_node_id = Some(node_id.clone());
         self.state = ShardState::Running {
             node_id,
             started_at,
@@ -181,6 +187,7 @@ impl ShardMeta {
         self.fencing_token = self.fencing_token.max(FENCING_TOKEN_BASE).saturating_add(1);
         self.lease_expires_at = None;
         self.lease_id = None;
+        self.last_owner_node_id = Some(node_id.clone());
         self.state = ShardState::Running {
             node_id,
             started_at: chrono::Utc::now(),
@@ -201,10 +208,12 @@ impl ShardMeta {
     pub fn set_progress_at(
         &mut self,
         records: u64,
+        bytes: u64,
         offset: OffsetValue,
         at: chrono::DateTime<chrono::Utc>,
     ) {
         self.records_processed = records;
+        self.bytes_processed = bytes;
         self.offset = offset;
         self.updated_at = system_time_from_utc(at);
     }

@@ -48,6 +48,9 @@ pub use pipeline::{
 };
 pub use raft::{Command, CommandResponse, RaftNode, raft_router};
 pub use storage::{ColumnFamily, KvStore, RocksDbStore, WriteBatch, cf};
-pub use task::{ShardGenerator, ShardMeta, ShardingStrategy, TaskMeta, TaskPriority, TaskStore};
+pub use task::{
+    NodeTaskAggregate, ShardCheckpoint, ShardGenerator, ShardMeta, ShardingStrategy, TaskAggregate,
+    TaskMeta, TaskPriority, TaskStore,
+};
 pub use tokio_util::sync::CancellationToken;
 pub use types::{NodeId, NodeRole, NodeStatus, ShardId, ShardState, TaskId, TaskState, TaskStats};

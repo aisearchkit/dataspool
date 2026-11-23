@@ -3,7 +3,8 @@
 
 //! Task metadata definitions
 
-use crate::types::{TaskId, TaskState, TaskStats};
+use crate::pipeline::OffsetValue;
+use crate::types::{ShardId, ShardState, TaskId, TaskState, TaskStats};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::SystemTime;
@@ -16,6 +17,46 @@ pub enum TaskPriority {
     Normal = 1,
     High = 2,
     Critical = 3,
+}
+
+/// Per-node contribution to a task's globally aggregated execution state.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodeTaskAggregate {
+    pub pending_shards: u32,
+    pub running_shards: u32,
+    pub completed_shards: u32,
+    pub failed_shards: u32,
+    pub docs_processed: u64,
+    pub bytes_processed: u64,
+}
+
+/// Last committed checkpoint for one shard.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ShardCheckpoint {
+    pub shard_id: ShardId,
+    pub node_id: Option<String>,
+    pub fencing_token: u64,
+    pub offset: OffsetValue,
+    pub records_processed: u64,
+    pub bytes_processed: u64,
+    pub updated_at_ms: u64,
+}
+
+/// Rebuildable, cluster-wide task view derived exclusively from committed shard metadata.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct TaskAggregate {
+    pub total_shards: u32,
+    pub pending_shards: u32,
+    pub running_shards: u32,
+    pub completed_shards: u32,
+    pub failed_shards: u32,
+    pub docs_processed: u64,
+    pub bytes_processed: u64,
+    pub elapsed_ms: u64,
+    pub throughput_docs_per_sec: f64,
+    pub throughput_bytes_per_sec: f64,
+    pub nodes: HashMap<String, NodeTaskAggregate>,
+    pub checkpoints: Vec<ShardCheckpoint>,
 }
 
 /// Task metadata containing all information about a data migration task
@@ -57,11 +98,19 @@ pub struct TaskMeta {
     /// Number of failed shards
     pub failed_shards: u32,
 
+    /// Rebuildable cluster-wide view derived from committed shard records.
+    #[serde(default)]
+    pub aggregate: TaskAggregate,
+
     /// Additional metadata (key-value pairs)
     pub metadata: HashMap<String, String>,
 
     /// Task creation timestamp
     pub created_at: SystemTime,
+
+    /// Task execution start time, retained after completion for stable duration metrics.
+    #[serde(default)]
+    pub started_at: Option<chrono::DateTime<chrono::Utc>>,
 
     /// Task last update timestamp
     pub updated_at: SystemTime,
@@ -84,8 +133,10 @@ impl TaskMeta {
             shard_count: 0,
             completed_shards: 0,
             failed_shards: 0,
+            aggregate: TaskAggregate::default(),
             metadata: HashMap::new(),
             created_at: now,
+            started_at: None,
             updated_at: now,
         }
     }
@@ -133,11 +184,179 @@ impl TaskMeta {
     /// Start the task
     pub fn start(&mut self, shard_count: u32) {
         self.shard_count = shard_count;
+        let started_at = chrono::Utc::now();
+        self.started_at = Some(started_at);
         self.state = TaskState::Running {
-            started_at: chrono::Utc::now(),
+            started_at,
             shard_count,
         };
         self.updated_at = SystemTime::now();
+    }
+
+    /// Rebuild task counters, terminal state, throughput and checkpoints from shard truth.
+    pub fn refresh_from_shards(
+        &mut self,
+        shards: &[crate::task::ShardMeta],
+        at: chrono::DateTime<chrono::Utc>,
+    ) {
+        let mut aggregate = TaskAggregate {
+            total_shards: shards.len() as u32,
+            ..TaskAggregate::default()
+        };
+        let mut earliest_start: Option<chrono::DateTime<chrono::Utc>> = None;
+        let mut latest_finish: Option<chrono::DateTime<chrono::Utc>> = None;
+
+        for shard in shards {
+            aggregate.docs_processed = aggregate
+                .docs_processed
+                .saturating_add(shard.records_processed);
+            aggregate.bytes_processed = aggregate
+                .bytes_processed
+                .saturating_add(shard.bytes_processed);
+            let state = match &shard.state {
+                ShardState::Pending => {
+                    aggregate.pending_shards += 1;
+                    0_u8
+                }
+                ShardState::Running { started_at, .. } => {
+                    aggregate.running_shards += 1;
+                    earliest_start =
+                        Some(earliest_start.map_or(*started_at, |v| v.min(*started_at)));
+                    1_u8
+                }
+                ShardState::Completed { finished_at, .. } => {
+                    aggregate.completed_shards += 1;
+                    latest_finish =
+                        Some(latest_finish.map_or(*finished_at, |v| v.max(*finished_at)));
+                    2_u8
+                }
+                ShardState::Failed { .. } => {
+                    aggregate.failed_shards += 1;
+                    let failed_at = chrono::DateTime::<chrono::Utc>::from(shard.updated_at);
+                    latest_finish = Some(latest_finish.map_or(failed_at, |v| v.max(failed_at)));
+                    3_u8
+                }
+            };
+            let owner = shard.last_owner_node_id.as_ref().map(ToString::to_string);
+            if let Some(owner) = owner.as_ref() {
+                let node = aggregate.nodes.entry(owner.clone()).or_default();
+                node.pending_shards += u32::from(state == 0);
+                node.running_shards += u32::from(state == 1);
+                node.completed_shards += u32::from(state == 2);
+                node.failed_shards += u32::from(state == 3);
+                node.docs_processed = node.docs_processed.saturating_add(shard.records_processed);
+                node.bytes_processed = node.bytes_processed.saturating_add(shard.bytes_processed);
+            }
+            aggregate.checkpoints.push(ShardCheckpoint {
+                shard_id: shard.shard_id,
+                node_id: owner,
+                fencing_token: shard.fencing_token,
+                offset: shard.offset.clone(),
+                records_processed: shard.records_processed,
+                bytes_processed: shard.bytes_processed,
+                updated_at_ms: shard
+                    .updated_at
+                    .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis()
+                    .min(u64::MAX as u128) as u64,
+            });
+        }
+
+        aggregate
+            .checkpoints
+            .sort_by_key(|checkpoint| checkpoint.shard_id.to_string());
+        self.shard_count = aggregate.total_shards;
+        self.completed_shards = aggregate.completed_shards;
+        self.failed_shards = aggregate.failed_shards;
+
+        let started_at = self.started_at.or_else(|| match &self.state {
+            TaskState::Running { started_at, .. } => Some(*started_at),
+            _ => earliest_start,
+        });
+        if self.started_at.is_none() {
+            self.started_at = started_at;
+        }
+        let terminal_count = aggregate.completed_shards + aggregate.failed_shards;
+        if aggregate.total_shards > 0 && terminal_count == aggregate.total_shards {
+            let finished_at = latest_finish.unwrap_or(at);
+            let duration_ms = started_at
+                .map(|start| {
+                    finished_at
+                        .signed_duration_since(start)
+                        .num_milliseconds()
+                        .max(0) as u64
+                })
+                .unwrap_or_default();
+            aggregate.elapsed_ms = duration_ms;
+            if aggregate.failed_shards > 0 {
+                self.state = TaskState::Failed {
+                    error: format!(
+                        "{} of {} shards failed",
+                        aggregate.failed_shards, aggregate.total_shards
+                    ),
+                    failed_at: finished_at,
+                };
+            } else {
+                self.state = TaskState::Completed {
+                    finished_at,
+                    stats: TaskStats {
+                        docs_processed: aggregate.docs_processed,
+                        bytes_processed: aggregate.bytes_processed,
+                        duration_ms,
+                    },
+                };
+            }
+        } else if !matches!(
+            self.state,
+            TaskState::Pausing | TaskState::Paused | TaskState::Canceling
+        ) {
+            if aggregate.running_shards > 0
+                || aggregate.completed_shards > 0
+                || aggregate.failed_shards > 0
+            {
+                let started_at = started_at.unwrap_or_else(|| self.created_at.into());
+                self.state = TaskState::Running {
+                    started_at,
+                    shard_count: aggregate.total_shards,
+                };
+            } else {
+                self.state = TaskState::Pending;
+            }
+        }
+        if aggregate.total_shards > 0 {
+            let elapsed = if self.is_terminal() {
+                match &self.state {
+                    TaskState::Completed { stats, .. } => stats.duration_ms,
+                    TaskState::Failed { failed_at, .. } => started_at
+                        .map(|start| {
+                            failed_at
+                                .signed_duration_since(start)
+                                .num_milliseconds()
+                                .max(0) as u64
+                        })
+                        .unwrap_or_default(),
+                    _ => 0,
+                }
+            } else {
+                let start = started_at.unwrap_or_else(|| self.created_at.into());
+                at.signed_duration_since(start).num_milliseconds().max(0) as u64
+            };
+            aggregate.elapsed_ms = elapsed;
+            aggregate.throughput_docs_per_sec = if elapsed > 0 {
+                aggregate.docs_processed as f64 * 1_000.0 / elapsed as f64
+            } else {
+                0.0
+            };
+            aggregate.throughput_bytes_per_sec = if elapsed > 0 {
+                aggregate.bytes_processed as f64 * 1_000.0 / elapsed as f64
+            } else {
+                0.0
+            };
+        }
+        self.aggregate = aggregate;
+        self.updated_at = std::time::UNIX_EPOCH
+            + std::time::Duration::from_millis(at.timestamp_millis().max(0) as u64);
     }
 
     /// Calculate task progress (0.0 to 1.0)

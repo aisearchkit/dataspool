@@ -99,3 +99,13 @@ The Elasticsearch `DocumentSink` enforces destination fencing with Bulk API `ver
 On restart, interrupted shards remain `Running` until their lease expires. A new committed claim then increments the fencing token and preserves the last committed source offset. Set a stable, non-empty `node.id` across restarts; an empty ID falls back to a hostname-derived ID.
 
 On SIGINT or SIGTERM, the HTTP server stops accepting new requests and drains active requests. The worker pool stops claiming shards, lets in-flight destination writes and checkpoint acknowledgements finish, closes drivers, and waits for workers to exit. Configure the service manager's termination grace period longer than the maximum expected sink write/flush duration; a forced kill can still interrupt an in-flight operation.
+
+## Distributed task aggregation and recovery
+
+The replicated shard record is the source of truth for task progress. Every committed shard claim, checkpoint, completion, failure, lease release, and node-offline requeue refreshes the task aggregate in the same application-store batch as the corresponding shard mutation. The aggregate includes pending/running/completed/failed counts, records and serialized record bytes, elapsed time, document/byte throughput, per-node contributions, and each shard's last committed offset/fencing generation.
+
+Read a task with a fresh projection through TaskStore::get_task_with_aggregate; the cached TaskMeta.aggregate is also persisted for efficient consumers. TaskStore::rebuild_task_aggregates reconstructs it from shard records after startup or snapshot installation. Do not use task counters as an independent source of truth or increment them from worker-local events.
+
+A shard's last owner is retained in ShardMeta.last_owner_node_id, so completed/failed work remains attributable after its lease is cleared. A later claim transfers current shard attribution to the new owner; the shard checkpoint and total processed counters remain intact.
+
+The Raft recovery integration test exercises a three-member cluster: it isolates a follower from inbound Raft traffic, commits additional task state on the remaining quorum, creates and purges a snapshot, reconnects the follower and verifies snapshot catch-up, then shuts down the leader and verifies that the surviving quorum elects a replacement leader and commits new work. Duplicate completion and failure proposals are checked for idempotency. Snapshot restoration also rebuilds the aggregate from committed shard metadata rather than trusting the serialized projection.

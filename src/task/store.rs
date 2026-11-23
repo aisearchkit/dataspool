@@ -77,23 +77,6 @@ impl<S: KvStore> TaskStore<S> {
             .collect()
     }
 
-    /// Atomically publish a node status transition and all shard requeues caused by it.
-    pub(crate) async fn save_node_and_shards(
-        &self,
-        node: &crate::types::NodeMeta,
-        shards: &[ShardMeta],
-    ) -> Result<()> {
-        let mut batch = crate::storage::WriteBatch::new();
-        let node_key = format!("node:{}", node.node_id);
-        batch.put_cf(cf::META, node_key, serde_json::to_vec(node)?);
-        for shard in shards {
-            let shard_key = format!("shard:{}", shard.shard_id);
-            batch.put_cf(cf::META, shard_key, serde_json::to_vec(shard)?);
-        }
-        self.store.write_batch(batch).await?;
-        Ok(())
-    }
-
     /// Save task metadata
     pub async fn save_task(&self, task: &TaskMeta) -> Result<()> {
         let key = format!("task:{}", task.task_id);
@@ -127,10 +110,102 @@ impl<S: KvStore> TaskStore<S> {
         Ok(tasks)
     }
 
+    /// Rebuild every persisted task aggregate from the committed shard records.
+    pub async fn rebuild_task_aggregates(&self) -> Result<usize> {
+        let mut rebuilt = Vec::new();
+        for mut task in self.list_tasks().await? {
+            let shards = self.list_task_shards(&task.task_id).await?;
+            let at = shards
+                .iter()
+                .map(|shard| shard.updated_at)
+                .max()
+                .map(chrono::DateTime::<chrono::Utc>::from)
+                .unwrap_or_else(|| chrono::DateTime::<chrono::Utc>::from(task.updated_at));
+            task.refresh_from_shards(&shards, at);
+            rebuilt.push(task);
+        }
+        if rebuilt.is_empty() {
+            return Ok(0);
+        }
+        let mut batch = crate::storage::WriteBatch::new();
+        for task in &rebuilt {
+            batch.put_cf(
+                cf::META,
+                format!("task:{}", task.task_id),
+                serde_json::to_vec(task)?,
+            );
+        }
+        self.store.write_batch(batch).await?;
+        Ok(rebuilt.len())
+    }
+
+    /// Read a task together with a freshly computed aggregate, without trusting a cached view.
+    pub async fn get_task_with_aggregate(&self, task_id: &TaskId) -> Result<Option<TaskMeta>> {
+        let Some(mut task) = self.get_task(task_id).await? else {
+            return Ok(None);
+        };
+        let shards = self.list_task_shards(task_id).await?;
+        task.refresh_from_shards(&shards, chrono::Utc::now());
+        Ok(Some(task))
+    }
+
     /// Delete task metadata
     pub async fn delete_task(&self, task_id: &TaskId) -> Result<()> {
         let key = format!("task:{}", task_id);
         self.store.delete_cf(cf::META, key.as_bytes()).await?;
+        Ok(())
+    }
+
+    /// Atomically persist a shard mutation and its task-level aggregate.
+    pub(crate) async fn save_shard_and_task(
+        &self,
+        shard: &ShardMeta,
+        task: &TaskMeta,
+    ) -> Result<()> {
+        let shard_key = format!("shard:{}", shard.shard_id);
+        let task_shard_key = format!("task_shard:{}:{}", shard.task_id, shard.shard_id);
+        let task_key = format!("task:{}", task.task_id);
+        let mut batch = crate::storage::WriteBatch::new();
+        batch.put_cf(cf::META, shard_key, serde_json::to_vec(shard)?);
+        batch.put_cf(cf::META, task_shard_key, bytes::Bytes::new());
+        batch.put_cf(cf::META, task_key, serde_json::to_vec(task)?);
+        self.store.write_batch(batch).await?;
+        Ok(())
+    }
+
+    /// Atomically persist a node transition, affected shards, and rebuilt task aggregates.
+    pub(crate) async fn save_node_shards_tasks(
+        &self,
+        node: &crate::types::NodeMeta,
+        shards: &[ShardMeta],
+        tasks: &[TaskMeta],
+    ) -> Result<()> {
+        let mut batch = crate::storage::WriteBatch::new();
+        batch.put_cf(
+            cf::META,
+            format!("node:{}", node.node_id),
+            serde_json::to_vec(node)?,
+        );
+        for shard in shards {
+            batch.put_cf(
+                cf::META,
+                format!("shard:{}", shard.shard_id),
+                serde_json::to_vec(shard)?,
+            );
+            batch.put_cf(
+                cf::META,
+                format!("task_shard:{}:{}", shard.task_id, shard.shard_id),
+                bytes::Bytes::new(),
+            );
+        }
+        for task in tasks {
+            batch.put_cf(
+                cf::META,
+                format!("task:{}", task.task_id),
+                serde_json::to_vec(task)?,
+            );
+        }
+        self.store.write_batch(batch).await?;
         Ok(())
     }
 
@@ -531,6 +606,46 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(completed_shards.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn snapshot_restore_rebuilds_task_aggregate_from_committed_shards() {
+        let (source, _source_temp) = create_test_store().await;
+        let task = TaskMeta::new("aggregate-restore".into(), "{}".into(), "{}".into());
+        let task_id = task.task_id;
+        source.save_task(&task).await.unwrap();
+
+        let mut shard = ShardMeta::new(task_id, 0, "{}".into());
+        shard.last_owner_node_id = Some(crate::types::NodeId::new("worker-recovered"));
+        shard.records_processed = 17;
+        shard.bytes_processed = 4096;
+        shard.offset = crate::pipeline::OffsetValue::DocumentCount(17);
+        shard.complete_at(17, chrono::Utc::now());
+        let shard_id = shard.shard_id;
+        source.save_shard(&shard).await.unwrap();
+
+        // Simulate an older/incomplete cached aggregate in a snapshot. Shard
+        // records remain authoritative and the restored member must rebuild it.
+        let snapshot = source.export_snapshot().await.unwrap();
+        let (restored, _restored_temp) = create_test_store().await;
+        restored.replace_snapshot(snapshot).await.unwrap();
+        assert_eq!(restored.rebuild_task_aggregates().await.unwrap(), 1);
+
+        let task = restored
+            .get_task_with_aggregate(&task_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(task.aggregate.total_shards, 1);
+        assert_eq!(task.aggregate.completed_shards, 1);
+        assert_eq!(task.aggregate.docs_processed, 17);
+        assert_eq!(task.aggregate.bytes_processed, 4096);
+        assert_eq!(task.aggregate.checkpoints[0].shard_id, shard_id);
+        assert_eq!(task.aggregate.nodes["worker-recovered"].completed_shards, 1);
+        assert!(matches!(
+            task.state,
+            crate::types::TaskState::Completed { .. }
+        ));
     }
 
     #[tokio::test]

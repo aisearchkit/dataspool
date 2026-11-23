@@ -106,6 +106,7 @@ pub enum Command {
         fencing_token: u64,
         issued_at_ms: i64,
         processed_records: u64,
+        processed_bytes: u64,
         offset: String, // JSON-serialized OffsetValue
     },
 

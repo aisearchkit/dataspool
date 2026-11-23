@@ -362,6 +362,38 @@ impl RaftNode {
         self.raft.current_leader().await.map(|id| id.to_string())
     }
 
+    /// Force a state-machine snapshot and purge the covered log prefix.
+    pub async fn trigger_snapshot_and_purge(&self) -> Result<()> {
+        let previous_snapshot = self.raft.metrics().borrow().snapshot;
+        self.raft
+            .trigger()
+            .snapshot()
+            .await
+            .map_err(|e| DatspoolError::Raft(crate::error::RaftError::Storage(e.to_string())))?;
+        let snapshot_index = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                if let Some(snapshot) = self.raft.metrics().borrow().snapshot
+                    && Some(snapshot) != previous_snapshot
+                {
+                    return snapshot.index;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .map_err(|_| {
+            DatspoolError::Raft(crate::error::RaftError::Storage(
+                "Timed out waiting for Raft snapshot creation".into(),
+            ))
+        })?;
+        self.raft
+            .trigger()
+            .purge_log(snapshot_index)
+            .await
+            .map_err(|e| DatspoolError::Raft(crate::error::RaftError::Storage(e.to_string())))?;
+        Ok(())
+    }
+
     pub async fn shutdown(&self) -> Result<()> {
         self.raft
             .shutdown()
@@ -606,11 +638,35 @@ mod cluster_tests {
                 fencing_token: first_token,
                 issued_at_ms: now,
                 processed_records: 1,
+                processed_bytes: 128,
                 offset: serde_json::to_string(&OffsetValue::DocumentCount(1)).unwrap(),
             })
             .await
             .unwrap();
         assert!(progress.success, "{}", progress.message);
+        // Every Raft member must expose the same aggregate, checkpoint, byte count,
+        // and per-node contribution after the committed progress entry.
+        for store in &stores {
+            let task = TaskStore::new(store.clone())
+                .get_task_with_aggregate(&task_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(task.aggregate.total_shards, 1);
+            assert_eq!(task.aggregate.running_shards, 1);
+            assert_eq!(task.aggregate.docs_processed, 1);
+            assert_eq!(task.aggregate.bytes_processed, 128);
+            assert_eq!(task.aggregate.checkpoints.len(), 1);
+            assert_eq!(
+                task.aggregate.checkpoints[0].offset,
+                OffsetValue::DocumentCount(1)
+            );
+            let worker = task.aggregate.nodes.get("worker-a").unwrap();
+            assert_eq!(worker.running_shards, 1);
+            assert_eq!(worker.docs_processed, 1);
+            assert_eq!(worker.bytes_processed, 128);
+        }
+
         let ack_command = Command::AckCacheBatch {
             shard_id: shard_id.to_string(),
             node_id: "worker-a".into(),
@@ -666,6 +722,40 @@ mod cluster_tests {
         assert!(second.success, "{}", second.message);
         let second_token = second.data.unwrap()["fencing_token"].as_u64().unwrap();
         assert!(second_token > first_token);
+        let complete_command = Command::CompleteShard {
+            shard_id: shard_id.to_string(),
+            node_id: "worker-b".into(),
+            fencing_token: second_token,
+            issued_at_ms: takeover_at + 2_000,
+            total_records: 1,
+        };
+        let completed = worker_node.propose(complete_command.clone()).await.unwrap();
+        assert!(completed.success, "{}", completed.message);
+        let duplicate_completion = worker_node.propose(complete_command.clone()).await.unwrap();
+        assert!(
+            duplicate_completion.success,
+            "duplicate completion must be idempotent"
+        );
+        for store in &stores {
+            let task = TaskStore::new(store.clone())
+                .get_task_with_aggregate(&task_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(task.aggregate.completed_shards, 1);
+            assert_eq!(task.aggregate.failed_shards, 0);
+            assert_eq!(task.completed_shards, 1);
+            assert_eq!(task.aggregate.docs_processed, 1);
+            assert!(matches!(
+                task.state,
+                crate::types::TaskState::Completed { .. }
+            ));
+            assert_eq!(
+                task.aggregate.nodes.get("worker-b").unwrap().docs_processed,
+                1
+            );
+        }
+
         let late_ack = worker_node.propose(ack_command).await.unwrap();
         assert!(
             late_ack.success,
@@ -713,8 +803,105 @@ mod cluster_tests {
             );
         }
 
-        for node in &nodes {
-            node.shutdown().await.unwrap();
+        // Partition one follower from inbound Raft traffic while the two-node
+        // quorum continues committing state. Force a snapshot and purge its log
+        // prefix so the returning follower must recover from the snapshot.
+        let isolated_index = (leader_index + 2) % nodes.len();
+        server_tasks[isolated_index].abort();
+        let recovery_task = TaskMeta::new("snapshot-recovery".into(), "{}".into(), "{}".into());
+        let recovery_task_id = recovery_task.task_id;
+        let recovery_shard = ShardMeta::new(recovery_task_id, 0, "{}".into());
+        let recovery_created = worker_node
+            .propose(Command::CreateTask {
+                task: Box::new(recovery_task),
+                shards: vec![recovery_shard],
+            })
+            .await
+            .unwrap();
+        assert!(recovery_created.success, "{}", recovery_created.message);
+        nodes[leader_index]
+            .trigger_snapshot_and_purge()
+            .await
+            .unwrap();
+
+        let listener = tokio::net::TcpListener::bind(&addresses[isolated_index])
+            .await
+            .unwrap();
+        let router = super::super::network::router(nodes[isolated_index].handle(), token.clone());
+        server_tasks[isolated_index] = tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                if TaskStore::new(stores[isolated_index].clone())
+                    .get_task_with_aggregate(&recovery_task_id)
+                    .await
+                    .unwrap()
+                    .is_some_and(|task| task.aggregate.total_shards == 1)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("partitioned follower did not recover task state from snapshot");
+
+        // Crash the leader. The remaining quorum must elect a new leader and
+        // accept writes through a follower client without losing committed state.
+        server_tasks[leader_index].abort();
+        nodes[leader_index].shutdown().await.unwrap();
+        let new_leader_index = tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                for (index, node) in nodes.iter().enumerate() {
+                    if index != leader_index && node.is_leader().await {
+                        return index;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("cluster did not elect a replacement leader after leader shutdown");
+        assert_ne!(new_leader_index, leader_index);
+
+        let after_failover =
+            TaskMeta::new("leader-failover-write".into(), "{}".into(), "{}".into());
+        let after_failover_id = after_failover.task_id;
+        let after_failover_shard = ShardMeta::new(after_failover_id, 0, "{}".into());
+        let failover_created = nodes[new_leader_index]
+            .propose(Command::CreateTask {
+                task: Box::new(after_failover),
+                shards: vec![after_failover_shard],
+            })
+            .await
+            .unwrap();
+        assert!(failover_created.success, "{}", failover_created.message);
+        for index in 0..nodes.len() {
+            if index == leader_index {
+                continue;
+            }
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    if TaskStore::new(stores[index].clone())
+                        .get_task(&after_failover_id)
+                        .await
+                        .unwrap()
+                        .is_some()
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            })
+            .await
+            .expect("post-failover task did not replicate to surviving members");
+        }
+
+        for (index, node) in nodes.iter().enumerate() {
+            if index != leader_index {
+                node.shutdown().await.unwrap();
+            }
         }
         for server in server_tasks {
             server.abort();

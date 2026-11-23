@@ -165,6 +165,7 @@ impl<S: KvStore + Clone> MetaStateMachine<S> {
                 fencing_token,
                 issued_at_ms,
                 processed_records,
+                processed_bytes,
                 offset,
             } => {
                 self.apply_progress(
@@ -173,6 +174,7 @@ impl<S: KvStore + Clone> MetaStateMachine<S> {
                     fencing_token,
                     issued_at_ms,
                     processed_records,
+                    processed_bytes,
                     offset,
                 )
                 .await
@@ -319,18 +321,26 @@ impl<S: KvStore + Clone> MetaStateMachine<S> {
         let at = chrono::DateTime::from_timestamp_millis(issued_at_ms)
             .ok_or_else(|| DatspoolError::Serialization("Invalid node-offline timestamp".into()))?;
         let mut requeued_shards = Vec::new();
-        for task in self.task_store.list_tasks().await? {
-            for mut shard in self.task_store.list_task_shards(&task.task_id).await? {
+        let mut affected_tasks = Vec::new();
+        for mut task in self.task_store.list_tasks().await? {
+            let mut shards = self.task_store.list_task_shards(&task.task_id).await?;
+            let mut changed = false;
+            for shard in &mut shards {
                 let owned = matches!(&shard.state, ShardState::Running { node_id: owner, .. } if owner == &id);
                 if owned {
                     shard.set_state_at(ShardState::Pending, at);
-                    requeued_shards.push(shard);
+                    requeued_shards.push(shard.clone());
+                    changed = true;
                 }
+            }
+            if changed {
+                task.refresh_from_shards(&shards, at);
+                affected_tasks.push(task);
             }
         }
         let requeued = requeued_shards.len();
         self.task_store
-            .save_node_and_shards(&node, &requeued_shards)
+            .save_node_shards_tasks(&node, &requeued_shards, &affected_tasks)
             .await?;
         Ok(accepted(
             "Node marked offline; owned shards atomically returned to pending",
@@ -338,9 +348,44 @@ impl<S: KvStore + Clone> MetaStateMachine<S> {
         ))
     }
 
+    async fn persist_shard_and_aggregate(&self, shard: &ShardMeta) -> Result<()> {
+        let mut task = self
+            .task_store
+            .get_task(&shard.task_id)
+            .await?
+            .ok_or_else(|| {
+                DatspoolError::Internal(format!(
+                    "Task {} missing for shard {}",
+                    shard.task_id, shard.shard_id
+                ))
+            })?;
+        let mut shards = self.task_store.list_task_shards(&shard.task_id).await?;
+        if let Some(existing) = shards
+            .iter_mut()
+            .find(|existing| existing.shard_id == shard.shard_id)
+        {
+            *existing = shard.clone();
+        } else {
+            shards.push(shard.clone());
+        }
+        task.refresh_from_shards(
+            &shards,
+            chrono::DateTime::from_timestamp_millis(
+                shard
+                    .updated_at
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis()
+                    .min(i64::MAX as u128) as i64,
+            )
+            .unwrap_or_else(chrono::Utc::now),
+        );
+        self.task_store.save_shard_and_task(shard, &task).await
+    }
+
     async fn apply_create_task(
         &self,
-        task: crate::task::TaskMeta,
+        mut task: crate::task::TaskMeta,
         shards: Vec<ShardMeta>,
     ) -> Result<CommandResponse> {
         let task_id = task.task_id;
@@ -362,13 +407,15 @@ impl<S: KvStore + Clone> MetaStateMachine<S> {
                         && existing.lease_id.is_none()
                         && matches!(&shard.state, ShardState::Pending) =>
                 {
-                    // The bootstrap command carries the normalized timestamp/state;
-                    // never consult local wall clocks while applying a replicated log.
                     self.task_store.save_shard(shard).await?;
                 }
                 Some(_) => {}
             }
         }
+        let committed_shards = self.task_store.list_task_shards(&task_id).await?;
+        let aggregate_at = chrono::DateTime::<chrono::Utc>::from(task.updated_at);
+        task.refresh_from_shards(&committed_shards, aggregate_at);
+        self.task_store.save_task(&task).await?;
         Ok(accepted(
             "Task and shards created",
             serde_json::json!({"task_id": task_id, "shards": shards.len()}),
@@ -445,7 +492,7 @@ impl<S: KvStore + Clone> MetaStateMachine<S> {
             Some(token) => token,
             None => return Ok(rejected("Shard fencing token exhausted")),
         };
-        self.task_store.save_shard(&shard).await?;
+        self.persist_shard_and_aggregate(&shard).await?;
         Ok(accepted(
             "Shard claimed",
             serde_json::json!({
@@ -479,7 +526,7 @@ impl<S: KvStore + Clone> MetaStateMachine<S> {
             return Ok(rejected("Lease release rejected by fencing token"));
         }
         shard.set_state_at(ShardState::Pending, at);
-        self.task_store.save_shard(&shard).await?;
+        self.persist_shard_and_aggregate(&shard).await?;
         Ok(accepted(
             "Shard lease released",
             serde_json::json!({"fencing_token": fencing_token}),
@@ -766,6 +813,7 @@ impl<S: KvStore + Clone> MetaStateMachine<S> {
         fencing_token: u64,
         issued_at_ms: i64,
         processed_records: u64,
+        processed_bytes: u64,
         offset: String,
     ) -> Result<CommandResponse> {
         let shard_id = parse_shard_id(&shard_id)?;
@@ -786,8 +834,8 @@ impl<S: KvStore + Clone> MetaStateMachine<S> {
             .map_err(|e| DatspoolError::Serialization(e.to_string()))?;
         let at = chrono::DateTime::from_timestamp_millis(issued_at_ms)
             .ok_or_else(|| DatspoolError::Serialization("Invalid progress timestamp".into()))?;
-        shard.set_progress_at(processed_records, offset, at);
-        self.task_store.save_shard(&shard).await?;
+        shard.set_progress_at(processed_records, processed_bytes, offset, at);
+        self.persist_shard_and_aggregate(&shard).await?;
         Ok(accepted(
             "Shard progress updated",
             serde_json::json!({"fencing_token": fencing_token}),
@@ -827,7 +875,7 @@ impl<S: KvStore + Clone> MetaStateMachine<S> {
         let at = chrono::DateTime::from_timestamp_millis(issued_at_ms)
             .ok_or_else(|| DatspoolError::Serialization("Invalid completion timestamp".into()))?;
         shard.complete_at(total_records, at);
-        self.task_store.save_shard(&shard).await?;
+        self.persist_shard_and_aggregate(&shard).await?;
         Ok(accepted(
             "Shard completed",
             serde_json::json!({"fencing_token": fencing_token}),
@@ -866,7 +914,7 @@ impl<S: KvStore + Clone> MetaStateMachine<S> {
         let at = chrono::DateTime::from_timestamp_millis(issued_at_ms)
             .ok_or_else(|| DatspoolError::Serialization("Invalid failure timestamp".into()))?;
         shard.fail_at(error_message, 1, at);
-        self.task_store.save_shard(&shard).await?;
+        self.persist_shard_and_aggregate(&shard).await?;
         Ok(accepted(
             "Shard marked failed",
             serde_json::json!({"fencing_token": fencing_token}),
@@ -1127,6 +1175,115 @@ mod tests {
             .await
             .unwrap();
         assert!(!stale_renewal.success);
+    }
+
+    #[tokio::test]
+    async fn task_aggregate_tracks_progress_completion_failure_and_node_contributions() {
+        let dir = tempdir().unwrap();
+        let db = RocksDbStore::open(dir.path()).unwrap();
+        let store = TaskStore::new(db);
+        let task = TaskMeta::new("distributed-aggregate".into(), "{}".into(), "{}".into());
+        let task_id = task.task_id;
+        let shard_a = ShardMeta::new(task_id, 0, "{}".into());
+        let shard_b = ShardMeta::new(task_id, 1, "{}".into());
+        let shard_a_id = shard_a.shard_id;
+        let shard_b_id = shard_b.shard_id;
+        let mut sm = MetaStateMachine::new(store.kv_store().clone());
+        let now = chrono::Utc::now().timestamp_millis();
+
+        let created = sm
+            .apply_command(Command::CreateTask {
+                task: Box::new(task),
+                shards: vec![shard_a, shard_b],
+            })
+            .await
+            .unwrap();
+        assert!(created.success);
+
+        for (shard_id, node_id) in [(&shard_a_id, "worker-a"), (&shard_b_id, "worker-b")] {
+            let claim = sm
+                .apply_command(Command::ClaimShard {
+                    shard_id: shard_id.to_string(),
+                    node_id: node_id.into(),
+                    claim_id: format!("claim-{node_id}"),
+                    issued_at_ms: now,
+                    lease_expires_at_ms: now + 60_000,
+                })
+                .await
+                .unwrap();
+            assert!(claim.success, "{}", claim.message);
+        }
+
+        let progress = sm
+            .apply_command(Command::UpdateShardProgress {
+                shard_id: shard_a_id.to_string(),
+                node_id: "worker-a".into(),
+                fencing_token: crate::task::shard::FENCING_TOKEN_BASE + 1,
+                issued_at_ms: now + 1,
+                processed_records: 10,
+                processed_bytes: 2048,
+                offset: serde_json::to_string(&crate::pipeline::OffsetValue::DocumentCount(10))
+                    .unwrap(),
+            })
+            .await
+            .unwrap();
+        assert!(progress.success);
+
+        let completed = sm
+            .apply_command(Command::CompleteShard {
+                shard_id: shard_a_id.to_string(),
+                node_id: "worker-a".into(),
+                fencing_token: crate::task::shard::FENCING_TOKEN_BASE + 1,
+                issued_at_ms: now + 2,
+                total_records: 10,
+            })
+            .await
+            .unwrap();
+        assert!(completed.success);
+
+        let failed_command = Command::FailShard {
+            shard_id: shard_b_id.to_string(),
+            node_id: "worker-b".into(),
+            fencing_token: crate::task::shard::FENCING_TOKEN_BASE + 1,
+            issued_at_ms: now + 3,
+            error_message: "destination rejected records".into(),
+        };
+        let failed = sm.apply_command(failed_command.clone()).await.unwrap();
+        assert!(failed.success);
+        assert!(sm.apply_command(failed_command).await.unwrap().success);
+
+        let aggregate = store
+            .get_task_with_aggregate(&task_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(aggregate.aggregate.total_shards, 2);
+        assert_eq!(aggregate.aggregate.pending_shards, 0);
+        assert_eq!(aggregate.aggregate.running_shards, 0);
+        assert_eq!(aggregate.aggregate.completed_shards, 1);
+        assert_eq!(aggregate.aggregate.failed_shards, 1);
+        assert_eq!(aggregate.completed_shards, 1);
+        assert_eq!(aggregate.failed_shards, 1);
+        assert_eq!(aggregate.aggregate.docs_processed, 10);
+        assert_eq!(aggregate.aggregate.bytes_processed, 2048);
+        assert!(aggregate.aggregate.throughput_docs_per_sec > 0.0);
+        assert!(aggregate.aggregate.throughput_bytes_per_sec > 0.0);
+        assert!(aggregate.aggregate.elapsed_ms > 0);
+        let duration_ms = aggregate.aggregate.elapsed_ms;
+        let rebuilt = store
+            .get_task_with_aggregate(&task_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(rebuilt.aggregate.elapsed_ms, duration_ms);
+        assert_eq!(aggregate.aggregate.nodes["worker-a"].completed_shards, 1);
+        assert_eq!(aggregate.aggregate.nodes["worker-a"].docs_processed, 10);
+        assert_eq!(aggregate.aggregate.nodes["worker-b"].failed_shards, 1);
+        assert_eq!(aggregate.aggregate.checkpoints.len(), 2);
+        assert!(matches!(
+            aggregate.state,
+            crate::types::TaskState::Failed { .. }
+        ));
     }
 
     #[tokio::test]
