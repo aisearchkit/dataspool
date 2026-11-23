@@ -74,8 +74,15 @@ impl<S: KvStore> LocalBatchCache<S> {
     }
 
     fn namespace_prefix(prefix: &str, shard_id: &str) -> Vec<u8> {
-        let safe_namespace: String = shard_id.chars()
-            .map(|c| if c.is_ascii_alphanumeric() || "-_".contains(c) { c } else { '_' })
+        let safe_namespace: String = shard_id
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || "-_".contains(c) {
+                    c
+                } else {
+                    '_'
+                }
+            })
             .collect();
         format!("{prefix}/{safe_namespace}/").into_bytes()
     }
@@ -90,7 +97,8 @@ impl<S: KvStore> LocalBatchCache<S> {
         let pending = self.pending().await?;
         if pending >= self.max_entries {
             return Err(DatspoolError::Internal(format!(
-                "local migration cache is full ({pending} entries; limit {})", self.max_entries
+                "local migration cache is full ({pending} entries; limit {})",
+                self.max_entries
             )));
         }
         Ok(())
@@ -122,7 +130,8 @@ impl<S: KvStore> LocalBatchCache<S> {
             .as_nanos();
         let seq = SEQUENCE.fetch_add(1, Ordering::Relaxed);
         let batch_id = format!("{:032x}-{:016x}", now, seq);
-        self.enqueue_with_id(&batch_id, batch, next_offset, source_count).await
+        self.enqueue_with_id(&batch_id, batch, next_offset, source_count)
+            .await
     }
 
     pub(crate) async fn enqueue_with_id(
@@ -134,8 +143,14 @@ impl<S: KvStore> LocalBatchCache<S> {
     ) -> Result<String> {
         self.ensure_capacity().await?;
         let key = [self.prefix.as_slice(), batch_id.as_bytes()].concat();
-        let entry = CacheEntry { records: batch.records().to_vec(), next_offset, source_count };
-        self.store.put_cf(cf::CACHE, &key, &serde_json::to_vec(&entry)?).await?;
+        let entry = CacheEntry {
+            records: batch.records().to_vec(),
+            next_offset,
+            source_count,
+        };
+        self.store
+            .put_cf(cf::CACHE, &key, &serde_json::to_vec(&entry)?)
+            .await?;
         Ok(String::from_utf8_lossy(&key).into_owned())
     }
 
@@ -157,10 +172,12 @@ impl<S: KvStore> LocalBatchCache<S> {
 
     pub(crate) async fn entries(&self) -> Result<Vec<(String, CacheEntry)>> {
         let rows = self.store.prefix_scan_cf(cf::CACHE, &self.prefix).await?;
-        rows.into_iter().map(|(key, value)| {
-            let entry = serde_json::from_slice(&value)?;
-            Ok((String::from_utf8_lossy(&key).into_owned(), entry))
-        }).collect()
+        rows.into_iter()
+            .map(|(key, value)| {
+                let entry = serde_json::from_slice(&value)?;
+                Ok((String::from_utf8_lossy(&key).into_owned(), entry))
+            })
+            .collect()
     }
 
     pub(crate) async fn peek_entry(&self) -> Result<Option<(String, CacheEntry)>> {
@@ -200,7 +217,8 @@ impl<S: KvStore> LocalBatchCache<S> {
         F: FnOnce(RecordBatch, Option<OffsetValue>, u64) -> Fut,
         Fut: std::future::Future<Output = Result<()>>,
     {
-        self.deliver_one_with_checkpoint_and_ack(deliver, |_| async { Ok(()) }).await
+        self.deliver_one_with_checkpoint_and_ack(deliver, |_| async { Ok(()) })
+            .await
     }
 
     pub async fn deliver_one_with_checkpoint_and_ack<F, Fut, A, AFut>(
@@ -214,7 +232,9 @@ impl<S: KvStore> LocalBatchCache<S> {
         A: FnOnce(String) -> AFut,
         AFut: std::future::Future<Output = Result<()>>,
     {
-        let Some((key, entry)) = self.peek_entry().await? else { return Ok(false) };
+        let Some((key, entry)) = self.peek_entry().await? else {
+            return Ok(false);
+        };
         deliver(entry.records.into(), entry.next_offset, entry.source_count).await?;
         // Replicate the acknowledgement before deleting the local cache copy.
         acknowledge(key.clone()).await?;

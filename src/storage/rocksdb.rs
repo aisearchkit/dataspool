@@ -235,7 +235,7 @@ impl KvStore for RocksDbStore {
         let db = self.db.clone();
         task::spawn_blocking(move || {
             db.flush_wal(true)
-                .map_err(|e| StorageError::WriteFailed(format!("WAL sync failed: {e}" )).into())
+                .map_err(|e| StorageError::WriteFailed(format!("WAL sync failed: {e}")).into())
         })
         .await
         .map_err(|e| StorageError::DatabaseError(format!("WAL sync task failed: {e}")))?

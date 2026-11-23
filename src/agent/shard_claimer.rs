@@ -5,9 +5,9 @@
 
 //! Shard claiming through committed Raft commands and monotonic lease generations.
 
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use tracing::{debug, info, warn};
 
 use crate::error::{DatspoolError, Result};
@@ -34,7 +34,9 @@ impl ShardLease {
     pub fn next_batch_id(&self) -> Result<String> {
         let sequence = self.batch_sequence.fetch_add(1, Ordering::SeqCst);
         if sequence >= 1_000_000 {
-            return Err(DatspoolError::Internal("Shard lease exceeded its one-million-batch fencing generation".into()));
+            return Err(DatspoolError::Internal(
+                "Shard lease exceeded its one-million-batch fencing generation".into(),
+            ));
         }
         Ok(format!("{:016x}-{:06x}", self.fencing_token, sequence))
     }
@@ -44,14 +46,26 @@ impl ShardLease {
     pub fn next_sink_version(&self) -> Result<i64> {
         let sequence = self.sink_sequence.fetch_add(1, Ordering::SeqCst);
         if sequence >= 1_000_000 {
-            return Err(DatspoolError::Internal("Shard lease exceeded its one-million-batch fencing version range".into()));
+            return Err(DatspoolError::Internal(
+                "Shard lease exceeded its one-million-batch fencing version range".into(),
+            ));
         }
-        let generation = self.fencing_token.saturating_sub(crate::task::shard::FENCING_TOKEN_BASE);
+        let generation = self
+            .fencing_token
+            .saturating_sub(crate::task::shard::FENCING_TOKEN_BASE);
         let version = crate::task::shard::FENCING_TOKEN_BASE
-            .checked_add(generation.checked_mul(1_000_000).ok_or_else(|| DatspoolError::Internal("Fencing version overflow".into()))?)
+            .checked_add(
+                generation
+                    .checked_mul(1_000_000)
+                    .ok_or_else(|| DatspoolError::Internal("Fencing version overflow".into()))?,
+            )
             .and_then(|base| base.checked_add(sequence))
             .and_then(|value| i64::try_from(value).ok())
-            .ok_or_else(|| DatspoolError::Internal("Fencing version exceeds Elasticsearch's signed version range".into()))?;
+            .ok_or_else(|| {
+                DatspoolError::Internal(
+                    "Fencing version exceeds Elasticsearch's signed version range".into(),
+                )
+            })?;
         Ok(version)
     }
 }
@@ -89,7 +103,9 @@ impl<S: KvStore + Clone + 'static> ShardClaimer<S> {
 
     pub fn with_lease_seconds(mut self, lease_seconds: i64) -> Result<Self> {
         if lease_seconds < 3 {
-            return Err(DatspoolError::Configuration("Shard lease must be at least 3 seconds".into()));
+            return Err(DatspoolError::Configuration(
+                "Shard lease must be at least 3 seconds".into(),
+            ));
         }
         self.lease_seconds = lease_seconds;
         Ok(self)
@@ -103,12 +119,21 @@ impl<S: KvStore + Clone + 'static> ShardClaimer<S> {
             for shard in self.task_store.list_task_shards(&task.task_id).await? {
                 let available = match &shard.state {
                     ShardState::Pending => true,
-                    ShardState::Running { started_at, .. } => shard.lease_expires_at.as_ref()
-                    .map(|deadline| deadline <= &now)
-                    .unwrap_or_else(|| started_at.timestamp_millis().saturating_add(DEFAULT_LEASE_SECONDS * 1_000) <= now.timestamp_millis()),
+                    ShardState::Running { started_at, .. } => shard
+                        .lease_expires_at
+                        .as_ref()
+                        .map(|deadline| deadline <= &now)
+                        .unwrap_or_else(|| {
+                            started_at
+                                .timestamp_millis()
+                                .saturating_add(DEFAULT_LEASE_SECONDS * 1_000)
+                                <= now.timestamp_millis()
+                        }),
                     _ => false,
                 };
-                if available { candidates.push(shard.shard_id); }
+                if available {
+                    candidates.push(shard.shard_id);
+                }
             }
         }
         if candidates.is_empty() {
@@ -129,14 +154,23 @@ impl<S: KvStore + Clone + 'static> ShardClaimer<S> {
                     issued_at_ms: issued_at.timestamp_millis(),
                     lease_expires_at_ms: expires_at.timestamp_millis(),
                 }),
-            ).await.map_err(|_| DatspoolError::Raft(crate::error::RaftError::ElectionTimeout))?;
+            )
+            .await
+            .map_err(|_| DatspoolError::Raft(crate::error::RaftError::ElectionTimeout))?;
             match response {
                 Ok(response) if response.success => {
-                    let fencing_token = response.data.as_ref()
+                    let fencing_token = response
+                        .data
+                        .as_ref()
                         .and_then(|data| data.get("fencing_token"))
                         .and_then(serde_json::Value::as_u64)
-                        .ok_or_else(|| DatspoolError::Internal("Raft claim response omitted fencing token".into()))?;
-                    self.wait_for_local_lease(&shard_id, fencing_token, expires_at).await?;
+                        .ok_or_else(|| {
+                            DatspoolError::Internal(
+                                "Raft claim response omitted fencing token".into(),
+                            )
+                        })?;
+                    self.wait_for_local_lease(&shard_id, fencing_token, expires_at)
+                        .await?;
                     info!(%shard_id, node_id = %self.node_id, fencing_token, "Shard lease committed by Raft");
                     return Ok(Some(ShardLease {
                         shard_id,
@@ -170,9 +204,12 @@ impl<S: KvStore + Clone + 'static> ShardClaimer<S> {
                 issued_at_ms: issued_at.timestamp_millis(),
                 lease_expires_at_ms: expires_at.timestamp_millis(),
             }),
-        ).await.map_err(|_| DatspoolError::Raft(crate::error::RaftError::ElectionTimeout))??;
+        )
+        .await
+        .map_err(|_| DatspoolError::Raft(crate::error::RaftError::ElectionTimeout))??;
         if response.success {
-            self.wait_for_local_lease(&lease.shard_id, lease.fencing_token, expires_at).await?;
+            self.wait_for_local_lease(&lease.shard_id, lease.fencing_token, expires_at)
+                .await?;
             lease.expires_at = expires_at;
             Ok(true)
         } else {
@@ -211,7 +248,6 @@ mod tests {
     use super::*;
     use crate::storage::rocksdb::RocksDbStore;
     use tempfile::tempdir;
-
 
     #[test]
     fn sink_versions_increase_within_and_across_lease_generations() {

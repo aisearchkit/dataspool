@@ -54,7 +54,9 @@ pub trait KvStore: Send + Sync {
 
     /// Force all preceding writes to durable media. Consensus state machines
     /// call this before persisting their applied-log index.
-    async fn flush_durable(&self) -> Result<()> { Ok(()) }
+    async fn flush_durable(&self) -> Result<()> {
+        Ok(())
+    }
 
     /// Create iterator over all keys with given prefix
     async fn prefix_scan(&self, prefix: &[u8]) -> Result<Vec<(Bytes, Bytes)>>;

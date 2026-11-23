@@ -205,15 +205,30 @@ mod tests {
             (*task_store).clone(),
             crate::raft::default_raft_config(),
             "test-raft-auth-token-0123456789abcdef".to_string(),
-        ).await.unwrap();
-        raft.initialize(std::collections::BTreeMap::from([(1, openraft::BasicNode::new("127.0.0.1:0"))])).await.unwrap();
-        let index_store = Arc::new(RwLock::new(TieredIndexStore::new(TieredConfig::default(), Arc::new(db))));
-        let mut pool = WorkerPool::new("node-shutdown-test".to_string(), 1, task_store, index_store, Arc::new(raft)).unwrap();
+        )
+        .await
+        .unwrap();
+        raft.initialize(std::collections::BTreeMap::from([(
+            1,
+            openraft::BasicNode::new("127.0.0.1:0"),
+        )]))
+        .await
+        .unwrap();
+        let index_store = Arc::new(RwLock::new(TieredIndexStore::new(
+            TieredConfig::default(),
+            Arc::new(db),
+        )));
+        let mut pool = WorkerPool::new(
+            "node-shutdown-test".to_string(),
+            1,
+            task_store,
+            index_store,
+            Arc::new(raft),
+        )
+        .unwrap();
         let shutdown = CancellationToken::new();
         shutdown.cancel();
         pool.run_until_cancelled(shutdown).await.unwrap();
         assert_eq!(pool.get_usage().await.0, 0);
     }
-
-
 }

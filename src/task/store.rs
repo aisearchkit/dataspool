@@ -154,38 +154,62 @@ impl<S: KvStore> TaskStore<S> {
     ) -> Result<()> {
         let key = crate::pipeline::cache::LocalBatchCache::<S>::key_for_shard(shard_id, batch_id);
         let value = serde_json::to_vec(entry)?;
-        self.store.put_cf(crate::storage::cf::CACHE, &key, &value).await?;
+        self.store
+            .put_cf(crate::storage::cf::CACHE, &key, &value)
+            .await?;
         Ok(())
     }
 
     pub(crate) async fn cache_batch_count(&self, shard_id: &str) -> Result<usize> {
         let prefix = crate::pipeline::cache::LocalBatchCache::<S>::prefix_for_shard(shard_id);
-        Ok(self.store.prefix_scan_cf(crate::storage::cf::CACHE, &prefix).await?.len())
+        Ok(self
+            .store
+            .prefix_scan_cf(crate::storage::cf::CACHE, &prefix)
+            .await?
+            .len())
     }
 
     /// Return the oldest unacknowledged replicated batch key for FIFO enforcement.
     pub(crate) async fn first_cache_batch_key(&self, shard_id: &str) -> Result<Option<Vec<u8>>> {
         let prefix = crate::pipeline::cache::LocalBatchCache::<S>::prefix_for_shard(shard_id);
-        Ok(self.store.prefix_scan_cf(crate::storage::cf::CACHE, &prefix).await?
-            .into_iter().next().map(|(key, _)| key.to_vec()))
+        Ok(self
+            .store
+            .prefix_scan_cf(crate::storage::cf::CACHE, &prefix)
+            .await?
+            .into_iter()
+            .next()
+            .map(|(key, _)| key.to_vec()))
     }
 
     /// Highest acknowledged Raft batch ID for a shard. Batch IDs are fixed-width
     /// hexadecimal fencing-generation/sequence pairs, so lexical order is numeric.
     pub(crate) async fn cache_ack_watermark(&self, shard_id: &str) -> Result<Option<String>> {
         let key = format!("shard_cache_ack:{shard_id}");
-        self.store.get_cf(cf::META, key.as_bytes()).await?
-            .map(|value| String::from_utf8(value.to_vec())
-                .map_err(|e| crate::error::DatspoolError::Serialization(e.to_string())))
+        self.store
+            .get_cf(cf::META, key.as_bytes())
+            .await?
+            .map(|value| {
+                String::from_utf8(value.to_vec())
+                    .map_err(|e| crate::error::DatspoolError::Serialization(e.to_string()))
+            })
             .transpose()
     }
 
     /// Atomically remove a replicated batch and advance its per-shard ack watermark.
-    pub(crate) async fn ack_cache_batch(&self, shard_id: &str, batch_id: &str, key: &[u8]) -> Result<()> {
+    pub(crate) async fn ack_cache_batch(
+        &self,
+        shard_id: &str,
+        batch_id: &str,
+        key: &[u8],
+    ) -> Result<()> {
         let watermark_key = format!("shard_cache_ack:{shard_id}");
         let mut batch = crate::storage::WriteBatch::new();
         batch.delete_cf(crate::storage::cf::CACHE, key.to_vec());
-        batch.put_cf(cf::META, watermark_key, bytes::Bytes::copy_from_slice(batch_id.as_bytes()));
+        batch.put_cf(
+            cf::META,
+            watermark_key,
+            bytes::Bytes::copy_from_slice(batch_id.as_bytes()),
+        );
         self.store.write_batch(batch).await?;
         Ok(())
     }
@@ -211,11 +235,17 @@ impl<S: KvStore> TaskStore<S> {
     /// Whether the bootstrap member has imported legacy state and opened the
     /// replicated scheduler for workers on every cluster member.
     pub(crate) async fn bootstrap_complete(&self) -> Result<bool> {
-        Ok(self.store.get_cf(cf::META, b"system:bootstrap_complete").await?.is_some())
+        Ok(self
+            .store
+            .get_cf(cf::META, b"system:bootstrap_complete")
+            .await?
+            .is_some())
     }
 
     pub(crate) async fn mark_bootstrap_complete(&self) -> Result<()> {
-        self.store.put_cf(cf::META, b"system:bootstrap_complete", b"1").await?;
+        self.store
+            .put_cf(cf::META, b"system:bootstrap_complete", b"1")
+            .await?;
         Ok(())
     }
 
@@ -223,7 +253,10 @@ impl<S: KvStore> TaskStore<S> {
     /// into the replicated Raft cache.
     pub(crate) async fn clear_legacy_cache(&self) -> Result<usize> {
         let mut batch = crate::storage::WriteBatch::new();
-        let entries = self.store.prefix_scan_cf(crate::storage::cf::CACHE, b"migration-batch/").await?;
+        let entries = self
+            .store
+            .prefix_scan_cf(crate::storage::cf::CACHE, b"migration-batch/")
+            .await?;
         let count = entries.len();
         for (key, _) in entries {
             batch.delete_cf(crate::storage::cf::CACHE, key);
@@ -237,41 +270,84 @@ impl<S: KvStore> TaskStore<S> {
 
     /// Read the state-machine applied marker stored atomically with application data.
     pub(crate) async fn raft_applied_state(&self) -> Result<Option<Vec<u8>>> {
-        Ok(self.store.get_cf(cf::META, b"system:raft_applied_state").await?
+        Ok(self
+            .store
+            .get_cf(cf::META, b"system:raft_applied_state")
+            .await?
             .map(|value| value.to_vec()))
     }
 
     /// Persist the applied marker in the same RocksDB as replicated application data.
     pub(crate) async fn set_raft_applied_state(&self, value: &[u8]) -> Result<()> {
-        self.store.put_cf(cf::META, b"system:raft_applied_state", value).await?;
+        self.store
+            .put_cf(cf::META, b"system:raft_applied_state", value)
+            .await?;
         Ok(())
     }
 
     /// Export all shard/task state and durable migration queues for a Raft snapshot.
     pub async fn export_snapshot(&self) -> Result<TaskStoreSnapshot> {
-        let metadata = self.store.prefix_scan_cf(crate::storage::cf::META, b"").await?
-            .into_iter().map(|(k, v)| (k.to_vec(), v.to_vec())).collect();
-        let offsets = self.store.prefix_scan_cf(crate::storage::cf::OFFSET, b"").await?
-            .into_iter().map(|(k, v)| (k.to_vec(), v.to_vec())).collect();
-        let cache = self.store.prefix_scan_cf(crate::storage::cf::CACHE, b"").await?
-            .into_iter().map(|(k, v)| (k.to_vec(), v.to_vec())).collect();
-        let dead_letters = self.store.prefix_scan_cf(crate::storage::cf::DEAD_LETTER, b"").await?
-            .into_iter().map(|(k, v)| (k.to_vec(), v.to_vec())).collect();
-        Ok(TaskStoreSnapshot { metadata, offsets, cache, dead_letters })
+        let metadata = self
+            .store
+            .prefix_scan_cf(crate::storage::cf::META, b"")
+            .await?
+            .into_iter()
+            .map(|(k, v)| (k.to_vec(), v.to_vec()))
+            .collect();
+        let offsets = self
+            .store
+            .prefix_scan_cf(crate::storage::cf::OFFSET, b"")
+            .await?
+            .into_iter()
+            .map(|(k, v)| (k.to_vec(), v.to_vec()))
+            .collect();
+        let cache = self
+            .store
+            .prefix_scan_cf(crate::storage::cf::CACHE, b"")
+            .await?
+            .into_iter()
+            .map(|(k, v)| (k.to_vec(), v.to_vec()))
+            .collect();
+        let dead_letters = self
+            .store
+            .prefix_scan_cf(crate::storage::cf::DEAD_LETTER, b"")
+            .await?
+            .into_iter()
+            .map(|(k, v)| (k.to_vec(), v.to_vec()))
+            .collect();
+        Ok(TaskStoreSnapshot {
+            metadata,
+            offsets,
+            cache,
+            dead_letters,
+        })
     }
 
     /// Atomically replace replicated application data from an installed Raft snapshot.
     pub async fn replace_snapshot(&self, snapshot: TaskStoreSnapshot) -> Result<()> {
         let mut batch = crate::storage::WriteBatch::new();
-        for column_family in [crate::storage::cf::META, crate::storage::cf::OFFSET, crate::storage::cf::CACHE, crate::storage::cf::DEAD_LETTER] {
+        for column_family in [
+            crate::storage::cf::META,
+            crate::storage::cf::OFFSET,
+            crate::storage::cf::CACHE,
+            crate::storage::cf::DEAD_LETTER,
+        ] {
             for (key, _) in self.store.prefix_scan_cf(column_family, b"").await? {
                 batch.delete_cf(column_family, key);
             }
         }
-        for (key, value) in snapshot.metadata { batch.put_cf(crate::storage::cf::META, key, value); }
-        for (key, value) in snapshot.offsets { batch.put_cf(crate::storage::cf::OFFSET, key, value); }
-        for (key, value) in snapshot.cache { batch.put_cf(crate::storage::cf::CACHE, key, value); }
-        for (key, value) in snapshot.dead_letters { batch.put_cf(crate::storage::cf::DEAD_LETTER, key, value); }
+        for (key, value) in snapshot.metadata {
+            batch.put_cf(crate::storage::cf::META, key, value);
+        }
+        for (key, value) in snapshot.offsets {
+            batch.put_cf(crate::storage::cf::OFFSET, key, value);
+        }
+        for (key, value) in snapshot.cache {
+            batch.put_cf(crate::storage::cf::CACHE, key, value);
+        }
+        for (key, value) in snapshot.dead_letters {
+            batch.put_cf(crate::storage::cf::DEAD_LETTER, key, value);
+        }
         self.store.write_batch(batch).await?;
         self.store.flush_durable().await?;
         Ok(())
@@ -417,9 +493,12 @@ mod tests {
         store.kv_store().flush_durable().await.unwrap();
 
         let snapshot = store.export_snapshot().await.unwrap();
-        assert!(snapshot.metadata.iter().any(|(key, value)| {
-            key == b"system:raft_applied_state" && value == &marker
-        }));
+        assert!(
+            snapshot
+                .metadata
+                .iter()
+                .any(|(key, value)| { key == b"system:raft_applied_state" && value == &marker })
+        );
 
         let (restored, _restored_temp) = create_test_store().await;
         restored.replace_snapshot(snapshot).await.unwrap();

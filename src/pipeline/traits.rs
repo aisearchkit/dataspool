@@ -116,10 +116,15 @@ pub trait Sink: Send + Sync {
 
     /// Write a batch under a distributed shard fencing generation. Sinks must
     /// reject writes from older generations; unsupported sinks fail closed.
-    async fn write_batch_fenced(&mut self, _batch: RecordBatch, _fencing_version: i64) -> Result<WriteResult> {
-        Err(DatspoolError::Driver(DriverError::Unsupported(
-            format!("Sink '{}' does not implement distributed fencing", self.sink_type()),
-        )))
+    async fn write_batch_fenced(
+        &mut self,
+        _batch: RecordBatch,
+        _fencing_version: i64,
+    ) -> Result<WriteResult> {
+        Err(DatspoolError::Driver(DriverError::Unsupported(format!(
+            "Sink '{}' does not implement distributed fencing",
+            self.sink_type()
+        ))))
     }
 
     /// Flush any buffered data

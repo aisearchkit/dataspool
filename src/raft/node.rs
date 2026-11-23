@@ -12,9 +12,9 @@ use std::sync::Arc;
 use openraft::{BasicNode, Config};
 use tracing::{info, warn};
 
+use super::Command;
 use super::network::NetworkFactory;
 use super::storage::{self, RocksNodeId, TypeConfig};
-use super::Command;
 use crate::error::{DatspoolError, Result};
 use crate::storage::RocksDbStore;
 use crate::task::TaskStore;
@@ -36,21 +36,42 @@ impl RaftNode {
         config: Config,
         raft_token: String,
     ) -> Result<Self> {
-        let config = Arc::new(config.validate().map_err(|e| DatspoolError::Configuration(e.to_string()))?);
-        let (log_store, state_machine) = storage::new(raft_data_dir, task_store).await
-            .map_err(|e| DatspoolError::Raft(crate::error::RaftError::Storage(e)))?;
-        let raft = Raft::new(node_id, config, NetworkFactory::new(raft_token.clone()), log_store, state_machine)
+        let config = Arc::new(
+            config
+                .validate()
+                .map_err(|e| DatspoolError::Configuration(e.to_string()))?,
+        );
+        let (log_store, state_machine) = storage::new(raft_data_dir, task_store)
             .await
-            .map_err(|e| DatspoolError::Raft(crate::error::RaftError::Storage(e.to_string())))?;
-        Ok(Self { node_id, raft: Arc::new(raft), raft_token })
+            .map_err(|e| DatspoolError::Raft(crate::error::RaftError::Storage(e)))?;
+        let raft = Raft::new(
+            node_id,
+            config,
+            NetworkFactory::new(raft_token.clone()),
+            log_store,
+            state_machine,
+        )
+        .await
+        .map_err(|e| DatspoolError::Raft(crate::error::RaftError::Storage(e.to_string())))?;
+        Ok(Self {
+            node_id,
+            raft: Arc::new(raft),
+            raft_token,
+        })
     }
 
-    pub fn handle(&self) -> Arc<Raft> { self.raft.clone() }
+    pub fn handle(&self) -> Arc<Raft> {
+        self.raft.clone()
+    }
 
-    pub fn node_id(&self) -> RocksNodeId { self.node_id }
+    pub fn node_id(&self) -> RocksNodeId {
+        self.node_id
+    }
 
     pub async fn is_initialized(&self) -> Result<bool> {
-        self.raft.is_initialized().await
+        self.raft
+            .is_initialized()
+            .await
             .map_err(|e| DatspoolError::Raft(crate::error::RaftError::Storage(e.to_string())))
     }
 
@@ -65,12 +86,20 @@ impl RaftNode {
     }
 
     pub async fn initialize(&self, members: BTreeMap<RocksNodeId, BasicNode>) -> Result<()> {
-        if self.raft.is_initialized().await.map_err(|e| DatspoolError::Raft(crate::error::RaftError::Storage(e.to_string())))? {
+        if self
+            .raft
+            .is_initialized()
+            .await
+            .map_err(|e| DatspoolError::Raft(crate::error::RaftError::Storage(e.to_string())))?
+        {
             return Ok(());
         }
         match self.raft.initialize(members).await {
             Ok(()) => {
-                info!(node_id = self.node_id, "Initialized OpenRaft cluster membership");
+                info!(
+                    node_id = self.node_id,
+                    "Initialized OpenRaft cluster membership"
+                );
                 Ok(())
             }
             Err(error) => {
@@ -79,7 +108,9 @@ impl RaftNode {
                     warn!(node_id = self.node_id, %error, "Raft cluster was initialized concurrently");
                     Ok(())
                 } else {
-                    Err(DatspoolError::Raft(crate::error::RaftError::ProposalFailed(error.to_string())))
+                    Err(DatspoolError::Raft(
+                        crate::error::RaftError::ProposalFailed(error.to_string()),
+                    ))
                 }
             }
         }
@@ -93,12 +124,17 @@ impl RaftNode {
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
-        }).await.map_err(|_| DatspoolError::Raft(crate::error::RaftError::ElectionTimeout))
+        })
+        .await
+        .map_err(|_| DatspoolError::Raft(crate::error::RaftError::ElectionTimeout))
     }
 
     /// Replicate pre-Raft tasks and node-local pending batches from the
     /// deterministic bootstrap member, then publish a cluster-wide readiness barrier.
-    pub async fn bootstrap_local_state(&self, task_store: &TaskStore<RocksDbStore>) -> Result<usize> {
+    pub async fn bootstrap_local_state(
+        &self,
+        task_store: &TaskStore<RocksDbStore>,
+    ) -> Result<usize> {
         if task_store.bootstrap_complete().await? {
             task_store.clear_legacy_cache().await?;
             return Ok(0);
@@ -115,35 +151,50 @@ impl RaftNode {
                     shard.set_state_at(crate::types::ShardState::Pending, chrono::Utc::now());
                 }
             }
-            let response = self.propose(Command::CreateTask {
-                task: Box::new(task),
-                shards: shards.clone(),
-            }).await?;
+            let response = self
+                .propose(Command::CreateTask {
+                    task: Box::new(task),
+                    shards: shards.clone(),
+                })
+                .await?;
             if !response.success {
-                return Err(DatspoolError::Raft(crate::error::RaftError::ProposalFailed(response.message)));
+                return Err(DatspoolError::Raft(
+                    crate::error::RaftError::ProposalFailed(response.message),
+                ));
             }
             replicated_tasks += 1;
 
             for shard in shards {
                 let legacy_cache = crate::pipeline::LocalBatchCache::new_for_shard(
-                    Arc::new(task_store.kv_store().clone()), 128, &shard.shard_id.to_string(),
+                    Arc::new(task_store.kv_store().clone()),
+                    128,
+                    &shard.shard_id.to_string(),
                 );
-                for (sequence, (_legacy_key, entry)) in legacy_cache.entries().await?.into_iter().enumerate() {
+                for (sequence, (_legacy_key, entry)) in
+                    legacy_cache.entries().await?.into_iter().enumerate()
+                {
                     if sequence >= 1_000_000 {
-                        return Err(DatspoolError::Internal(format!("Too many legacy cache entries for shard {}", shard.shard_id)));
+                        return Err(DatspoolError::Internal(format!(
+                            "Too many legacy cache entries for shard {}",
+                            shard.shard_id
+                        )));
                     }
                     // Generation zero sorts before every lease-backed batch. Stable
                     // sequence IDs make a partially completed bootstrap resumable.
                     let batch_id = format!("{:016x}-{:06x}", 0, sequence);
-                    let response = self.propose(Command::ImportLegacyCache {
-                        shard_id: shard.shard_id.to_string(),
-                        batch_id,
-                        records: entry.records,
-                        next_offset: entry.next_offset,
-                        source_count: entry.source_count,
-                    }).await?;
+                    let response = self
+                        .propose(Command::ImportLegacyCache {
+                            shard_id: shard.shard_id.to_string(),
+                            batch_id,
+                            records: entry.records,
+                            next_offset: entry.next_offset,
+                            source_count: entry.source_count,
+                        })
+                        .await?;
                     if !response.success {
-                        return Err(DatspoolError::Raft(crate::error::RaftError::ProposalFailed(response.message)));
+                        return Err(DatspoolError::Raft(
+                            crate::error::RaftError::ProposalFailed(response.message),
+                        ));
                     }
                 }
             }
@@ -151,9 +202,12 @@ impl RaftNode {
 
         let response = self.propose(Command::BootstrapComplete).await?;
         if !response.success {
-            return Err(DatspoolError::Raft(crate::error::RaftError::ProposalFailed(response.message)));
+            return Err(DatspoolError::Raft(
+                crate::error::RaftError::ProposalFailed(response.message),
+            ));
         }
-        self.wait_for_bootstrap_complete(task_store, std::time::Duration::from_secs(60)).await?;
+        self.wait_for_bootstrap_complete(task_store, std::time::Duration::from_secs(60))
+            .await?;
         task_store.clear_legacy_cache().await?;
         Ok(replicated_tasks)
     }
@@ -172,7 +226,9 @@ impl RaftNode {
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             }
-        }).await.map_err(|_| DatspoolError::Raft(crate::error::RaftError::ElectionTimeout))?
+        })
+        .await
+        .map_err(|_| DatspoolError::Raft(crate::error::RaftError::ElectionTimeout))?
     }
 
     pub async fn propose(&self, command: Command) -> Result<super::CommandResponse> {
@@ -186,7 +242,9 @@ impl RaftNode {
                     match tokio::time::timeout(
                         std::time::Duration::from_secs(10),
                         self.raft.client_write(command.clone()),
-                    ).await {
+                    )
+                    .await
+                    {
                         Ok(Ok(response)) => return Ok(response.data),
                         Ok(Err(error)) => last_error = Some(error.to_string()),
                         Err(_) => last_error = Some("Raft proposal timed out".to_string()),
@@ -202,9 +260,11 @@ impl RaftNode {
                 tokio::time::sleep(std::time::Duration::from_millis(250)).await;
             }
         }
-        Err(DatspoolError::Raft(crate::error::RaftError::ProposalFailed(
-            last_error.unwrap_or_else(|| "Raft proposal failed".to_string()),
-        )))
+        Err(DatspoolError::Raft(
+            crate::error::RaftError::ProposalFailed(
+                last_error.unwrap_or_else(|| "Raft proposal failed".to_string()),
+            ),
+        ))
     }
 
     async fn forward_proposal(&self, command: Command) -> Result<super::CommandResponse> {
@@ -213,21 +273,37 @@ impl RaftNode {
             let current = metrics.borrow();
             let leader_id = current.current_leader;
             let address = leader_id.and_then(|id| {
-                current.membership_config.membership().get_node(&id).map(|node| node.addr.clone())
+                current
+                    .membership_config
+                    .membership()
+                    .get_node(&id)
+                    .map(|node| node.addr.clone())
             });
             (leader_id, address)
         };
-        let leader_id = leader_id.ok_or_else(|| DatspoolError::Raft(crate::error::RaftError::NotLeader(None)))?;
-        let address = leader_addr.ok_or_else(|| DatspoolError::Raft(crate::error::RaftError::NotLeader(Some(leader_id.to_string()))))?;
-        let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(30)).connect_timeout(std::time::Duration::from_secs(5)).build()
+        let leader_id = leader_id
+            .ok_or_else(|| DatspoolError::Raft(crate::error::RaftError::NotLeader(None)))?;
+        let address = leader_addr.ok_or_else(|| {
+            DatspoolError::Raft(crate::error::RaftError::NotLeader(Some(
+                leader_id.to_string(),
+            )))
+        })?;
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .build()
             .map_err(|e| DatspoolError::Raft(crate::error::RaftError::Network(e.to_string())))?;
-        let response = client.post(format!("http://{address}/raft/propose"))
+        let response = client
+            .post(format!("http://{address}/raft/propose"))
             .header("x-dataspool-raft-token", &self.raft_token)
             .json(&command)
-            .send().await
+            .send()
+            .await
             .and_then(reqwest::Response::error_for_status)
             .map_err(|e| DatspoolError::Raft(crate::error::RaftError::Network(e.to_string())))?;
-        response.json::<super::CommandResponse>().await
+        response
+            .json::<super::CommandResponse>()
+            .await
             .map_err(|e| DatspoolError::Raft(crate::error::RaftError::Network(e.to_string())))
     }
 
@@ -240,7 +316,9 @@ impl RaftNode {
     }
 
     pub async fn shutdown(&self) -> Result<()> {
-        self.raft.shutdown().await
+        self.raft
+            .shutdown()
+            .await
             .map_err(|e| DatspoolError::Raft(crate::error::RaftError::Storage(e.to_string())))
     }
 }
@@ -261,9 +339,9 @@ mod cluster_tests {
     use crate::task::{ShardMeta, TaskMeta, TaskStore};
     use crate::types::ShardState;
     use serde_json::json;
+    use std::sync::Arc;
     use std::time::Duration;
     use tempfile::tempdir;
-    use std::sync::Arc;
 
     #[tokio::test]
     async fn three_node_raft_cluster_replicates_claims_and_rejects_stale_fencing_tokens() {
@@ -284,10 +362,13 @@ mod cluster_tests {
         }
 
         let ids = [11_u64, 22_u64, 33_u64];
-        let members = ids.iter().zip(addresses.iter())
+        let members = ids
+            .iter()
+            .zip(addresses.iter())
             .map(|(id, address)| (*id, BasicNode::new(address.clone())))
             .collect::<BTreeMap<_, _>>();
-        let config = crate::raft::raft_config(Duration::from_millis(150), Duration::from_millis(600));
+        let config =
+            crate::raft::raft_config(Duration::from_millis(150), Duration::from_millis(600));
         let mut nodes = Vec::new();
         let mut server_tasks = Vec::new();
 
@@ -299,7 +380,9 @@ mod cluster_tests {
                 task_store,
                 config.clone(),
                 token.clone(),
-            ).await.unwrap();
+            )
+            .await
+            .unwrap();
             let router = super::super::network::router(node.handle(), token.clone());
             let listener = listeners.remove(0);
             server_tasks.push(tokio::spawn(async move {
@@ -313,52 +396,83 @@ mod cluster_tests {
         let leader_index = tokio::time::timeout(Duration::from_secs(12), async {
             loop {
                 for (index, node) in nodes.iter().enumerate() {
-                    if node.is_leader().await { return index; }
+                    if node.is_leader().await {
+                        return index;
+                    }
                 }
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
-        }).await.expect("Raft cluster did not elect a leader");
+        })
+        .await
+        .expect("Raft cluster did not elect a leader");
         let leader = &nodes[leader_index];
 
         let task = TaskMeta::new("raft-fencing-integration".into(), "{}".into(), "{}".into());
         let task_id = task.task_id;
         let shard = ShardMeta::new(task_id, 0, "{}".into());
         let shard_id = shard.shard_id;
-        let created = leader.propose(Command::CreateTask {
-            task: Box::new(task),
-            shards: vec![shard],
-        }).await.unwrap();
+        let created = leader
+            .propose(Command::CreateTask {
+                task: Box::new(task),
+                shards: vec![shard],
+            })
+            .await
+            .unwrap();
         assert!(created.success, "{}", created.message);
 
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 let mut replicated = true;
                 for store in &stores {
-                    if TaskStore::new(store.clone()).get_shard(&shard_id).await.unwrap().is_none() {
+                    if TaskStore::new(store.clone())
+                        .get_shard(&shard_id)
+                        .await
+                        .unwrap()
+                        .is_none()
+                    {
                         replicated = false;
                         break;
                     }
                 }
-                if replicated { break; }
+                if replicated {
+                    break;
+                }
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
-        }).await.expect("task/shard metadata did not replicate to all members");
+        })
+        .await
+        .expect("task/shard metadata did not replicate to all members");
 
         // A follower must be able to claim and renew through the elected leader;
         // shard execution is distributed across all members, not leader-only.
         let worker_index = (leader_index + 1) % nodes.len();
         let worker_node = nodes[worker_index].clone();
-        let known_leader = worker_node.wait_for_leader(Duration::from_secs(5)).await.unwrap();
+        let known_leader = worker_node
+            .wait_for_leader(Duration::from_secs(5))
+            .await
+            .unwrap();
         assert_eq!(known_leader, leader.node_id());
         let worker_store = Arc::new(TaskStore::new(stores[worker_index].clone()));
-        let claimer = ShardClaimer::new("worker-a".into(), worker_store.clone(), Arc::new(worker_node.clone()));
-        let mut lease = claimer.try_claim().await.unwrap().expect("follower should claim pending shard");
+        let claimer = ShardClaimer::new(
+            "worker-a".into(),
+            worker_store.clone(),
+            Arc::new(worker_node.clone()),
+        );
+        let mut lease = claimer
+            .try_claim()
+            .await
+            .unwrap()
+            .expect("follower should claim pending shard");
         let first_token = lease.fencing_token;
-        assert!(claimer.renew(&mut lease).await.unwrap(), "follower should renew its committed lease");
+        assert!(
+            claimer.renew(&mut lease).await.unwrap(),
+            "follower should renew its committed lease"
+        );
 
         let batch_id = lease.next_batch_id().unwrap();
         let cache_key = crate::pipeline::cache::LocalBatchCache::<RocksDbStore>::key_for_shard(
-            &shard_id.to_string(), &batch_id,
+            &shard_id.to_string(),
+            &batch_id,
         );
         let batch_command = Command::CacheBatch {
             shard_id: shard_id.to_string(),
@@ -366,38 +480,63 @@ mod cluster_tests {
             fencing_token: first_token,
             issued_at_ms: chrono::Utc::now().timestamp_millis(),
             batch_id: batch_id.clone(),
-            records: vec![Record::with_id("doc-1", "elasticsearch", json!({"value": 1}))],
+            records: vec![Record::with_id(
+                "doc-1",
+                "elasticsearch",
+                json!({"value": 1}),
+            )],
             next_offset: Some(OffsetValue::DocumentCount(1)),
             source_count: 1,
         };
         let cached = worker_node.propose(batch_command.clone()).await.unwrap();
         assert!(cached.success, "{}", cached.message);
         let duplicate = worker_node.propose(batch_command.clone()).await.unwrap();
-        assert!(duplicate.success, "same cache batch retry must be idempotent: {}", duplicate.message);
+        assert!(
+            duplicate.success,
+            "same cache batch retry must be idempotent: {}",
+            duplicate.message
+        );
         let mut conflicting = batch_command.clone();
         if let Command::CacheBatch { records, .. } = &mut conflicting {
             records[0].payload = json!({"value": 2});
         }
         let conflict = worker_node.propose(conflicting).await.unwrap();
-        assert!(!conflict.success, "a cache batch ID must not be reusable with a different payload");
+        assert!(
+            !conflict.success,
+            "a cache batch ID must not be reusable with a different payload"
+        );
 
         let local_cache = LocalBatchCache::new_replicated_for_shard(
-            Arc::new(stores[worker_index].clone()), 128, &shard_id.to_string(),
+            Arc::new(stores[worker_index].clone()),
+            128,
+            &shard_id.to_string(),
         );
-        local_cache.wait_for_batch(&batch_id, Duration::from_secs(5)).await.unwrap();
+        local_cache
+            .wait_for_batch(&batch_id, Duration::from_secs(5))
+            .await
+            .unwrap();
         for store in &stores {
-            assert_eq!(TaskStore::new(store.clone()).cache_batch_count(&shard_id.to_string()).await.unwrap(), 1);
+            assert_eq!(
+                TaskStore::new(store.clone())
+                    .cache_batch_count(&shard_id.to_string())
+                    .await
+                    .unwrap(),
+                1
+            );
         }
 
         let now = chrono::Utc::now().timestamp_millis();
-        let progress = worker_node.propose(Command::UpdateShardProgress {
-            shard_id: shard_id.to_string(),
-            node_id: "worker-a".into(),
-            fencing_token: first_token,
-            issued_at_ms: now,
-            processed_records: 1,
-            offset: serde_json::to_string(&OffsetValue::DocumentCount(1)).unwrap(),
-        }).await.unwrap();
+        let progress = worker_node
+            .propose(Command::UpdateShardProgress {
+                shard_id: shard_id.to_string(),
+                node_id: "worker-a".into(),
+                fencing_token: first_token,
+                issued_at_ms: now,
+                processed_records: 1,
+                offset: serde_json::to_string(&OffsetValue::DocumentCount(1)).unwrap(),
+            })
+            .await
+            .unwrap();
         assert!(progress.success, "{}", progress.message);
         let ack_command = Command::AckCacheBatch {
             shard_id: shard_id.to_string(),
@@ -409,51 +548,98 @@ mod cluster_tests {
         let ack = worker_node.propose(ack_command.clone()).await.unwrap();
         assert!(ack.success, "{}", ack.message);
         for store in &stores {
-            assert_eq!(TaskStore::new(store.clone()).cache_batch_count(&shard_id.to_string()).await.unwrap(), 0);
+            assert_eq!(
+                TaskStore::new(store.clone())
+                    .cache_batch_count(&shard_id.to_string())
+                    .await
+                    .unwrap(),
+                0
+            );
         }
         // A delayed retry of an already acknowledged log command must not
         // resurrect the batch after the FIFO cache watermark has advanced.
         let late_retry = worker_node.propose(batch_command.clone()).await.unwrap();
-        assert!(late_retry.success, "late cache retry should be idempotent: {}", late_retry.message);
+        assert!(
+            late_retry.success,
+            "late cache retry should be idempotent: {}",
+            late_retry.message
+        );
         for store in &stores {
-            assert_eq!(TaskStore::new(store.clone()).cache_batch_count(&shard_id.to_string()).await.unwrap(), 0);
+            assert_eq!(
+                TaskStore::new(store.clone())
+                    .cache_batch_count(&shard_id.to_string())
+                    .await
+                    .unwrap(),
+                0
+            );
         }
 
         let takeover_at = lease.expires_at.timestamp_millis() + 1;
-        let second = worker_node.propose(Command::ClaimShard {
-            shard_id: shard_id.to_string(),
-            node_id: "worker-b".into(),
-            claim_id: "claim-worker-b".into(),
-            issued_at_ms: takeover_at,
-            lease_expires_at_ms: takeover_at + 30_000,
-        }).await.unwrap();
+        let second = worker_node
+            .propose(Command::ClaimShard {
+                shard_id: shard_id.to_string(),
+                node_id: "worker-b".into(),
+                claim_id: "claim-worker-b".into(),
+                issued_at_ms: takeover_at,
+                lease_expires_at_ms: takeover_at + 30_000,
+            })
+            .await
+            .unwrap();
         assert!(second.success, "{}", second.message);
         let second_token = second.data.unwrap()["fencing_token"].as_u64().unwrap();
         assert!(second_token > first_token);
         let late_ack = worker_node.propose(ack_command).await.unwrap();
-        assert!(late_ack.success, "an already committed ack remains idempotent after lease handoff");
+        assert!(
+            late_ack.success,
+            "an already committed ack remains idempotent after lease handoff"
+        );
         let stale_batch = worker_node.propose(batch_command).await.unwrap();
-        assert!(!stale_batch.success, "an old owner cannot append a batch after lease handoff");
+        assert!(
+            !stale_batch.success,
+            "an old owner cannot append a batch after lease handoff"
+        );
         for store in &stores {
-            assert_eq!(TaskStore::new(store.clone()).cache_batch_count(&shard_id.to_string()).await.unwrap(), 0);
+            assert_eq!(
+                TaskStore::new(store.clone())
+                    .cache_batch_count(&shard_id.to_string())
+                    .await
+                    .unwrap(),
+                0
+            );
         }
 
-        let stale = worker_node.propose(Command::CompleteShard {
-            shard_id: shard_id.to_string(),
-            node_id: "worker-a".into(),
-            fencing_token: first_token,
-            issued_at_ms: takeover_at + 1_000,
-            total_records: 99,
-        }).await.unwrap();
-        assert!(!stale.success, "stale worker must not complete a reclaimed shard");
+        let stale = worker_node
+            .propose(Command::CompleteShard {
+                shard_id: shard_id.to_string(),
+                node_id: "worker-a".into(),
+                fencing_token: first_token,
+                issued_at_ms: takeover_at + 1_000,
+                total_records: 99,
+            })
+            .await
+            .unwrap();
+        assert!(
+            !stale.success,
+            "stale worker must not complete a reclaimed shard"
+        );
 
         for store in &stores {
-            let current = TaskStore::new(store.clone()).get_shard(&shard_id).await.unwrap().unwrap();
+            let current = TaskStore::new(store.clone())
+                .get_shard(&shard_id)
+                .await
+                .unwrap()
+                .unwrap();
             assert_eq!(current.fencing_token, second_token);
-            assert!(matches!(current.state, ShardState::Running { ref node_id, .. } if node_id.as_str() == "worker-b"));
+            assert!(
+                matches!(current.state, ShardState::Running { ref node_id, .. } if node_id.as_str() == "worker-b")
+            );
         }
 
-        for node in &nodes { node.shutdown().await.unwrap(); }
-        for server in server_tasks { server.abort(); }
+        for node in &nodes {
+            node.shutdown().await.unwrap();
+        }
+        for server in server_tasks {
+            server.abort();
+        }
     }
 }

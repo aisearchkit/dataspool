@@ -247,13 +247,12 @@ impl DocumentSink {
             if let Some(routing) = record.get_metadata("_routing") {
                 meta.insert("routing".into(), json!(routing));
             }
-            if let Some(version) = record.get_metadata("_dataspool_fencing_token") {
-                if record.id.is_some() {
-                    if let Ok(version) = version.parse::<i64>() {
-                        meta.insert("version".into(), json!(version));
-                        meta.insert("version_type".into(), json!("external_gte"));
-                    }
-                }
+            if let Some(version) = record.get_metadata("_dataspool_fencing_token")
+                && record.id.is_some()
+                && let Ok(version) = version.parse::<i64>()
+            {
+                meta.insert("version".into(), json!(version));
+                meta.insert("version_type".into(), json!("external_gte"));
             }
             let mut action = serde_json::Map::new();
             action.insert(operation.to_string(), Value::Object(meta));
@@ -556,16 +555,23 @@ impl Sink for DocumentSink {
         Ok(aggregate)
     }
 
-    async fn write_batch_fenced(&mut self, batch: RecordBatch, fencing_version: i64) -> Result<WriteResult> {
+    async fn write_batch_fenced(
+        &mut self,
+        batch: RecordBatch,
+        fencing_version: i64,
+    ) -> Result<WriteResult> {
         if fencing_version <= 0 {
-            return Err(DriverError::DataError("Invalid Elasticsearch fencing version".into()).into());
+            return Err(
+                DriverError::DataError("Invalid Elasticsearch fencing version".into()).into(),
+            );
         }
         let mut records = batch.into_records();
         for record in &mut records {
             if record.id.is_none() {
                 return Err(DriverError::Unsupported(
                     "Fenced Elasticsearch writes require stable document IDs".into(),
-                ).into());
+                )
+                .into());
             }
             record.add_metadata("_dataspool_fencing_token", fencing_version.to_string());
         }

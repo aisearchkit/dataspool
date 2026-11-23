@@ -132,7 +132,10 @@ impl ShardMeta {
         self.fencing_token = self.fencing_token.max(FENCING_TOKEN_BASE).checked_add(1)?;
         self.lease_expires_at = Some(lease_expires_at);
         self.lease_id = Some(lease_id);
-        self.state = ShardState::Running { node_id, started_at };
+        self.state = ShardState::Running {
+            node_id,
+            started_at,
+        };
         self.updated_at = system_time_from_utc(started_at);
         Some(self.fencing_token)
     }
@@ -161,7 +164,11 @@ impl ShardMeta {
         if !owns_shard || self.fencing_token != fencing_token {
             return false;
         }
-        if self.lease_expires_at.as_ref().is_none_or(|current| lease_expires_at <= current.clone()) {
+        if self
+            .lease_expires_at
+            .as_ref()
+            .is_none_or(|current| lease_expires_at <= *current)
+        {
             return false;
         }
         self.lease_expires_at = Some(lease_expires_at);
@@ -191,7 +198,12 @@ impl ShardMeta {
 
     /// Set an absolute progress checkpoint. This is idempotent when a committed
     /// Raft entry is replayed after a crash between application data and log metadata.
-    pub fn set_progress_at(&mut self, records: u64, offset: OffsetValue, at: chrono::DateTime<chrono::Utc>) {
+    pub fn set_progress_at(
+        &mut self,
+        records: u64,
+        offset: OffsetValue,
+        at: chrono::DateTime<chrono::Utc>,
+    ) {
         self.records_processed = records;
         self.offset = offset;
         self.updated_at = system_time_from_utc(at);
@@ -205,7 +217,10 @@ impl ShardMeta {
     pub fn complete_at(&mut self, docs_processed: u64, at: chrono::DateTime<chrono::Utc>) {
         self.lease_expires_at = None;
         self.lease_id = None;
-        self.state = ShardState::Completed { finished_at: at, docs_processed };
+        self.state = ShardState::Completed {
+            finished_at: at,
+            docs_processed,
+        };
         self.updated_at = system_time_from_utc(at);
     }
 
@@ -244,7 +259,8 @@ impl ShardMeta {
 }
 
 fn system_time_from_utc(value: chrono::DateTime<chrono::Utc>) -> SystemTime {
-    SystemTime::UNIX_EPOCH + std::time::Duration::from_millis(value.timestamp_millis().max(0) as u64)
+    SystemTime::UNIX_EPOCH
+        + std::time::Duration::from_millis(value.timestamp_millis().max(0) as u64)
 }
 
 /// Shard generator for creating shards based on strategy

@@ -165,35 +165,92 @@ impl Command {
             Command::DeleteTask { task_id } => {
                 format!("DeleteTask({})", task_id)
             }
-            Command::ClaimShard { shard_id, node_id, .. } => {
+            Command::ClaimShard {
+                shard_id, node_id, ..
+            } => {
                 format!("ClaimShard({}, {})", shard_id, node_id)
             }
-            Command::ReleaseShardLease { shard_id, node_id, fencing_token, .. } => {
-                format!("ReleaseShardLease({}, {}, {})", shard_id, node_id, fencing_token)
+            Command::ReleaseShardLease {
+                shard_id,
+                node_id,
+                fencing_token,
+                ..
+            } => {
+                format!(
+                    "ReleaseShardLease({}, {}, {})",
+                    shard_id, node_id, fencing_token
+                )
             }
-            Command::ImportLegacyCache { shard_id, batch_id, records, .. } => {
-                format!("ImportLegacyCache({}, {}, {} records)", shard_id, batch_id, records.len())
+            Command::ImportLegacyCache {
+                shard_id,
+                batch_id,
+                records,
+                ..
+            } => {
+                format!(
+                    "ImportLegacyCache({}, {}, {} records)",
+                    shard_id,
+                    batch_id,
+                    records.len()
+                )
             }
             Command::BootstrapComplete => "BootstrapComplete".to_string(),
-            Command::CacheBatch { shard_id, node_id: _, batch_id, records, .. } => {
-                format!("CacheBatch({}, {}, {} records)", shard_id, batch_id, records.len())
+            Command::CacheBatch {
+                shard_id,
+                node_id: _,
+                batch_id,
+                records,
+                ..
+            } => {
+                format!(
+                    "CacheBatch({}, {}, {} records)",
+                    shard_id,
+                    batch_id,
+                    records.len()
+                )
             }
-            Command::PersistDeadLetters { shard_id, failures, .. } => {
-                format!("PersistDeadLetters({}, {} records)", shard_id, failures.len())
+            Command::PersistDeadLetters {
+                shard_id, failures, ..
+            } => {
+                format!(
+                    "PersistDeadLetters({}, {} records)",
+                    shard_id,
+                    failures.len()
+                )
             }
-            Command::AckCacheBatch { shard_id, cache_key, .. } => {
+            Command::AckCacheBatch {
+                shard_id,
+                cache_key,
+                ..
+            } => {
                 format!("AckCacheBatch({}, {})", shard_id, cache_key)
             }
-            Command::RenewShardLease { shard_id, node_id, fencing_token, .. } => {
-                format!("RenewShardLease({}, {}, {})", shard_id, node_id, fencing_token)
+            Command::RenewShardLease {
+                shard_id,
+                node_id,
+                fencing_token,
+                ..
+            } => {
+                format!(
+                    "RenewShardLease({}, {}, {})",
+                    shard_id, node_id, fencing_token
+                )
             }
             Command::UpdateShardProgress { shard_id, .. } => {
                 format!("UpdateShardProgress({})", shard_id)
             }
-            Command::CompleteShard { shard_id, fencing_token, .. } => {
+            Command::CompleteShard {
+                shard_id,
+                fencing_token,
+                ..
+            } => {
                 format!("CompleteShard({}, fencing={})", shard_id, fencing_token)
             }
-            Command::FailShard { shard_id, fencing_token, .. } => {
+            Command::FailShard {
+                shard_id,
+                fencing_token,
+                ..
+            } => {
                 format!("FailShard({}, fencing={})", shard_id, fencing_token)
             }
             Command::RegisterNode { node_id, .. } => {

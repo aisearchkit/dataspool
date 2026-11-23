@@ -7,15 +7,26 @@
 
 use std::sync::Arc;
 
-use axum::{Json, Router, body::Body, extract::{DefaultBodyLimit, State}, http::{Request, StatusCode}, middleware::{self, Next}, response::{IntoResponse, Response}, routing::post};
+use axum::{
+    Json, Router,
+    body::Body,
+    extract::{DefaultBodyLimit, State},
+    http::{Request, StatusCode},
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
+    routing::post,
+};
+use openraft::BasicNode;
 use openraft::error::{NetworkError, RPCError, RaftError as OpenRaftError};
 use openraft::network::{RPCOption, RaftNetwork as OpenRaftNetwork, RaftNetworkFactory};
-use openraft::raft::{AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse, VoteRequest, VoteResponse};
-use openraft::BasicNode;
+use openraft::raft::{
+    AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
+    VoteRequest, VoteResponse,
+};
 use reqwest::Client;
 
-use super::storage::{RocksNodeId, TypeConfig};
 use super::Raft;
+use super::storage::{RocksNodeId, TypeConfig};
 
 #[derive(Clone)]
 pub struct NetworkFactory {
@@ -25,7 +36,14 @@ pub struct NetworkFactory {
 
 impl NetworkFactory {
     pub fn new(token: String) -> Self {
-        Self { client: Client::builder().timeout(std::time::Duration::from_secs(30)).connect_timeout(std::time::Duration::from_secs(5)).build().expect("HTTP client"), token }
+        Self {
+            client: Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .connect_timeout(std::time::Duration::from_secs(5))
+                .build()
+                .expect("HTTP client"),
+            token,
+        }
     }
 }
 
@@ -36,15 +54,26 @@ pub struct NetworkConnection {
 }
 
 impl NetworkConnection {
-    fn rpc_error<E: std::error::Error + 'static>(error: E) -> RPCError<RocksNodeId, BasicNode, OpenRaftError<RocksNodeId>> {
+    fn rpc_error<E: std::error::Error + 'static>(
+        error: E,
+    ) -> RPCError<RocksNodeId, BasicNode, OpenRaftError<RocksNodeId>> {
         RPCError::Network(NetworkError::new(&error))
     }
 
     async fn post<Req, Resp>(&self, path: &str, request: &Req) -> Result<Resp, reqwest::Error>
-    where Req: serde::Serialize + ?Sized, Resp: serde::de::DeserializeOwned {
-        self.client.post(format!("{}{path}", self.base_url))
+    where
+        Req: serde::Serialize + ?Sized,
+        Resp: serde::de::DeserializeOwned,
+    {
+        self.client
+            .post(format!("{}{path}", self.base_url))
             .header("x-dataspool-raft-token", &self.token)
-            .json(request).send().await?.error_for_status()?.json().await
+            .json(request)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await
     }
 }
 
@@ -52,7 +81,11 @@ impl RaftNetworkFactory<TypeConfig> for NetworkFactory {
     type Network = NetworkConnection;
 
     async fn new_client(&mut self, _target: RocksNodeId, node: &BasicNode) -> Self::Network {
-        NetworkConnection { client: self.client.clone(), base_url: format!("http://{}", node.addr), token: self.token.clone() }
+        NetworkConnection {
+            client: self.client.clone(),
+            base_url: format!("http://{}", node.addr),
+            token: self.token.clone(),
+        }
     }
 }
 
@@ -61,26 +94,41 @@ impl OpenRaftNetwork<TypeConfig> for NetworkConnection {
         &mut self,
         rpc: AppendEntriesRequest<TypeConfig>,
         _option: RPCOption,
-    ) -> Result<AppendEntriesResponse<RocksNodeId>, RPCError<RocksNodeId, BasicNode, OpenRaftError<RocksNodeId>>> {
-        self.post("/raft/append", &rpc).await.map_err(|e| Self::rpc_error(e))
+    ) -> Result<
+        AppendEntriesResponse<RocksNodeId>,
+        RPCError<RocksNodeId, BasicNode, OpenRaftError<RocksNodeId>>,
+    > {
+        self.post("/raft/append", &rpc)
+            .await
+            .map_err(Self::rpc_error)
     }
 
-async fn vote(
+    async fn vote(
         &mut self,
         rpc: VoteRequest<RocksNodeId>,
         _option: RPCOption,
-    ) -> Result<VoteResponse<RocksNodeId>, RPCError<RocksNodeId, BasicNode, OpenRaftError<RocksNodeId>>> {
-        self.post("/raft/vote", &rpc).await.map_err(|e| Self::rpc_error(e))
+    ) -> Result<
+        VoteResponse<RocksNodeId>,
+        RPCError<RocksNodeId, BasicNode, OpenRaftError<RocksNodeId>>,
+    > {
+        self.post("/raft/vote", &rpc).await.map_err(Self::rpc_error)
     }
 
     async fn install_snapshot(
         &mut self,
         rpc: InstallSnapshotRequest<TypeConfig>,
         _option: RPCOption,
-    ) -> Result<InstallSnapshotResponse<RocksNodeId>, RPCError<RocksNodeId, BasicNode, OpenRaftError<RocksNodeId, openraft::error::InstallSnapshotError>>> {
-        self.post("/raft/snapshot", &rpc).await.map_err(|e| {
-            RPCError::Network(NetworkError::new(&e))
-        })
+    ) -> Result<
+        InstallSnapshotResponse<RocksNodeId>,
+        RPCError<
+            RocksNodeId,
+            BasicNode,
+            OpenRaftError<RocksNodeId, openraft::error::InstallSnapshotError>,
+        >,
+    > {
+        self.post("/raft/snapshot", &rpc)
+            .await
+            .map_err(|e| RPCError::Network(NetworkError::new(&e)))
     }
 }
 
@@ -91,7 +139,10 @@ struct RaftHttpState {
 }
 
 pub fn router(raft: Arc<Raft>, token: String) -> Router {
-    let state = RaftHttpState { raft, token: Arc::from(token.into_bytes()) };
+    let state = RaftHttpState {
+        raft,
+        token: Arc::from(token.into_bytes()),
+    };
     Router::new()
         .route("/raft/vote", post(vote))
         .route("/raft/append", post(append))
@@ -102,9 +153,17 @@ pub fn router(raft: Arc<Raft>, token: String) -> Router {
         .with_state(state)
 }
 
-async fn authorize(State(state): State<RaftHttpState>, request: Request<Body>, next: Next) -> Response {
+async fn authorize(
+    State(state): State<RaftHttpState>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
     use subtle::ConstantTimeEq;
-    let supplied = request.headers().get("x-dataspool-raft-token").map(|v| v.as_bytes()).unwrap_or_default();
+    let supplied = request
+        .headers()
+        .get("x-dataspool-raft-token")
+        .map(|v| v.as_bytes())
+        .unwrap_or_default();
     if supplied.len() != state.token.len() || !bool::from(supplied.ct_eq(state.token.as_ref())) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
@@ -115,7 +174,10 @@ async fn client_write(
     State(state): State<RaftHttpState>,
     Json(command): Json<super::Command>,
 ) -> Result<Json<super::CommandResponse>, StatusCode> {
-    state.raft.client_write(command).await
+    state
+        .raft
+        .client_write(command)
+        .await
         .map(|response| Json(response.data))
         .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)
 }
@@ -124,19 +186,34 @@ async fn vote(
     State(state): State<RaftHttpState>,
     Json(request): Json<VoteRequest<RocksNodeId>>,
 ) -> Result<Json<VoteResponse<RocksNodeId>>, StatusCode> {
-    state.raft.vote(request).await.map(Json).map_err(|_| StatusCode::SERVICE_UNAVAILABLE)
+    state
+        .raft
+        .vote(request)
+        .await
+        .map(Json)
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)
 }
 
 async fn append(
     State(state): State<RaftHttpState>,
     Json(request): Json<AppendEntriesRequest<TypeConfig>>,
 ) -> Result<Json<AppendEntriesResponse<RocksNodeId>>, StatusCode> {
-    state.raft.append_entries(request).await.map(Json).map_err(|_| StatusCode::SERVICE_UNAVAILABLE)
+    state
+        .raft
+        .append_entries(request)
+        .await
+        .map(Json)
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)
 }
 
 async fn snapshot(
     State(state): State<RaftHttpState>,
     Json(request): Json<InstallSnapshotRequest<TypeConfig>>,
 ) -> Result<Json<InstallSnapshotResponse<RocksNodeId>>, StatusCode> {
-    state.raft.install_snapshot(request).await.map(Json).map_err(|_| StatusCode::SERVICE_UNAVAILABLE)
+    state
+        .raft
+        .install_snapshot(request)
+        .await
+        .map(Json)
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)
 }

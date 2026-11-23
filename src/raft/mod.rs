@@ -26,7 +26,10 @@ pub fn default_raft_config() -> Config {
 
 pub fn raft_config(heartbeat: Duration, election_timeout: Duration) -> Config {
     let heartbeat_ms = heartbeat.as_millis().clamp(100, u64::MAX as u128) as u64;
-    let election_ms = election_timeout.as_millis().clamp((heartbeat_ms.saturating_mul(3)) as u128, u64::MAX as u128) as u64;
+    let election_ms = election_timeout
+        .as_millis()
+        .clamp((heartbeat_ms.saturating_mul(3)) as u128, u64::MAX as u128)
+        as u64;
     Config {
         cluster_name: "dataspool".to_string(),
         heartbeat_interval: heartbeat_ms,
