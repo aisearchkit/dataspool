@@ -882,13 +882,13 @@ mod cluster_tests {
             .await
             .unwrap();
         assert!(failover_created.success, "{}", failover_created.message);
-        for index in 0..nodes.len() {
+        for (index, store) in stores.iter().enumerate() {
             if index == leader_index {
                 continue;
             }
             tokio::time::timeout(Duration::from_secs(10), async {
                 loop {
-                    if TaskStore::new(stores[index].clone())
+                    if TaskStore::new(store.clone())
                         .get_task(&after_failover_id)
                         .await
                         .unwrap()

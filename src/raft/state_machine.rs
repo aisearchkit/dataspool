@@ -36,6 +36,16 @@ struct CacheBatchRequest {
     source_count: u64,
 }
 
+struct ShardProgressRequest {
+    shard_id: String,
+    node_id: String,
+    fencing_token: u64,
+    issued_at_ms: i64,
+    processed_records: u64,
+    processed_bytes: u64,
+    offset: String,
+}
+
 impl<S: KvStore + Clone> MetaStateMachine<S> {
     pub fn new(store: S) -> Self {
         Self {
@@ -168,7 +178,7 @@ impl<S: KvStore + Clone> MetaStateMachine<S> {
                 processed_bytes,
                 offset,
             } => {
-                self.apply_progress(
+                self.apply_progress(ShardProgressRequest {
                     shard_id,
                     node_id,
                     fencing_token,
@@ -176,7 +186,7 @@ impl<S: KvStore + Clone> MetaStateMachine<S> {
                     processed_records,
                     processed_bytes,
                     offset,
-                )
+                })
                 .await
             }
             Command::CompleteShard {
@@ -806,16 +816,16 @@ impl<S: KvStore + Clone> MetaStateMachine<S> {
         ))
     }
 
-    async fn apply_progress(
-        &self,
-        shard_id: String,
-        node_id: String,
-        fencing_token: u64,
-        issued_at_ms: i64,
-        processed_records: u64,
-        processed_bytes: u64,
-        offset: String,
-    ) -> Result<CommandResponse> {
+    async fn apply_progress(&self, request: ShardProgressRequest) -> Result<CommandResponse> {
+        let ShardProgressRequest {
+            shard_id,
+            node_id,
+            fencing_token,
+            issued_at_ms,
+            processed_records,
+            processed_bytes,
+            offset,
+        } = request;
         let shard_id = parse_shard_id(&shard_id)?;
         let mut shard = match self.task_store.get_shard(&shard_id).await? {
             Some(shard) => shard,

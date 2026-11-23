@@ -270,7 +270,7 @@ impl TaskMeta {
         self.completed_shards = aggregate.completed_shards;
         self.failed_shards = aggregate.failed_shards;
 
-        let started_at = self.started_at.or_else(|| match &self.state {
+        let started_at = self.started_at.or(match &self.state {
             TaskState::Running { started_at, .. } => Some(*started_at),
             _ => earliest_start,
         });
