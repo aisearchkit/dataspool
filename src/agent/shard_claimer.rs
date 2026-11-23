@@ -187,6 +187,7 @@ impl<S: KvStore + Clone + 'static> ShardClaimer<S> {
         fencing_token: u64,
         expires_at: DateTime<Utc>,
     ) -> Result<()> {
+        let mut last_seen = String::from("shard metadata not present on local member");
         tokio::time::timeout(std::time::Duration::from_secs(15), async {
             loop {
                 if let Some(shard) = self.task_store.get_shard(shard_id).await? {
@@ -197,10 +198,11 @@ impl<S: KvStore + Clone + 'static> ShardClaimer<S> {
                     {
                         return Ok(());
                     }
+                    last_seen = format!("state={:?}, owner_matches={owner_matches}, fencing_token={}, lease_expires_at={:?}, expected_token={fencing_token}, expected_expiry={expires_at}", shard.state, shard.fencing_token, shard.lease_expires_at);
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             }
-        }).await.map_err(|_| DatspoolError::Raft(crate::error::RaftError::ElectionTimeout))?
+        }).await.map_err(|_| DatspoolError::Internal(format!("Timed out waiting for committed shard lease on local member: {last_seen}")))?
     }
 }
 
