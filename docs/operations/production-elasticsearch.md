@@ -102,7 +102,7 @@ On SIGINT or SIGTERM, the HTTP server stops accepting new requests and drains ac
 
 ## Distributed task aggregation and recovery
 
-The replicated shard record is the source of truth for task progress. Every committed shard claim, checkpoint, completion, failure, lease release, and node-offline requeue refreshes the task aggregate in the same application-store batch as the corresponding shard mutation. The aggregate includes pending/running/completed/failed counts, records and serialized record bytes, elapsed time, document/byte throughput, per-node ownership-state counts, and each shard's last committed offset/fencing generation.
+The replicated shard record is the source of truth for task progress. Every committed shard claim, checkpoint, completion, failure, lease release, and node-offline requeue refreshes the task aggregate in the same application-store batch as the corresponding shard mutation. The aggregate includes pending/running/completed/failed counts, records and serialized record bytes, elapsed time, document/byte throughput, per-node ownership-state counts and processed-document/byte throughput, and each shard's last committed offset/fencing generation. Per-node document/byte totals are attributed to the shard's last committed owner; task-wide totals remain authoritative across reassignment.
 
 Read a task with a fresh projection through TaskStore::get_task_with_aggregate; the cached TaskMeta.aggregate is also persisted for efficient consumers. TaskStore::rebuild_task_aggregates reconstructs it from shard records after startup or snapshot installation. Do not use task counters as an independent source of truth or increment them from worker-local events.
 

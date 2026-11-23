@@ -20,12 +20,17 @@ pub enum TaskPriority {
 }
 
 /// Per-node contribution to a task's globally aggregated execution state.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct NodeTaskAggregate {
     pub pending_shards: u32,
     pub running_shards: u32,
     pub completed_shards: u32,
     pub failed_shards: u32,
+    pub docs_processed: u64,
+    pub bytes_processed: u64,
+    pub throughput_docs_per_sec: f64,
+    pub throughput_bytes_per_sec: f64,
 }
 
 /// Last committed checkpoint for one shard.
@@ -42,6 +47,7 @@ pub struct ShardCheckpoint {
 
 /// Rebuildable, cluster-wide task view derived exclusively from committed shard metadata.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default)]
 pub struct TaskAggregate {
     pub total_shards: u32,
     pub pending_shards: u32,
@@ -242,6 +248,8 @@ impl TaskMeta {
                 node.running_shards += u32::from(state == 1);
                 node.completed_shards += u32::from(state == 2);
                 node.failed_shards += u32::from(state == 3);
+                node.docs_processed = node.docs_processed.saturating_add(shard.records_processed);
+                node.bytes_processed = node.bytes_processed.saturating_add(shard.bytes_processed);
             }
             aggregate.checkpoints.push(ShardCheckpoint {
                 shard_id: shard.shard_id,
@@ -349,6 +357,18 @@ impl TaskMeta {
             } else {
                 0.0
             };
+            for node in aggregate.nodes.values_mut() {
+                node.throughput_docs_per_sec = if elapsed > 0 {
+                    node.docs_processed as f64 * 1_000.0 / elapsed as f64
+                } else {
+                    0.0
+                };
+                node.throughput_bytes_per_sec = if elapsed > 0 {
+                    node.bytes_processed as f64 * 1_000.0 / elapsed as f64
+                } else {
+                    0.0
+                };
+            }
         }
         self.aggregate = aggregate;
         self.updated_at = std::time::UNIX_EPOCH

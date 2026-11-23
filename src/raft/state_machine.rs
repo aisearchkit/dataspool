@@ -1287,7 +1287,9 @@ mod tests {
             .unwrap();
         assert_eq!(rebuilt.aggregate.elapsed_ms, duration_ms);
         assert_eq!(aggregate.aggregate.nodes["worker-a"].completed_shards, 1);
-        assert_eq!(aggregate.aggregate.nodes["worker-a"].completed_shards, 1);
+        assert_eq!(aggregate.aggregate.nodes["worker-a"].docs_processed, 10);
+        assert_eq!(aggregate.aggregate.nodes["worker-a"].bytes_processed, 2048);
+        assert!(aggregate.aggregate.nodes["worker-a"].throughput_docs_per_sec > 0.0);
         assert_eq!(aggregate.aggregate.nodes["worker-b"].failed_shards, 1);
         assert_eq!(aggregate.aggregate.checkpoints.len(), 2);
         assert!(matches!(

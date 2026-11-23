@@ -748,14 +748,11 @@ mod cluster_tests {
                 task.state,
                 crate::types::TaskState::Completed { .. }
             ));
-            assert_eq!(
-                task.aggregate
-                    .nodes
-                    .get("worker-b")
-                    .unwrap()
-                    .completed_shards,
-                1
-            );
+            let worker_b = task.aggregate.nodes.get("worker-b").unwrap();
+            assert_eq!(worker_b.completed_shards, 1);
+            assert_eq!(worker_b.docs_processed, 1);
+            assert_eq!(worker_b.bytes_processed, 128);
+            assert!(worker_b.throughput_docs_per_sec > 0.0);
         }
 
         let late_ack = worker_node.propose(ack_command).await.unwrap();
