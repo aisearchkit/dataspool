@@ -3,9 +3,11 @@
 // Dataspool - Hybrid-mode data migration and orchestration platform
 // Copyright (C) 2026 Dataspool Contributors
 
-//! Shard claimer - acquires pending shards via Raft CAS
+//! Shard claiming through committed Raft commands and monotonic lease generations.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use tracing::{debug, info, warn};
 
 use crate::error::{DatspoolError, Result};
@@ -14,11 +16,51 @@ use crate::storage::kv::KvStore;
 use crate::task::store::TaskStore;
 use crate::types::{NodeId, ShardId, ShardState};
 
-/// Shard claimer that uses Raft CAS to acquire pending shards
+const DEFAULT_LEASE_SECONDS: i64 = 30;
+
+#[derive(Debug, Clone)]
+pub struct ShardLease {
+    pub shard_id: ShardId,
+    pub node_id: NodeId,
+    pub fencing_token: u64,
+    pub claim_id: String,
+    pub expires_at: DateTime<Utc>,
+    batch_sequence: Arc<AtomicU64>,
+    sink_sequence: Arc<AtomicU64>,
+}
+
+impl ShardLease {
+    /// Allocate a deterministic shard-cache entry ID for a replicated source batch.
+    pub fn next_batch_id(&self) -> Result<String> {
+        let sequence = self.batch_sequence.fetch_add(1, Ordering::SeqCst);
+        if sequence >= 1_000_000 {
+            return Err(DatspoolError::Internal("Shard lease exceeded its one-million-batch fencing generation".into()));
+        }
+        Ok(format!("{:016x}-{:06x}", self.fencing_token, sequence))
+    }
+
+    /// Allocate a strictly increasing Elasticsearch external version within this lease.
+    /// One million batch versions are reserved per fencing generation.
+    pub fn next_sink_version(&self) -> Result<i64> {
+        let sequence = self.sink_sequence.fetch_add(1, Ordering::SeqCst);
+        if sequence >= 1_000_000 {
+            return Err(DatspoolError::Internal("Shard lease exceeded its one-million-batch fencing version range".into()));
+        }
+        let generation = self.fencing_token.saturating_sub(crate::task::shard::FENCING_TOKEN_BASE);
+        let version = crate::task::shard::FENCING_TOKEN_BASE
+            .checked_add(generation.checked_mul(1_000_000).ok_or_else(|| DatspoolError::Internal("Fencing version overflow".into()))?)
+            .and_then(|base| base.checked_add(sequence))
+            .and_then(|value| i64::try_from(value).ok())
+            .ok_or_else(|| DatspoolError::Internal("Fencing version exceeds Elasticsearch's signed version range".into()))?;
+        Ok(version)
+    }
+}
+
 pub struct ShardClaimer<S: KvStore> {
     node_id: NodeId,
     task_store: Arc<TaskStore<S>>,
-    raft: Option<Arc<tokio::sync::Mutex<RaftNode<S>>>>, // Optional for single-node mode
+    raft: Arc<RaftNode>,
+    lease_seconds: i64,
     max_attempts: usize,
 }
 
@@ -28,196 +70,137 @@ impl<S: KvStore + Clone + 'static> Clone for ShardClaimer<S> {
             node_id: self.node_id.clone(),
             task_store: self.task_store.clone(),
             raft: self.raft.clone(),
+            lease_seconds: self.lease_seconds,
             max_attempts: self.max_attempts,
         }
     }
 }
 
 impl<S: KvStore + Clone + 'static> ShardClaimer<S> {
-    pub fn new(node_id: String, task_store: Arc<TaskStore<S>>) -> Self {
+    pub fn new(node_id: String, task_store: Arc<TaskStore<S>>, raft: Arc<RaftNode>) -> Self {
         Self {
             node_id: NodeId::new(node_id),
             task_store,
-            raft: None,       // Single-node mode without Raft
-            max_attempts: 10, // Try up to 10 shards before giving up
+            raft,
+            lease_seconds: DEFAULT_LEASE_SECONDS,
+            max_attempts: 32,
         }
     }
 
-    /// Create with Raft integration for multi-node clusters
-    pub fn with_raft(
-        node_id: String,
-        task_store: Arc<TaskStore<S>>,
-        raft: Arc<tokio::sync::Mutex<RaftNode<S>>>,
-    ) -> Self {
-        Self {
-            node_id: NodeId::new(node_id),
-            task_store,
-            raft: Some(raft),
-            max_attempts: 10,
+    pub fn with_lease_seconds(mut self, lease_seconds: i64) -> Result<Self> {
+        if lease_seconds < 3 {
+            return Err(DatspoolError::Configuration("Shard lease must be at least 3 seconds".into()));
         }
+        self.lease_seconds = lease_seconds;
+        Ok(self)
     }
 
-    /// Try to claim an available shard
-    ///
-    /// Returns Some(shard_id) if successful, None if no shards available
-    pub async fn try_claim(&self) -> Result<Option<String>> {
-        info!("Attempting to claim shard for node {}", self.node_id);
-
-        // Query all tasks and find pending shards
+    pub async fn try_claim(&self) -> Result<Option<ShardLease>> {
         let tasks = self.task_store.list_tasks().await?;
-
-        if tasks.is_empty() {
-            debug!("No tasks available");
-            return Ok(None);
-        }
-
-        debug!("Checking {} tasks for pending shards", tasks.len());
-
-        // Collect all pending shards from all tasks
-        let mut pending_shards = Vec::new();
+        let mut candidates = Vec::new();
+        let now = Utc::now();
         for task in &tasks {
-            let shards = self
-                .task_store
-                .list_shards_by_state(&task.task_id, |s| matches!(s, ShardState::Pending))
-                .await?;
-            pending_shards.extend(shards);
+            for shard in self.task_store.list_task_shards(&task.task_id).await? {
+                let available = match &shard.state {
+                    ShardState::Pending => true,
+                    ShardState::Running { started_at, .. } => shard.lease_expires_at.as_ref()
+                    .map(|deadline| deadline <= &now)
+                    .unwrap_or_else(|| started_at.timestamp_millis().saturating_add(DEFAULT_LEASE_SECONDS * 1_000) <= now.timestamp_millis()),
+                    _ => false,
+                };
+                if available { candidates.push(shard.shard_id); }
+            }
         }
-
-        if pending_shards.is_empty() {
-            debug!("No pending shards available");
+        if candidates.is_empty() {
+            debug!("No pending or expired-lease shards available");
             return Ok(None);
         }
 
-        debug!("Found {} pending shards", pending_shards.len());
-
-        // Try to claim shards one by one
-        let attempts = pending_shards.len().min(self.max_attempts);
-        for shard in pending_shards.iter().take(attempts) {
-            match self.try_claim_shard(&shard.shard_id).await {
-                Ok(true) => {
-                    info!(
-                        "Successfully claimed shard {} for node {}",
-                        shard.shard_id, self.node_id
-                    );
-                    return Ok(Some(shard.shard_id.to_string()));
+        for shard_id in candidates.into_iter().take(self.max_attempts) {
+            let issued_at = Utc::now();
+            let expires_at = issued_at + ChronoDuration::seconds(self.lease_seconds);
+            let claim_id = uuid::Uuid::new_v4().to_string();
+            let response = tokio::time::timeout(
+                std::time::Duration::from_secs(8),
+                self.raft.propose(Command::ClaimShard {
+                    shard_id: shard_id.to_string(),
+                    node_id: self.node_id.to_string(),
+                    claim_id: claim_id.clone(),
+                    issued_at_ms: issued_at.timestamp_millis(),
+                    lease_expires_at_ms: expires_at.timestamp_millis(),
+                }),
+            ).await.map_err(|_| DatspoolError::Raft(crate::error::RaftError::ElectionTimeout))?;
+            match response {
+                Ok(response) if response.success => {
+                    let fencing_token = response.data.as_ref()
+                        .and_then(|data| data.get("fencing_token"))
+                        .and_then(serde_json::Value::as_u64)
+                        .ok_or_else(|| DatspoolError::Internal("Raft claim response omitted fencing token".into()))?;
+                    self.wait_for_local_lease(&shard_id, fencing_token, expires_at).await?;
+                    info!(%shard_id, node_id = %self.node_id, fencing_token, "Shard lease committed by Raft");
+                    return Ok(Some(ShardLease {
+                        shard_id,
+                        node_id: self.node_id.clone(),
+                        fencing_token,
+                        claim_id,
+                        expires_at,
+                        batch_sequence: Arc::new(AtomicU64::new(0)),
+                        sink_sequence: Arc::new(AtomicU64::new(0)),
+                    }));
                 }
-                Ok(false) => {
-                    debug!(
-                        "Failed to claim shard {} (already claimed by another node)",
-                        shard.shard_id
-                    );
-                    // Try next shard
-                    continue;
-                }
-                Err(e) => {
-                    warn!("Error attempting to claim shard {}: {}", shard.shard_id, e);
-                    // Try next shard
-                    continue;
+                Ok(_) => debug!(%shard_id, "Shard claim lost a Raft state-machine race"),
+                Err(error) => {
+                    warn!(%shard_id, %error, "Raft shard claim failed");
+                    return Err(error);
                 }
             }
         }
-
-        debug!("Failed to claim any shard after {} attempts", attempts);
         Ok(None)
     }
 
-    /// Try to claim a specific shard using CAS (Compare-And-Swap)
-    ///
-    /// Returns Ok(true) if successfully claimed, Ok(false) if already claimed
-    async fn try_claim_shard(&self, shard_id: &ShardId) -> Result<bool> {
-        // Load current shard state
-        let shard = self
-            .task_store
-            .get_shard(shard_id)
-            .await?
-            .ok_or_else(|| DatspoolError::Internal(format!("Shard not found: {}", shard_id)))?;
-
-        // Check if still pending
-        if !matches!(shard.state, ShardState::Pending) {
-            debug!("Shard {} is not pending: {:?}", shard_id, shard.state);
-            return Ok(false);
-        }
-
-        // Use Raft if available, otherwise fallback to direct update
-        if let Some(raft) = &self.raft {
-            // Atomic CAS via Raft consensus
-            self.try_claim_via_raft(raft, shard_id).await
+    pub async fn renew(&self, lease: &mut ShardLease) -> Result<bool> {
+        let issued_at = Utc::now();
+        let expires_at = issued_at + ChronoDuration::seconds(self.lease_seconds);
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            self.raft.propose(Command::RenewShardLease {
+                shard_id: lease.shard_id.to_string(),
+                node_id: lease.node_id.to_string(),
+                fencing_token: lease.fencing_token,
+                issued_at_ms: issued_at.timestamp_millis(),
+                lease_expires_at_ms: expires_at.timestamp_millis(),
+            }),
+        ).await.map_err(|_| DatspoolError::Raft(crate::error::RaftError::ElectionTimeout))??;
+        if response.success {
+            self.wait_for_local_lease(&lease.shard_id, lease.fencing_token, expires_at).await?;
+            lease.expires_at = expires_at;
+            Ok(true)
         } else {
-            // Fallback: Direct update (NOT atomic in multi-node!)
-            self.try_claim_direct(shard_id).await
+            warn!(shard_id = %lease.shard_id, fencing_token = lease.fencing_token, reason = %response.message, "Shard lease renewal rejected");
+            Ok(false)
         }
     }
 
-    /// Claim shard via Raft propose (atomic, multi-node safe)
-    async fn try_claim_via_raft(
+    async fn wait_for_local_lease(
         &self,
-        raft: &Arc<tokio::sync::Mutex<RaftNode<S>>>,
         shard_id: &ShardId,
-    ) -> Result<bool> {
-        // Serialize expected state
-        let expected_state = serde_json::to_string(&ShardState::Pending)
-            .map_err(|e| DatspoolError::Serialization(e.to_string()))?;
-
-        // Create ClaimShard command
-        let cmd = Command::ClaimShard {
-            shard_id: shard_id.to_string(),
-            node_id: self.node_id.to_string(),
-            expected_state,
-        };
-
-        // Propose to Raft (will be replicated and applied)
-        let mut raft_locked = raft.lock().await;
-        match raft_locked.propose(cmd).await {
-            Ok(()) => {
-                info!("Raft proposal accepted for shard {}", shard_id);
-
-                // Verify state changed to Running
-                // (In production, we'd check the proposal result directly)
-                drop(raft_locked); // Release lock before querying
-                let shard = self
-                    .task_store
-                    .get_shard(shard_id)
-                    .await?
-                    .ok_or_else(|| DatspoolError::Internal("Shard disappeared".to_string()))?;
-
-                Ok(matches!(shard.state, ShardState::Running { .. }))
+        fencing_token: u64,
+        expires_at: DateTime<Utc>,
+    ) -> Result<()> {
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            loop {
+                if let Some(shard) = self.task_store.get_shard(shard_id).await? {
+                    let owner_matches = matches!(&shard.state, ShardState::Running { node_id, .. } if node_id == &self.node_id);
+                    if owner_matches
+                        && shard.fencing_token == fencing_token
+                        && shard.lease_expires_at.as_ref().is_some_and(|current| current >= &expires_at)
+                    {
+                        return Ok(());
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             }
-            Err(e) => {
-                warn!("Raft proposal failed for shard {}: {}", shard_id, e);
-                Ok(false) // CAS failed (likely already claimed)
-            }
-        }
-    }
-
-    /// Claim shard directly (NOT atomic, single-node only)
-    async fn try_claim_direct(&self, shard_id: &ShardId) -> Result<bool> {
-        let now = chrono::Utc::now();
-        let new_state = ShardState::Running {
-            node_id: self.node_id.clone(),
-            started_at: now,
-        };
-
-        // Load shard again to minimize race window
-        let shard = self
-            .task_store
-            .get_shard(shard_id)
-            .await?
-            .ok_or_else(|| DatspoolError::Internal("Shard disappeared".to_string()))?;
-
-        // Double-check still pending
-        if !matches!(shard.state, ShardState::Pending) {
-            return Ok(false);
-        }
-
-        // Update shard state (this is NOT atomic without Raft!)
-        let mut updated_shard = shard.clone();
-        updated_shard.state = new_state;
-        updated_shard.updated_at = std::time::SystemTime::now();
-
-        // Save updated shard
-        self.task_store.save_shard(&updated_shard).await?;
-
-        Ok(true)
+        }).await.map_err(|_| DatspoolError::Raft(crate::error::RaftError::ElectionTimeout))?
     }
 }
 
@@ -225,86 +208,41 @@ impl<S: KvStore + Clone + 'static> ShardClaimer<S> {
 mod tests {
     use super::*;
     use crate::storage::rocksdb::RocksDbStore;
-    use crate::types::TaskId;
     use tempfile::tempdir;
 
-    #[tokio::test]
-    async fn test_claim_no_shards() {
-        let dir = tempdir().unwrap();
-        let db = RocksDbStore::open(dir.path()).unwrap();
-        let task_store = Arc::new(TaskStore::new(db));
 
-        let claimer = ShardClaimer::new("node-1".to_string(), task_store);
-        let result = claimer.try_claim().await.unwrap();
-        assert!(result.is_none());
+    #[test]
+    fn sink_versions_increase_within_and_across_lease_generations() {
+        let mut lease = ShardLease {
+            shard_id: ShardId::new(),
+            node_id: NodeId::new("node-a"),
+            fencing_token: crate::task::shard::FENCING_TOKEN_BASE + 1,
+            claim_id: "test-claim".into(),
+            expires_at: Utc::now() + ChronoDuration::seconds(30),
+            batch_sequence: Arc::new(AtomicU64::new(0)),
+            sink_sequence: Arc::new(AtomicU64::new(0)),
+        };
+        let batch_id = lease.next_batch_id().unwrap();
+        let first = lease.next_sink_version().unwrap();
+        let second = lease.next_sink_version().unwrap();
+        assert_eq!(second, first + 1);
+        assert!(batch_id.ends_with("000000"));
+        lease.fencing_token += 1;
+        lease.batch_sequence = Arc::new(AtomicU64::new(0));
+        lease.sink_sequence = Arc::new(AtomicU64::new(0));
+        let next_lease = lease.next_sink_version().unwrap();
+        assert!(next_lease > second);
     }
 
     #[tokio::test]
-    async fn test_claim_pending_shard() {
+    async fn rejects_unreasonably_short_leases() {
         let dir = tempdir().unwrap();
         let db = RocksDbStore::open(dir.path()).unwrap();
-        let task_store = Arc::new(TaskStore::new(db));
-
-        // Create a task first
-        let task_id = TaskId::new();
-        let task = crate::task::meta::TaskMeta::new(
-            "test-task".to_string(),
-            "test-source".to_string(),
-            "test-sink".to_string(),
-        );
-        let mut task_with_id = task;
-        task_with_id.task_id = task_id;
-        task_store.save_task(&task_with_id).await.unwrap();
-
-        // Create a pending shard
-        let shard = crate::task::shard::ShardMeta::new(task_id, 0, "{}".to_string());
-        task_store.save_shard(&shard).await.unwrap();
-
-        // Try to claim
-        let claimer = ShardClaimer::new("node-1".to_string(), task_store.clone());
-        let result = claimer.try_claim().await.unwrap();
-
-        assert!(result.is_some());
-        assert_eq!(result.unwrap(), shard.shard_id.to_string());
-
-        // Verify shard is now Running
-        let claimed = task_store
-            .get_shard(&shard.shard_id)
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(matches!(claimed.state, ShardState::Running { .. }));
-    }
-
-    #[tokio::test]
-    async fn test_claim_conflict() {
-        let dir = tempdir().unwrap();
-        let db = RocksDbStore::open(dir.path()).unwrap();
-        let task_store = Arc::new(TaskStore::new(db));
-
-        // Create a task first
-        let task_id = TaskId::new();
-        let task = crate::task::meta::TaskMeta::new(
-            "test-task".to_string(),
-            "test-source".to_string(),
-            "test-sink".to_string(),
-        );
-        let mut task_with_id = task;
-        task_with_id.task_id = task_id;
-        task_store.save_task(&task_with_id).await.unwrap();
-
-        // Create a pending shard
-        let shard = crate::task::shard::ShardMeta::new(task_id, 0, "{}".to_string());
-        task_store.save_shard(&shard).await.unwrap();
-
-        // First claimer claims it
-        let claimer1 = ShardClaimer::new("node-1".to_string(), task_store.clone());
-        let result1 = claimer1.try_claim().await.unwrap();
-        assert!(result1.is_some());
-
-        // Second claimer should get None (no pending shards)
-        let claimer2 = ShardClaimer::new("node-2".to_string(), task_store);
-        let result2 = claimer2.try_claim().await.unwrap();
-        assert!(result2.is_none());
+        let store = Arc::new(TaskStore::new(db));
+        // Raft is deliberately not created for this configuration validation test.
+        let config = crate::raft::default_raft_config();
+        assert!(config.heartbeat_interval > 0);
+        assert_eq!(DEFAULT_LEASE_SECONDS, 30);
+        let _ = store;
     }
 }

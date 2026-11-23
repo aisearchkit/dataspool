@@ -53,13 +53,19 @@ impl<S: KvStore> DeadLetterQueue<S> {
     }
 
     pub async fn enqueue(&self, failures: Vec<FailedRecord>) -> Result<usize> {
-        if failures.is_empty() {
-            return Ok(0);
-        }
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
+        self.enqueue_at(failures, now).await
+    }
+
+    /// Persist failures with a replicated timestamp so every Raft state machine
+    /// produces byte-identical DLQ records.
+    pub async fn enqueue_at(&self, failures: Vec<FailedRecord>, now: u64) -> Result<usize> {
+        if failures.is_empty() {
+            return Ok(0);
+        }
         let mut batch = crate::storage::kv::WriteBatch::new();
         let count = failures.len();
         for failure in failures {

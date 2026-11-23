@@ -13,4 +13,4 @@ pub mod store;
 
 pub use meta::{TaskMeta, TaskPriority};
 pub use shard::{ShardGenerator, ShardMeta, ShardingStrategy};
-pub use store::TaskStore;
+pub use store::{TaskStore, TaskStoreSnapshot};

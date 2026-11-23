@@ -46,7 +46,7 @@ pub use pipeline::{
     AdaptiveBackpressure, BackpressureConfig, ClusterPressure, FlowWindow, LocalBatchCache,
     Pipeline, PipelineConfig, PipelineStats, Record, RecordBatch, Sink, Source, Transform,
 };
-pub use raft::{Command, RaftNode};
+pub use raft::{Command, CommandResponse, RaftNode, raft_router};
 pub use storage::{ColumnFamily, KvStore, RocksDbStore, WriteBatch, cf};
 pub use tokio_util::sync::CancellationToken;
 pub use task::{ShardGenerator, ShardMeta, ShardingStrategy, TaskMeta, TaskPriority, TaskStore};

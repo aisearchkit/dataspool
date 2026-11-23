@@ -52,6 +52,10 @@ pub trait KvStore: Send + Sync {
     /// Atomic batch write
     async fn write_batch(&self, batch: WriteBatch) -> Result<()>;
 
+    /// Force all preceding writes to durable media. Consensus state machines
+    /// call this before persisting their applied-log index.
+    async fn flush_durable(&self) -> Result<()> { Ok(()) }
+
     /// Create iterator over all keys with given prefix
     async fn prefix_scan(&self, prefix: &[u8]) -> Result<Vec<(Bytes, Bytes)>>;
 

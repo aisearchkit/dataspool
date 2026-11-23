@@ -35,12 +35,76 @@ pub enum Command {
     ClaimShard {
         shard_id: String,
         node_id: String,
-        expected_state: String, // Must be "Pending"
+        claim_id: String,
+        issued_at_ms: i64,
+        lease_expires_at_ms: i64,
+    },
+
+    /// Release a shard lease on cooperative shutdown.
+    ReleaseShardLease {
+        shard_id: String,
+        node_id: String,
+        fencing_token: u64,
+        issued_at_ms: i64,
+    },
+
+    /// Import a pre-Raft local cache entry during the one-time cluster bootstrap.
+    ImportLegacyCache {
+        shard_id: String,
+        batch_id: String,
+        records: Vec<crate::pipeline::Record>,
+        next_offset: Option<crate::pipeline::OffsetValue>,
+        source_count: u64,
+    },
+
+    /// Mark legacy-state import complete; workers on followers wait for this entry.
+    BootstrapComplete,
+
+    /// Replicate a durable source batch before any destination write is attempted.
+    CacheBatch {
+        shard_id: String,
+        node_id: String,
+        fencing_token: u64,
+        issued_at_ms: i64,
+        batch_id: String,
+        records: Vec<crate::pipeline::Record>,
+        next_offset: Option<crate::pipeline::OffsetValue>,
+        source_count: u64,
+    },
+
+    /// Replicate permanent sink failures to every state-machine replica.
+    PersistDeadLetters {
+        shard_id: String,
+        node_id: String,
+        fencing_token: u64,
+        issued_at_ms: i64,
+        failures: Vec<crate::pipeline::FailedRecord>,
+    },
+
+    /// Replicate cache acknowledgement after destination delivery and checkpoint commit.
+    AckCacheBatch {
+        shard_id: String,
+        node_id: String,
+        fencing_token: u64,
+        issued_at_ms: i64,
+        cache_key: String,
+    },
+
+    /// Renew a shard lease using the current fencing generation.
+    RenewShardLease {
+        shard_id: String,
+        node_id: String,
+        fencing_token: u64,
+        issued_at_ms: i64,
+        lease_expires_at_ms: i64,
     },
 
     /// Update shard progress
     UpdateShardProgress {
         shard_id: String,
+        node_id: String,
+        fencing_token: u64,
+        issued_at_ms: i64,
         processed_records: u64,
         offset: String, // JSON-serialized OffsetValue
     },
@@ -48,12 +112,18 @@ pub enum Command {
     /// Mark shard as completed
     CompleteShard {
         shard_id: String,
+        node_id: String,
+        fencing_token: u64,
+        issued_at_ms: i64,
         total_records: u64,
     },
 
     /// Mark shard as failed
     FailShard {
         shard_id: String,
+        node_id: String,
+        fencing_token: u64,
+        issued_at_ms: i64,
         error_message: String,
     },
 
@@ -95,19 +165,36 @@ impl Command {
             Command::DeleteTask { task_id } => {
                 format!("DeleteTask({})", task_id)
             }
-            Command::ClaimShard {
-                shard_id, node_id, ..
-            } => {
+            Command::ClaimShard { shard_id, node_id, .. } => {
                 format!("ClaimShard({}, {})", shard_id, node_id)
+            }
+            Command::ReleaseShardLease { shard_id, node_id, fencing_token, .. } => {
+                format!("ReleaseShardLease({}, {}, {})", shard_id, node_id, fencing_token)
+            }
+            Command::ImportLegacyCache { shard_id, batch_id, records, .. } => {
+                format!("ImportLegacyCache({}, {}, {} records)", shard_id, batch_id, records.len())
+            }
+            Command::BootstrapComplete => "BootstrapComplete".to_string(),
+            Command::CacheBatch { shard_id, node_id, batch_id, records, .. } => {
+                format!("CacheBatch({}, {}, {} records)", shard_id, batch_id, records.len())
+            }
+            Command::PersistDeadLetters { shard_id, failures, .. } => {
+                format!("PersistDeadLetters({}, {} records)", shard_id, failures.len())
+            }
+            Command::AckCacheBatch { shard_id, cache_key, .. } => {
+                format!("AckCacheBatch({}, {})", shard_id, cache_key)
+            }
+            Command::RenewShardLease { shard_id, node_id, fencing_token, .. } => {
+                format!("RenewShardLease({}, {}, {})", shard_id, node_id, fencing_token)
             }
             Command::UpdateShardProgress { shard_id, .. } => {
                 format!("UpdateShardProgress({})", shard_id)
             }
-            Command::CompleteShard { shard_id, .. } => {
-                format!("CompleteShard({})", shard_id)
+            Command::CompleteShard { shard_id, fencing_token, .. } => {
+                format!("CompleteShard({}, fencing={})", shard_id, fencing_token)
             }
-            Command::FailShard { shard_id, .. } => {
-                format!("FailShard({})", shard_id)
+            Command::FailShard { shard_id, fencing_token, .. } => {
+                format!("FailShard({}, fencing={})", shard_id, fencing_token)
             }
             Command::RegisterNode { node_id, .. } => {
                 format!("RegisterNode({})", node_id)
@@ -134,7 +221,9 @@ mod tests {
         let cmd = Command::ClaimShard {
             shard_id: "shard-1".to_string(),
             node_id: "node-1".to_string(),
-            expected_state: "Pending".to_string(),
+            claim_id: "claim-1".to_string(),
+            issued_at_ms: 1_000,
+            lease_expires_at_ms: 31_000,
         };
 
         let json = serde_json::to_string(&cmd).unwrap();

@@ -247,6 +247,14 @@ impl DocumentSink {
             if let Some(routing) = record.get_metadata("_routing") {
                 meta.insert("routing".into(), json!(routing));
             }
+            if let Some(version) = record.get_metadata("_dataspool_fencing_token") {
+                if record.id.is_some() {
+                    if let Ok(version) = version.parse::<i64>() {
+                        meta.insert("version".into(), json!(version));
+                        meta.insert("version_type".into(), json!("external_gte"));
+                    }
+                }
+            }
             let mut action = serde_json::Map::new();
             action.insert(operation.to_string(), Value::Object(meta));
             body.push_str(&Value::Object(action).to_string());
@@ -351,6 +359,11 @@ impl DocumentSink {
                     .as_str()
                     .unwrap_or("no reason supplied")
                     .to_string();
+                if status == 409 && error_type == "version_conflict_engine_exception" {
+                    // A newer lease generation already wrote this document.
+                    result.success_count += 1;
+                    continue;
+                }
                 if is_retryable_bulk_failure(status, &error_type) && attempt < MAX_RETRIES {
                     retry.push(record);
                 } else {
@@ -543,6 +556,22 @@ impl Sink for DocumentSink {
         Ok(aggregate)
     }
 
+    async fn write_batch_fenced(&mut self, batch: RecordBatch, fencing_version: i64) -> Result<WriteResult> {
+        if fencing_version <= 0 {
+            return Err(DriverError::DataError("Invalid Elasticsearch fencing version".into()).into());
+        }
+        let mut records = batch.into_records();
+        for record in &mut records {
+            if record.id.is_none() {
+                return Err(DriverError::Unsupported(
+                    "Fenced Elasticsearch writes require stable document IDs".into(),
+                ).into());
+            }
+            record.add_metadata("_dataspool_fencing_token", fencing_version.to_string());
+        }
+        self.write_batch(RecordBatch::from(records)).await
+    }
+
     async fn flush(&mut self) -> Result<()> {
         // Bulk API is synchronous, no buffering to flush
         Ok(())
@@ -730,6 +759,16 @@ mod tests {
         assert!(body.contains(r#""delete""#));
         assert!(body.contains(r#""_index":"events-2026""#));
         assert!(body.contains(r#""routing":"tenant-42""#));
+    }
+
+    #[test]
+    fn test_build_bulk_body_includes_external_fencing_version() {
+        let sink = DocumentSink::new(DocumentConfig::local("test"), "target".to_string());
+        let mut record = Record::with_id("doc-fenced", "test", json!({"value": 1}));
+        record.add_metadata("_dataspool_fencing_token", "4611686018428387904");
+        let body = sink.build_bulk_body(&RecordBatch::from(vec![record]));
+        assert!(body.contains("\"version\":4611686018428387904"));
+        assert!(body.contains("\"version_type\":\"external_gte\""));
     }
 
     #[test]

@@ -19,7 +19,7 @@
 //! Data source, transformation, and sink traits for pipeline
 
 use super::record::{Record, RecordBatch};
-use crate::error::Result;
+use crate::error::{DatspoolError, DriverError, Result};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
@@ -114,6 +114,14 @@ pub trait Sink: Send + Sync {
     /// Returns statistics about the write operation.
     async fn write_batch(&mut self, batch: RecordBatch) -> Result<WriteResult>;
 
+    /// Write a batch under a distributed shard fencing generation. Sinks must
+    /// reject writes from older generations; unsupported sinks fail closed.
+    async fn write_batch_fenced(&mut self, _batch: RecordBatch, _fencing_version: i64) -> Result<WriteResult> {
+        Err(DatspoolError::Driver(DriverError::Unsupported(
+            format!("Sink '{}' does not implement distributed fencing", self.sink_type()),
+        )))
+    }
+
     /// Flush any buffered data
     async fn flush(&mut self) -> Result<()>;
 
@@ -149,7 +157,7 @@ pub struct WriteResult {
     pub errors: Vec<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FailedRecord {
     pub record: super::record::Record,
     pub status: u16,

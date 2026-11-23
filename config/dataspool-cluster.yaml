@@ -12,9 +12,10 @@ node:
 
 # ==================== Cluster Configuration ====================
 cluster:
-  # Raft peer list. Multi-node Agent execution is intentionally disabled
-  # until the worker claimer is wired to Raft consensus.
-  # Keep this empty for the currently supported single-node Agent mode.
+  # Initial Raft peers, excluding this node. Use a stable node ID prefix:
+  # - "node-2@10.0.0.12:50051"
+  # - "node-3@10.0.0.13:50051"
+  # All members must use the same peer set and DATASPOOL_RAFT_TOKEN.
   peers: []
   
   # Raft election timeout (3-6s recommended)
@@ -34,8 +35,8 @@ server:
   # Bind address (0.0.0.0 for all interfaces)
   bind_addr: "0.0.0.0"
   
-  # TLS is terminated at a trusted reverse proxy; native HTTP TLS is not
-  # currently implemented by the Dataspool binary.
+  # Raft HTTP RPC is bound to grpc_port and should be restricted to the
+  # private cluster network. TLS termination is not built into this listener.
   tls:
     enabled: false
     cert_file: "/etc/dataspool/certs/server.crt"

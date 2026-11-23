@@ -8,6 +8,10 @@ use crate::types::{NodeId, ShardId, ShardState, TaskId};
 use serde::{Deserialize, Serialize};
 use std::time::SystemTime;
 
+/// Start ES external versions in a high range so existing internally-versioned
+/// documents are normally below the first Dataspool lease generation.
+pub const FENCING_TOKEN_BASE: u64 = 1_u64 << 62;
+
 /// Sharding strategies for different data sources
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ShardingStrategy {
@@ -51,6 +55,18 @@ pub struct ShardMeta {
     /// Current shard state (includes node assignment and timestamps)
     pub state: ShardState,
 
+    /// Monotonically increasing ownership generation. Never reset on requeue.
+    #[serde(default)]
+    pub fencing_token: u64,
+
+    /// Lease deadline for the current owner. None means the shard is not safely reclaimable.
+    #[serde(default)]
+    pub lease_expires_at: Option<chrono::DateTime<chrono::Utc>>,
+
+    /// Idempotency key for the current lease acquisition.
+    #[serde(default)]
+    pub lease_id: Option<String>,
+
     /// Shard-specific configuration (JSON string)
     pub config: String,
 
@@ -79,6 +95,9 @@ impl ShardMeta {
             task_id,
             shard_index,
             state: ShardState::Pending,
+            fencing_token: 0,
+            lease_expires_at: None,
+            lease_id: None,
             config,
             offset: OffsetValue::initial(),
             records_processed: 0,
@@ -90,12 +109,71 @@ impl ShardMeta {
 
     /// Update shard state
     pub fn set_state(&mut self, new_state: ShardState) {
+        self.set_state_at(new_state, chrono::Utc::now());
+    }
+
+    pub fn set_state_at(&mut self, new_state: ShardState, at: chrono::DateTime<chrono::Utc>) {
+        if !matches!(new_state, ShardState::Running { .. }) {
+            self.lease_expires_at = None;
+            self.lease_id = None;
+        }
         self.state = new_state;
-        self.updated_at = SystemTime::now();
+        self.updated_at = system_time_from_utc(at);
+    }
+
+    /// Start a new ownership generation with a bounded lease.
+    pub fn start_with_lease(
+        &mut self,
+        node_id: NodeId,
+        started_at: chrono::DateTime<chrono::Utc>,
+        lease_expires_at: chrono::DateTime<chrono::Utc>,
+        lease_id: String,
+    ) -> Option<u64> {
+        self.fencing_token = self.fencing_token.max(FENCING_TOKEN_BASE).checked_add(1)?;
+        self.lease_expires_at = Some(lease_expires_at);
+        self.lease_id = Some(lease_id);
+        self.state = ShardState::Running { node_id, started_at };
+        self.updated_at = system_time_from_utc(started_at);
+        Some(self.fencing_token)
+    }
+
+    /// Extend a lease only for its current owner and fencing generation.
+    pub fn renew_lease(
+        &mut self,
+        node_id: &NodeId,
+        fencing_token: u64,
+        lease_expires_at: chrono::DateTime<chrono::Utc>,
+    ) -> bool {
+        self.renew_lease_at(node_id, fencing_token, lease_expires_at, chrono::Utc::now())
+    }
+
+    pub fn renew_lease_at(
+        &mut self,
+        node_id: &NodeId,
+        fencing_token: u64,
+        lease_expires_at: chrono::DateTime<chrono::Utc>,
+        at: chrono::DateTime<chrono::Utc>,
+    ) -> bool {
+        let owns_shard = matches!(
+            &self.state,
+            ShardState::Running { node_id: owner, .. } if owner == node_id
+        );
+        if !owns_shard || self.fencing_token != fencing_token {
+            return false;
+        }
+        if self.lease_expires_at.as_ref().is_none_or(|current| lease_expires_at <= current.clone()) {
+            return false;
+        }
+        self.lease_expires_at = Some(lease_expires_at);
+        self.updated_at = system_time_from_utc(at);
+        true
     }
 
     /// Assign shard to a node and start running
     pub fn start(&mut self, node_id: NodeId) {
+        self.fencing_token = self.fencing_token.max(FENCING_TOKEN_BASE).saturating_add(1);
+        self.lease_expires_at = None;
+        self.lease_id = None;
         self.state = ShardState::Running {
             node_id,
             started_at: chrono::Utc::now(),
@@ -111,19 +189,36 @@ impl ShardMeta {
         self.updated_at = SystemTime::now();
     }
 
+    /// Set an absolute progress checkpoint. This is idempotent when a committed
+    /// Raft entry is replayed after a crash between application data and log metadata.
+    pub fn set_progress_at(&mut self, records: u64, offset: OffsetValue, at: chrono::DateTime<chrono::Utc>) {
+        self.records_processed = records;
+        self.offset = offset;
+        self.updated_at = system_time_from_utc(at);
+    }
+
     /// Mark shard as completed
     pub fn complete(&mut self, docs_processed: u64) {
-        self.state = ShardState::Completed {
-            finished_at: chrono::Utc::now(),
-            docs_processed,
-        };
-        self.updated_at = SystemTime::now();
+        self.complete_at(docs_processed, chrono::Utc::now());
+    }
+
+    pub fn complete_at(&mut self, docs_processed: u64, at: chrono::DateTime<chrono::Utc>) {
+        self.lease_expires_at = None;
+        self.lease_id = None;
+        self.state = ShardState::Completed { finished_at: at, docs_processed };
+        self.updated_at = system_time_from_utc(at);
     }
 
     /// Mark shard as failed
     pub fn fail(&mut self, error: String, attempts: u32) {
+        self.fail_at(error, attempts, chrono::Utc::now());
+    }
+
+    pub fn fail_at(&mut self, error: String, attempts: u32, at: chrono::DateTime<chrono::Utc>) {
+        self.lease_expires_at = None;
+        self.lease_id = None;
         self.state = ShardState::Failed { error, attempts };
-        self.updated_at = SystemTime::now();
+        self.updated_at = system_time_from_utc(at);
     }
 
     /// Check if shard is in a terminal state
@@ -146,6 +241,10 @@ impl ShardMeta {
             _ => None,
         }
     }
+}
+
+fn system_time_from_utc(value: chrono::DateTime<chrono::Utc>) -> SystemTime {
+    SystemTime::UNIX_EPOCH + std::time::Duration::from_millis(value.timestamp_millis().max(0) as u64)
 }
 
 /// Shard generator for creating shards based on strategy

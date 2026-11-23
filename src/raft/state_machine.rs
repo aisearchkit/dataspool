@@ -3,139 +3,469 @@
 // Dataspool - Hybrid-mode data migration and orchestration platform
 // Copyright (C) 2026 Dataspool Contributors
 
-//! Raft state machine - applies commands to storage
+//! Deterministic application of committed Raft commands.
 
 use serde::{Deserialize, Serialize};
-use tracing::{info, warn};
+use tracing::info;
 
 use super::Command;
 use crate::error::{DatspoolError, Result};
 use crate::storage::KvStore;
-use crate::task::TaskStore;
+use crate::task::{ShardMeta, TaskStore};
+use crate::types::{NodeId, ShardId, ShardState};
 
-/// Response from applying a command
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CommandResponse {
     pub success: bool,
     pub message: String,
     pub data: Option<serde_json::Value>,
 }
 
-/// Raft state machine that applies commands to RocksDB
 pub struct MetaStateMachine<S: KvStore> {
     task_store: TaskStore<S>,
-    #[allow(dead_code)]
-    last_applied_log: u64,
 }
 
 impl<S: KvStore + Clone> MetaStateMachine<S> {
     pub fn new(store: S) -> Self {
-        Self {
-            task_store: TaskStore::new(store),
-            last_applied_log: 0,
-        }
+        Self { task_store: TaskStore::new(store) }
     }
 
-    /// Apply a single command to the state machine
     pub async fn apply_command(&mut self, cmd: Command) -> Result<CommandResponse> {
-        info!("Applying command: {}", cmd.description());
-
+        info!("Applying committed command: {}", cmd.description());
         match cmd {
-            Command::CreateTask { task, shards } => self.apply_create_task(task, shards).await,
-            Command::ClaimShard {
-                shard_id,
-                node_id,
-                expected_state,
-            } => {
-                self.apply_claim_shard(shard_id, node_id, expected_state)
-                    .await
+            Command::CreateTask { task, shards } => self.apply_create_task(*task, shards).await,
+            Command::ClaimShard { shard_id, node_id, claim_id, issued_at_ms, lease_expires_at_ms } => {
+                self.apply_claim_shard(shard_id, node_id, claim_id, issued_at_ms, lease_expires_at_ms).await
             }
-            // TODO: Implement other commands
-            _ => {
-                warn!("Command not implemented yet: {}", cmd.description());
-                Ok(CommandResponse {
-                    success: false,
-                    message: "Not implemented yet".to_string(),
-                    data: None,
-                })
+            Command::ImportLegacyCache { shard_id, batch_id, records, next_offset, source_count } => {
+                self.apply_import_legacy_cache(shard_id, batch_id, records, next_offset, source_count).await
             }
+            Command::BootstrapComplete => {
+                self.task_store.mark_bootstrap_complete().await?;
+                Ok(accepted("Raft bootstrap completed", serde_json::json!({"ready": true})))
+            }
+            Command::ReleaseShardLease { shard_id, node_id, fencing_token, issued_at_ms } => {
+                self.apply_release_lease(shard_id, node_id, fencing_token, issued_at_ms).await
+            }
+            Command::CacheBatch { shard_id, node_id, fencing_token, issued_at_ms, batch_id, records, next_offset, source_count } => {
+                self.apply_cache_batch(shard_id, node_id, fencing_token, issued_at_ms, batch_id, records, next_offset, source_count).await
+            }
+            Command::PersistDeadLetters { shard_id, node_id, fencing_token, issued_at_ms, failures } => {
+                self.apply_dead_letters(shard_id, node_id, fencing_token, issued_at_ms, failures).await
+            }
+            Command::AckCacheBatch { shard_id, node_id, fencing_token, issued_at_ms, cache_key } => {
+                self.apply_ack_cache_batch(shard_id, node_id, fencing_token, issued_at_ms, cache_key).await
+            }
+            Command::RenewShardLease { shard_id, node_id, fencing_token, issued_at_ms, lease_expires_at_ms } => {
+                self.apply_renew_lease(shard_id, node_id, fencing_token, issued_at_ms, lease_expires_at_ms).await
+            }
+            Command::UpdateShardProgress { shard_id, node_id, fencing_token, issued_at_ms, processed_records, offset } => {
+                self.apply_progress(shard_id, node_id, fencing_token, issued_at_ms, processed_records, offset).await
+            }
+            Command::CompleteShard { shard_id, node_id, fencing_token, issued_at_ms, total_records } => {
+                self.apply_complete(shard_id, node_id, fencing_token, issued_at_ms, total_records).await
+            }
+            Command::FailShard { shard_id, node_id, fencing_token, issued_at_ms, error_message } => {
+                self.apply_fail(shard_id, node_id, fencing_token, issued_at_ms, error_message).await
+            }
+            Command::UpdateTaskState { .. }
+            | Command::DeleteTask { .. }
+            | Command::RegisterNode { .. }
+            | Command::UpdateNodeHeartbeat { .. }
+            | Command::MarkNodeOffline { .. }
+            | Command::UpdateConfig { .. } => Ok(rejected("Command is not implemented")),
         }
     }
 
-    async fn apply_create_task(
-        &mut self,
-        task: Box<crate::task::TaskMeta>,
-        shards: Vec<crate::task::ShardMeta>,
-    ) -> Result<CommandResponse> {
-        // This would use TaskStore to persist task and shards
-        // For now, just a stub
-        Ok(CommandResponse {
-            success: true,
-            message: format!("Task {} created with {} shards", task.task_id, shards.len()),
-            data: Some(serde_json::json!({ "task_id": task.task_id })),
-        })
+    async fn apply_create_task(&self, task: crate::task::TaskMeta, shards: Vec<ShardMeta>) -> Result<CommandResponse> {
+        let task_id = task.task_id;
+        for shard in &shards {
+            if shard.task_id != task_id {
+                return Ok(rejected("Shard belongs to a different task"));
+            }
+        }
+        // Re-applying a committed entry after a crash must be safe.
+        if self.task_store.get_task(&task_id).await?.is_none() {
+            self.task_store.save_task(&task).await?;
+        }
+        for shard in &shards {
+            match self.task_store.get_shard(&shard.shard_id).await? {
+                None => self.task_store.save_shard(shard).await?,
+                Some(existing)
+                    if matches!(&existing.state, ShardState::Running { .. })
+                        && existing.lease_expires_at.is_none()
+                        && existing.lease_id.is_none()
+                        && matches!(&shard.state, ShardState::Pending) =>
+                {
+                    // The bootstrap command carries the normalized timestamp/state;
+                    // never consult local wall clocks while applying a replicated log.
+                    self.task_store.save_shard(shard).await?;
+                }
+                Some(_) => {}
+            }
+        }
+        Ok(accepted("Task and shards created", serde_json::json!({"task_id": task_id, "shards": shards.len()})))
     }
 
-    async fn apply_claim_shard(
-        &mut self,
-        shard_id: String,
-        node_id: String,
-        expected_state: String,
-    ) -> Result<CommandResponse> {
-        use crate::types::{NodeId, ShardId, ShardState};
-
-        // Parse expected state
-        let expected_state: ShardState = serde_json::from_str(&expected_state)
-            .map_err(|e| DatspoolError::Serialization(e.to_string()))?;
-
-        // Parse shard ID
-        let shard_id: ShardId = shard_id
-            .parse()
-            .map_err(|e: uuid::Error| DatspoolError::Serialization(e.to_string()))?;
-
-        // Get current shard
+    async fn apply_claim_shard(&self, shard_id: String, node_id: String, claim_id: String, issued_at_ms: i64, lease_expires_at_ms: i64) -> Result<CommandResponse> {
+        let shard_id = parse_shard_id(&shard_id)?;
         let mut shard = match self.task_store.get_shard(&shard_id).await? {
-            Some(s) => s,
-            None => {
-                return Ok(CommandResponse {
-                    success: false,
-                    message: format!("Shard {} not found", shard_id),
-                    data: None,
-                });
-            }
+            Some(shard) => shard,
+            None => return Ok(rejected("Shard not found")),
         };
-
-        // Check if expected state matches (CAS semantics)
-        if shard.state != expected_state {
-            return Ok(CommandResponse {
-                success: false,
-                message: format!(
-                    "Shard {} state is {:?}, expected {:?}",
-                    shard_id, shard.state, expected_state
-                ),
-                data: None,
-            });
+        let previous_expiry = shard.lease_expires_at.as_ref()
+            .filter(|expires| expires.timestamp_millis() > issued_at_ms)
+            .cloned();
+        if matches!(&shard.state, ShardState::Running { node_id: owner, .. } if owner.as_str() == node_id)
+            && shard.lease_id.as_deref() == Some(claim_id.as_str())
+            && previous_expiry.is_some()
+        {
+            return Ok(accepted("Shard claim already committed", serde_json::json!({
+                "shard_id": shard_id.to_string(), "node_id": node_id,
+                "claim_id": claim_id, "fencing_token": shard.fencing_token,
+                "lease_expires_at_ms": previous_expiry.unwrap().timestamp_millis()
+            })));
         }
-
-        // Transition to Running using built-in method
-        shard.start(NodeId(node_id.clone()));
-
-        // Persist change
+        let reclaimable = match &shard.state {
+            ShardState::Pending => true,
+            ShardState::Running { started_at, .. } => shard.lease_expires_at.as_ref()
+                .map(|expires| expires.timestamp_millis() <= issued_at_ms)
+                .unwrap_or_else(|| started_at.timestamp_millis().saturating_add(30_000) <= issued_at_ms),
+            _ => false,
+        };
+        if !reclaimable {
+            return Ok(rejected("Shard is not pending or its lease is still valid"));
+        }
+        if lease_expires_at_ms <= issued_at_ms {
+            return Ok(rejected("Lease expiration must be later than claim time"));
+        }
+        let expires = chrono::DateTime::from_timestamp_millis(lease_expires_at_ms)
+            .ok_or_else(|| DatspoolError::Serialization("Invalid lease expiration".into()))?;
+        let issued_at = chrono::DateTime::from_timestamp_millis(issued_at_ms)
+            .ok_or_else(|| DatspoolError::Serialization("Invalid claim timestamp".into()))?;
+        let fencing_token = match shard.start_with_lease(NodeId::new(node_id.clone()), issued_at, expires, claim_id.clone()) {
+            Some(token) => token,
+            None => return Ok(rejected("Shard fencing token exhausted")),
+        };
         self.task_store.save_shard(&shard).await?;
+        Ok(accepted("Shard claimed", serde_json::json!({
+            "shard_id": shard_id.to_string(), "node_id": node_id, "claim_id": claim_id,
+            "fencing_token": fencing_token, "lease_expires_at_ms": lease_expires_at_ms
+        })))
+    }
 
-        info!("Shard {} claimed by {} (CAS succeeded)", shard_id, node_id);
+    async fn apply_release_lease(&self, shard_id: String, node_id: String, fencing_token: u64, issued_at_ms: i64) -> Result<CommandResponse> {
+        let shard_id = parse_shard_id(&shard_id)?;
+        let mut shard = match self.task_store.get_shard(&shard_id).await? {
+            Some(shard) => shard,
+            None => return Ok(rejected("Shard not found")),
+        };
+        let at = chrono::DateTime::from_timestamp_millis(issued_at_ms)
+            .ok_or_else(|| DatspoolError::Serialization("Invalid release timestamp".into()))?;
+        if matches!(&shard.state, ShardState::Pending) && shard.fencing_token == fencing_token {
+            return Ok(accepted("Shard lease already released", serde_json::json!({"fencing_token": fencing_token})));
+        }
+        if !lease_matches(&shard, &node_id, fencing_token, at) {
+            return Ok(rejected("Lease release rejected by fencing token"));
+        }
+        shard.set_state_at(ShardState::Pending, at);
+        self.task_store.save_shard(&shard).await?;
+        Ok(accepted("Shard lease released", serde_json::json!({"fencing_token": fencing_token})))
+    }
 
-        Ok(CommandResponse {
-            success: true,
-            message: format!("Shard {} claimed by {}", shard_id, node_id),
-            data: Some(serde_json::json!({
-                "shard_id": shard_id.to_string(),
-                "node_id": node_id,
-                "state": "Running"
-            })),
-        })
+    async fn apply_import_legacy_cache(
+        &self,
+        shard_id: String,
+        batch_id: String,
+        records: Vec<crate::pipeline::Record>,
+        next_offset: Option<crate::pipeline::OffsetValue>,
+        source_count: u64,
+    ) -> Result<CommandResponse> {
+        if self.task_store.bootstrap_complete().await? {
+            return Ok(rejected("Legacy cache import is closed after bootstrap"));
+        }
+        let parsed_shard_id = parse_shard_id(&shard_id)?;
+        let shard = match self.task_store.get_shard(&parsed_shard_id).await? {
+            Some(shard) => shard,
+            None => return Ok(rejected("Shard not found")),
+        };
+        if !matches!(&shard.state, ShardState::Pending)
+            || shard.lease_expires_at.is_some()
+            || shard.lease_id.is_some()
+        {
+            return Ok(rejected("Legacy cache can only be imported before the shard is first claimed"));
+        }
+        if !valid_batch_id(&batch_id) || !batch_id.starts_with("0000000000000000-") {
+            return Ok(rejected("Invalid legacy cache import ID"));
+        }
+        let key = crate::pipeline::cache::LocalBatchCache::<S>::key_for_shard(&shard_id, &batch_id);
+        let entry = crate::pipeline::cache::CacheEntry { records, next_offset, source_count };
+        if let Some(existing) = self.task_store.kv_store().get_cf(crate::storage::cf::CACHE, &key).await? {
+            let existing: crate::pipeline::cache::CacheEntry = serde_json::from_slice(&existing)?;
+            return if existing == entry {
+                Ok(accepted("Legacy cache entry already imported", serde_json::json!({"batch_id": batch_id})))
+            } else {
+                Ok(rejected("Legacy cache import ID was reused with a different payload"))
+            };
+        }
+        if self.task_store.cache_batch_count(&shard_id).await? >= 128 {
+            return Ok(rejected("Replicated shard cache is full during bootstrap"));
+        }
+        self.task_store.save_cache_batch(&shard_id, &batch_id, &entry).await?;
+        Ok(accepted("Legacy cache entry imported", serde_json::json!({"batch_id": batch_id})))
+    }
+
+    async fn apply_cache_batch(
+        &self, shard_id: String, node_id: String, fencing_token: u64, issued_at_ms: i64,
+        batch_id: String, records: Vec<crate::pipeline::Record>,
+        next_offset: Option<crate::pipeline::OffsetValue>, source_count: u64,
+    ) -> Result<CommandResponse> {
+        let parsed_shard_id = parse_shard_id(&shard_id)?;
+        let shard = match self.task_store.get_shard(&parsed_shard_id).await? {
+            Some(shard) => shard,
+            None => return Ok(rejected("Shard not found")),
+        };
+        let at = chrono::DateTime::from_timestamp_millis(issued_at_ms)
+            .ok_or_else(|| DatspoolError::Serialization("Invalid cache batch timestamp".into()))?;
+        if !lease_matches(&shard, &node_id, fencing_token, at) {
+            return Ok(rejected("Cache batch rejected by fencing token"));
+        }
+        if !valid_batch_id(&batch_id) {
+            return Ok(rejected("Invalid cache batch ID; expected a 16-hex generation and 6-hex sequence"));
+        }
+        if self.task_store.cache_ack_watermark(&shard_id).await?
+            .as_deref().is_some_and(|watermark| batch_id.as_str() <= watermark)
+        {
+            return Ok(accepted("Source batch was already acknowledged", serde_json::json!({"batch_id": batch_id})));
+        }
+        let key = crate::pipeline::cache::LocalBatchCache::<S>::key_for_shard(&shard_id, &batch_id);
+        let entry = crate::pipeline::cache::CacheEntry { records, next_offset, source_count };
+        if let Some(existing) = self.task_store.kv_store().get_cf(crate::storage::cf::CACHE, &key).await? {
+            let existing: crate::pipeline::cache::CacheEntry = serde_json::from_slice(&existing)?;
+            if existing == entry {
+                return Ok(accepted("Source batch already replicated", serde_json::json!({"batch_id": batch_id})));
+            }
+            return Ok(rejected("Cache batch ID was reused with a different payload"));
+        }
+        if self.task_store.cache_batch_count(&shard_id).await? >= 128 {
+            return Ok(rejected("Replicated shard cache is full"));
+        }
+        self.task_store.save_cache_batch(&shard_id, &batch_id, &entry).await?;
+        Ok(accepted("Source batch replicated", serde_json::json!({"batch_id": batch_id})))
+    }
+
+    async fn apply_dead_letters(
+        &self, shard_id: String, node_id: String, fencing_token: u64, issued_at_ms: i64,
+        failures: Vec<crate::pipeline::FailedRecord>,
+    ) -> Result<CommandResponse> {
+        let parsed_shard_id = parse_shard_id(&shard_id)?;
+        let shard = match self.task_store.get_shard(&parsed_shard_id).await? {
+            Some(shard) => shard,
+            None => return Ok(rejected("Shard not found")),
+        };
+        let at = chrono::DateTime::from_timestamp_millis(issued_at_ms)
+            .ok_or_else(|| DatspoolError::Serialization("Invalid dead-letter timestamp".into()))?;
+        if !lease_matches(&shard, &node_id, fencing_token, at) {
+            return Ok(rejected("Dead-letter persistence rejected by fencing token"));
+        }
+        let count = failures.len();
+        let queue = crate::pipeline::DeadLetterQueue::new(
+            std::sync::Arc::new(self.task_store.kv_store().clone()),
+            &shard_id,
+        );
+        queue.enqueue_at(failures, issued_at_ms.max(0) as u64).await?;
+        Ok(accepted("Dead-letter records replicated", serde_json::json!({"count": count})))
+    }
+
+    async fn apply_ack_cache_batch(
+        &self, shard_id: String, node_id: String, fencing_token: u64, issued_at_ms: i64,
+        cache_key: String,
+    ) -> Result<CommandResponse> {
+        let parsed_shard_id = parse_shard_id(&shard_id)?;
+        let expected_prefix = crate::pipeline::cache::LocalBatchCache::<S>::prefix_for_shard(&shard_id);
+        let batch_id = match cache_key.as_bytes().strip_prefix(&expected_prefix) {
+            Some(value) => match std::str::from_utf8(value) {
+                Ok(value) if valid_batch_id(value) => value.to_string(),
+                _ => return Ok(rejected("Invalid replicated cache key")),
+            },
+            None => return Ok(rejected("Cache key does not belong to this shard")),
+        };
+        if self.task_store.cache_ack_watermark(&shard_id).await?
+            .as_deref().is_some_and(|watermark| batch_id.as_str() <= watermark)
+        {
+            return Ok(accepted("Replicated cache entry already acknowledged", serde_json::json!({"batch_id": batch_id})));
+        }
+        let shard = match self.task_store.get_shard(&parsed_shard_id).await? {
+            Some(shard) => shard,
+            None => return Ok(rejected("Shard not found")),
+        };
+        let at = chrono::DateTime::from_timestamp_millis(issued_at_ms)
+            .ok_or_else(|| DatspoolError::Serialization("Invalid cache acknowledgement timestamp".into()))?;
+        if !lease_matches(&shard, &node_id, fencing_token, at) {
+            return Ok(rejected("Cache acknowledgement rejected by fencing token"));
+        }
+        match self.task_store.first_cache_batch_key(&shard_id).await? {
+            Some(first_key) if first_key == cache_key.as_bytes() => {}
+            Some(_) => return Ok(rejected("Cache batches must be acknowledged in FIFO order")),
+            None => return Ok(rejected("Replicated cache batch does not exist")),
+        }
+        self.task_store.ack_cache_batch(&shard_id, &batch_id, cache_key.as_bytes()).await?;
+        Ok(accepted("Replicated cache entry acknowledged", serde_json::json!({"cache_key": cache_key})))
+    }
+
+    async fn apply_renew_lease(&self, shard_id: String, node_id: String, fencing_token: u64, issued_at_ms: i64, lease_expires_at_ms: i64) -> Result<CommandResponse> {
+        let shard_id = parse_shard_id(&shard_id)?;
+        let mut shard = match self.task_store.get_shard(&shard_id).await? {
+            Some(shard) => shard,
+            None => return Ok(rejected("Shard not found")),
+        };
+        let owner_matches = matches!(&shard.state, ShardState::Running { node_id: owner, .. } if owner.as_str() == node_id);
+        let lease_valid_at_issue = shard.lease_expires_at.as_ref()
+            .is_some_and(|expires| expires.timestamp_millis() > issued_at_ms);
+        let new_expiry = chrono::DateTime::from_timestamp_millis(lease_expires_at_ms)
+            .ok_or_else(|| DatspoolError::Serialization("Invalid lease expiration".into()))?;
+        if owner_matches && shard.fencing_token == fencing_token && shard.lease_expires_at.as_ref() == Some(&new_expiry) {
+            return Ok(accepted("Lease renewal already committed", serde_json::json!({"fencing_token": fencing_token, "lease_expires_at_ms": lease_expires_at_ms})));
+        }
+        let issued_at = chrono::DateTime::from_timestamp_millis(issued_at_ms)
+            .ok_or_else(|| DatspoolError::Serialization("Invalid renewal timestamp".into()))?;
+        if !owner_matches || !lease_valid_at_issue || !shard.renew_lease_at(&NodeId::new(node_id), fencing_token, new_expiry, issued_at) {
+            return Ok(rejected("Lease renewal rejected: owner, fencing token, or lease deadline is stale"));
+        }
+        self.task_store.save_shard(&shard).await?;
+        Ok(accepted("Lease renewed", serde_json::json!({"fencing_token": fencing_token, "lease_expires_at_ms": lease_expires_at_ms})))
+    }
+
+    async fn apply_progress(&self, shard_id: String, node_id: String, fencing_token: u64, issued_at_ms: i64, processed_records: u64, offset: String) -> Result<CommandResponse> {
+        let shard_id = parse_shard_id(&shard_id)?;
+        let mut shard = match self.task_store.get_shard(&shard_id).await? {
+            Some(shard) => shard,
+            None => return Ok(rejected("Shard not found")),
+        };
+        if !lease_matches(&shard, &node_id, fencing_token, chrono::DateTime::from_timestamp_millis(issued_at_ms).ok_or_else(|| DatspoolError::Serialization("Invalid command timestamp".into()))?) {
+            return Ok(rejected("Progress rejected by fencing token"));
+        }
+        let offset = serde_json::from_str(&offset).map_err(|e| DatspoolError::Serialization(e.to_string()))?;
+        let at = chrono::DateTime::from_timestamp_millis(issued_at_ms)
+            .ok_or_else(|| DatspoolError::Serialization("Invalid progress timestamp".into()))?;
+        shard.set_progress_at(processed_records, offset, at);
+        self.task_store.save_shard(&shard).await?;
+        Ok(accepted("Shard progress updated", serde_json::json!({"fencing_token": fencing_token})))
+    }
+
+    async fn apply_complete(&self, shard_id: String, node_id: String, fencing_token: u64, issued_at_ms: i64, total_records: u64) -> Result<CommandResponse> {
+        let shard_id = parse_shard_id(&shard_id)?;
+        let mut shard = match self.task_store.get_shard(&shard_id).await? {
+            Some(shard) => shard,
+            None => return Ok(rejected("Shard not found")),
+        };
+        if matches!(&shard.state, ShardState::Completed { .. }) && shard.fencing_token == fencing_token {
+            return Ok(accepted("Shard completion already committed", serde_json::json!({"fencing_token": fencing_token})));
+        }
+        if !lease_matches(&shard, &node_id, fencing_token, chrono::DateTime::from_timestamp_millis(issued_at_ms).ok_or_else(|| DatspoolError::Serialization("Invalid command timestamp".into()))?) {
+            return Ok(rejected("Completion rejected by fencing token"));
+        }
+        let at = chrono::DateTime::from_timestamp_millis(issued_at_ms)
+            .ok_or_else(|| DatspoolError::Serialization("Invalid completion timestamp".into()))?;
+        shard.complete_at(total_records, at);
+        self.task_store.save_shard(&shard).await?;
+        Ok(accepted("Shard completed", serde_json::json!({"fencing_token": fencing_token})))
+    }
+
+    async fn apply_fail(&self, shard_id: String, node_id: String, fencing_token: u64, issued_at_ms: i64, error_message: String) -> Result<CommandResponse> {
+        let shard_id = parse_shard_id(&shard_id)?;
+        let mut shard = match self.task_store.get_shard(&shard_id).await? {
+            Some(shard) => shard,
+            None => return Ok(rejected("Shard not found")),
+        };
+        if matches!(&shard.state, ShardState::Failed { .. }) && shard.fencing_token == fencing_token {
+            return Ok(accepted("Shard failure already committed", serde_json::json!({"fencing_token": fencing_token})));
+        }
+        if !lease_matches(&shard, &node_id, fencing_token, chrono::DateTime::from_timestamp_millis(issued_at_ms).ok_or_else(|| DatspoolError::Serialization("Invalid command timestamp".into()))?) {
+            return Ok(rejected("Failure update rejected by fencing token"));
+        }
+        let at = chrono::DateTime::from_timestamp_millis(issued_at_ms)
+            .ok_or_else(|| DatspoolError::Serialization("Invalid failure timestamp".into()))?;
+        shard.fail_at(error_message, 1, at);
+        self.task_store.save_shard(&shard).await?;
+        Ok(accepted("Shard marked failed", serde_json::json!({"fencing_token": fencing_token})))
+    }
+
+    pub async fn validate_lease(&self, shard_id: &ShardId, node_id: &str, fencing_token: u64) -> Result<bool> {
+        let Some(shard) = self.task_store.get_shard(shard_id).await? else { return Ok(false) };
+        Ok(lease_matches(&shard, node_id, fencing_token, chrono::Utc::now()))
     }
 }
 
-// NOTE: Full openraft::RaftStateMachine implementation would go here
-// This is a placeholder showing the structure
+fn lease_matches(shard: &ShardMeta, node_id: &str, fencing_token: u64, now: chrono::DateTime<chrono::Utc>) -> bool {
+    shard.fencing_token == fencing_token
+        && shard.lease_expires_at.as_ref().is_some_and(|expires| expires > &now)
+        && matches!(&shard.state, ShardState::Running { node_id: owner, .. } if owner.as_str() == node_id)
+}
+
+fn valid_batch_id(value: &str) -> bool {
+    let Some((generation, sequence)) = value.split_once('-') else { return false; };
+    generation.len() == 16
+        && sequence.len() == 6
+        && generation.bytes().all(|byte| byte.is_ascii_hexdigit())
+        && sequence.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn parse_shard_id(value: &str) -> Result<ShardId> {
+    value.parse().map_err(|e: uuid::Error| DatspoolError::Serialization(e.to_string()))
+}
+
+fn accepted(message: &str, data: serde_json::Value) -> CommandResponse {
+    CommandResponse { success: true, message: message.to_string(), data: Some(data) }
+}
+
+fn rejected(message: &str) -> CommandResponse {
+    CommandResponse { success: false, message: message.to_string(), data: None }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::RocksDbStore;
+    use crate::task::{ShardMeta, TaskMeta};
+    use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn stale_fencing_token_cannot_renew_or_complete_reclaimed_shard() {
+        let dir = tempdir().unwrap();
+        let db = RocksDbStore::open(dir.path()).unwrap();
+        let store = TaskStore::new(db);
+        let task = TaskMeta::new("fence-test".into(), "{}".into(), "{}".into());
+        let task_id = task.task_id;
+        store.save_task(&task).await.unwrap();
+        let shard = ShardMeta::new(task_id, 0, "{}".into());
+        let shard_id = shard.shard_id;
+        store.save_shard(&shard).await.unwrap();
+        let mut sm = MetaStateMachine::new(store.kv_store().clone());
+        let now = chrono::Utc::now().timestamp_millis();
+
+        let first = sm.apply_command(Command::ClaimShard {
+            shard_id: shard_id.to_string(), node_id: "node-a".into(), claim_id: "claim-a".into(),
+            issued_at_ms: now, lease_expires_at_ms: now + 30_000,
+        }).await.unwrap();
+        assert!(first.success);
+        assert_eq!(first.data.as_ref().unwrap()["fencing_token"], crate::task::shard::FENCING_TOKEN_BASE + 1);
+
+        let reclaimed = sm.apply_command(Command::ClaimShard {
+            shard_id: shard_id.to_string(), node_id: "node-b".into(), claim_id: "claim-b".into(),
+            issued_at_ms: now + 31_000, lease_expires_at_ms: now + 61_000,
+        }).await.unwrap();
+        assert!(reclaimed.success);
+        assert_eq!(reclaimed.data.as_ref().unwrap()["fencing_token"], crate::task::shard::FENCING_TOKEN_BASE + 2);
+
+        let stale = sm.apply_command(Command::CompleteShard {
+            shard_id: shard_id.to_string(), node_id: "node-a".into(),
+            fencing_token: crate::task::shard::FENCING_TOKEN_BASE + 1, issued_at_ms: now + 32_000, total_records: 100,
+        }).await.unwrap();
+        assert!(!stale.success);
+
+        let current = store.get_shard(&shard_id).await.unwrap().unwrap();
+        assert_eq!(current.fencing_token, crate::task::shard::FENCING_TOKEN_BASE + 2);
+        assert!(matches!(current.state, ShardState::Running { ref node_id, .. } if node_id.as_str() == "node-b"));
+    }
+}

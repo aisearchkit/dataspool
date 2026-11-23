@@ -13,6 +13,8 @@ use tracing::info;
 use crate::drivers::factory::{SinkConfig, SourceConfig, create_sink, create_source};
 use crate::error::{DatspoolError, Result};
 use crate::pipeline::{DeadLetterQueue, LocalBatchCache, Sink, Source};
+use crate::raft::{Command, RaftNode};
+use super::ShardLease;
 use crate::storage::index::TieredIndexStore;
 use crate::storage::kv::KvStore;
 use crate::task::shard::ShardMeta;
@@ -48,6 +50,7 @@ pub struct ShardExecutor<S: KvStore> {
     task_store: Arc<TaskStore<S>>,
     index_store: Arc<RwLock<TieredIndexStore<S>>>,
     batch_size: usize,
+    raft: Option<Arc<RaftNode>>,
 }
 
 impl<S: KvStore + Clone + 'static> Clone for ShardExecutor<S> {
@@ -56,6 +59,7 @@ impl<S: KvStore + Clone + 'static> Clone for ShardExecutor<S> {
             task_store: self.task_store.clone(),
             index_store: self.index_store.clone(),
             batch_size: self.batch_size,
+            raft: self.raft.clone(),
         }
     }
 }
@@ -69,7 +73,18 @@ impl<S: KvStore + Clone + 'static> ShardExecutor<S> {
             task_store,
             index_store,
             batch_size: 1000, // Default batch size
+            raft: None,
         }
+    }
+
+    pub fn new_with_raft(
+        task_store: Arc<TaskStore<S>>,
+        index_store: Arc<RwLock<TieredIndexStore<S>>>,
+        raft: Arc<RaftNode>,
+    ) -> Self {
+        let mut executor = Self::new(task_store, index_store);
+        executor.raft = Some(raft);
+        executor
     }
 
     pub fn with_batch_size(mut self, batch_size: usize) -> Self {
@@ -91,6 +106,24 @@ impl<S: KvStore + Clone + 'static> ShardExecutor<S> {
         shard_id: &str,
         cancellation: CancellationToken,
     ) -> Result<ExecutionStats> {
+        self.execute_internal(shard_id, None, cancellation).await
+    }
+
+    pub async fn execute_with_lease(
+        &self,
+        shard_id: &str,
+        lease: ShardLease,
+        cancellation: CancellationToken,
+    ) -> Result<ExecutionStats> {
+        self.execute_internal(shard_id, Some(lease), cancellation).await
+    }
+
+    async fn execute_internal(
+        &self,
+        shard_id: &str,
+        lease: Option<ShardLease>,
+        cancellation: CancellationToken,
+    ) -> Result<ExecutionStats> {
         use std::str::FromStr;
 
         info!("Executing shard: {}", shard_id);
@@ -103,13 +136,17 @@ impl<S: KvStore + Clone + 'static> ShardExecutor<S> {
             .await?
             .ok_or_else(|| DatspoolError::Internal(format!("Shard {shard_id} not found")))?;
         if cancellation.is_cancelled() {
-            let mut pending = shard.clone();
-            pending.set_state(crate::types::ShardState::Pending);
-            self.task_store.save_shard(&pending).await?;
+            self.release_lease(lease.as_ref()).await;
             return Ok(ExecutionStats {
                 cancelled: true,
                 ..Default::default()
             });
+        }
+        if let Some(lease) = lease.as_ref() {
+            self.ensure_lease(lease).await?;
+            if shard.fencing_token != lease.fencing_token {
+                return Err(DatspoolError::Internal("Shard fencing token does not match claimed lease".into()));
+            }
         }
         let task = self
             .task_store
@@ -125,10 +162,11 @@ impl<S: KvStore + Clone + 'static> ShardExecutor<S> {
         let mut sink = create_sink(&sink_config)?;
 
         let execution = self
-            .execute_pipeline_with_cancellation(
+            .execute_pipeline_with_lease(
                 &shard,
                 source.as_mut(),
                 sink.as_mut(),
+                lease.clone(),
                 cancellation.clone(),
             )
             .await;
@@ -137,30 +175,32 @@ impl<S: KvStore + Clone + 'static> ShardExecutor<S> {
             Err(_) => cancellation.is_cancelled(),
         };
         if should_requeue {
-            let mut pending = self
-                .task_store
-                .get_shard(&shard_key)
-                .await?
-                .ok_or_else(|| {
-                    DatspoolError::Internal(format!(
-                        "Shard {shard_id} disappeared during shutdown"
-                    ))
-                })?;
-            pending.set_state(crate::types::ShardState::Pending);
-            self.task_store.save_shard(&pending).await?;
+            self.release_lease(lease.as_ref()).await;
             return execution;
         }
         let stats = execution?;
-        let mut completed = self
-            .task_store
-            .get_shard(&shard_key)
-            .await?
-            .ok_or_else(|| {
-                DatspoolError::Internal(format!("Shard {shard_id} disappeared during execution"))
-            })?;
         if !stats.is_continuous {
-            completed.complete(stats.docs_written);
-            self.task_store.save_shard(&completed).await?;
+            if let Some(lease) = lease.as_ref() {
+                self.ensure_lease(lease).await?;
+                let completed = self.task_store.get_shard(&shard_key).await?
+                    .ok_or_else(|| DatspoolError::Internal(format!("Shard {shard_id} disappeared before completion")))?;
+                let response = self.raft.as_ref().ok_or_else(|| DatspoolError::Internal("Raft is required for leased execution".into()))?
+                    .propose(Command::CompleteShard {
+                        shard_id: shard_id.to_string(),
+                        node_id: lease.node_id.to_string(),
+                        fencing_token: lease.fencing_token,
+                        issued_at_ms: chrono::Utc::now().timestamp_millis(),
+                        total_records: completed.records_processed,
+                    }).await?;
+                if !response.success {
+                    return Err(DatspoolError::Internal(format!("Shard completion rejected: {}", response.message)));
+                }
+            } else {
+                let mut completed = self.task_store.get_shard(&shard_key).await?
+                    .ok_or_else(|| DatspoolError::Internal(format!("Shard {shard_id} disappeared during execution")))?;
+                completed.complete(stats.docs_written);
+                self.task_store.save_shard(&completed).await?;
+            }
         }
 
         info!(
@@ -187,10 +227,11 @@ impl<S: KvStore + Clone + 'static> ShardExecutor<S> {
         source: &mut dyn Source,
         sink: &mut dyn Sink,
     ) -> Result<ExecutionStats> {
-        self.execute_pipeline_with_cancellation(
+        self.execute_pipeline_with_lease(
             shard,
             source,
             sink,
+            None,
             CancellationToken::new(),
         )
         .await
@@ -203,6 +244,17 @@ impl<S: KvStore + Clone + 'static> ShardExecutor<S> {
         shard: &ShardMeta,
         source: &mut dyn Source,
         sink: &mut dyn Sink,
+        cancellation: CancellationToken,
+    ) -> Result<ExecutionStats> {
+        self.execute_pipeline_with_lease(shard, source, sink, None, cancellation).await
+    }
+
+    async fn execute_pipeline_with_lease(
+        &self,
+        shard: &ShardMeta,
+        source: &mut dyn Source,
+        sink: &mut dyn Sink,
+        lease: Option<ShardLease>,
         cancellation: CancellationToken,
     ) -> Result<ExecutionStats> {
         let mut stats = ExecutionStats {
@@ -221,11 +273,16 @@ impl<S: KvStore + Clone + 'static> ShardExecutor<S> {
             .as_ref()
             .map(|stored| stored.offset.clone())
             .unwrap_or_else(|| shard.offset.clone());
-        let cache = LocalBatchCache::new_for_shard(
-            Arc::new(self.task_store.kv_store().clone()),
-            128,
-            &shard.shard_id.to_string(),
-        );
+        let cache_store = Arc::new(self.task_store.kv_store().clone());
+        let cache = if lease.is_some() {
+            LocalBatchCache::new_replicated_for_shard(
+                cache_store, 128, &shard.shard_id.to_string(),
+            )
+        } else {
+            LocalBatchCache::new_for_shard(
+                cache_store, 128, &shard.shard_id.to_string(),
+            )
+        };
 
         // Replay durable batches before reading new source data after a restart.
         while cache.pending().await? > 0 {
@@ -234,11 +291,20 @@ impl<S: KvStore + Clone + 'static> ShardExecutor<S> {
                 break;
             }
             let task_store = self.task_store.clone();
+            let executor = self.clone();
+            let lease_for_delivery = lease.clone();
+            let lease_for_ack = lease.clone();
+            let executor_for_ack = self.clone();
             let shard_id = shard.shard_id;
+            let shard_id_for_ack = shard.shard_id;
             let sink_ref = &mut *sink;
             let delivered = cache
-                .deliver_one_with_checkpoint(|batch, next_offset, source_count| async move {
-                    let write = sink_ref.write_batch(batch).await?;
+                .deliver_one_with_checkpoint_and_ack(|batch, next_offset, source_count| async move {
+                    executor.ensure_optional_lease(lease_for_delivery.as_ref()).await?;
+                    let write = match lease_for_delivery.as_ref() {
+                        Some(lease) => sink_ref.write_batch_fenced(batch, lease.next_sink_version()?).await?,
+                        None => sink_ref.write_batch(batch).await?,
+                    };
                     if write.rejected_count > 0 || write.failed_count > write.failed_records.len() {
                         return Err(crate::error::DatspoolError::Internal(format!(
                             "cached batch delivery still has retryable/unclassified failures: {} failed, {} rejected: {}",
@@ -246,21 +312,42 @@ impl<S: KvStore + Clone + 'static> ShardExecutor<S> {
                         )));
                     }
                     if !write.failed_records.is_empty() {
-                        let dlq = DeadLetterQueue::new(Arc::new(task_store.kv_store().clone()), &shard_id.to_string());
-                        dlq.enqueue(write.failed_records).await?;
+                        if let Some(lease) = lease_for_delivery.as_ref() {
+                            let response = executor.raft.as_ref()
+                                .ok_or_else(|| DatspoolError::Internal("Raft is required to persist dead letters".into()))?
+                                .propose(Command::PersistDeadLetters {
+                                    shard_id: shard_id.to_string(),
+                                    node_id: lease.node_id.to_string(),
+                                    fencing_token: lease.fencing_token,
+                                    issued_at_ms: chrono::Utc::now().timestamp_millis(),
+                                    failures: write.failed_records,
+                                }).await?;
+                            if !response.success {
+                                return Err(DatspoolError::Internal(format!("Fenced DLQ persistence rejected: {}", response.message)));
+                            }
+                        } else {
+                            let dlq = DeadLetterQueue::new(Arc::new(task_store.kv_store().clone()), &shard_id.to_string());
+                            dlq.enqueue(write.failed_records).await?;
+                        }
                     }
                     if let Some(next_offset) = next_offset {
-                        let mut stored =
-                            task_store.get_shard(&shard_id).await?.ok_or_else(|| {
-                                crate::error::DatspoolError::Internal(format!(
-                                    "Shard {} not found",
-                                    shard_id
-                                ))
-                            })?;
-                        // Checkpoint writes are idempotent if a crash occurred after save but before cache ACK.
-                        if stored.offset != next_offset {
-                            stored.update_progress(source_count, 0, next_offset);
-                            task_store.save_shard(&stored).await?;
+                        executor.persist_progress(lease_for_delivery.as_ref(), &shard_id, source_count, next_offset).await?;
+                    }
+                    Ok(())
+                }, move |cache_key| async move {
+                    if let Some(lease) = lease_for_ack.as_ref() {
+                        executor_for_ack.ensure_lease(lease).await?;
+                        let response = executor_for_ack.raft.as_ref()
+                            .ok_or_else(|| DatspoolError::Internal("Raft is required to acknowledge replicated cache".into()))?
+                            .propose(Command::AckCacheBatch {
+                                shard_id: shard_id_for_ack.to_string(),
+                                node_id: lease.node_id.to_string(),
+                                fencing_token: lease.fencing_token,
+                                issued_at_ms: chrono::Utc::now().timestamp_millis(),
+                                cache_key: cache_key.to_string(),
+                            }).await?;
+                        if !response.success {
+                            return Err(DatspoolError::Internal(format!("Replicated cache acknowledgement rejected: {}", response.message)));
                         }
                     }
                     Ok(())
@@ -296,18 +383,7 @@ impl<S: KvStore + Clone + 'static> ShardExecutor<S> {
                     // without emitting a record. Persist that transition so a restart
                     // does not reopen the snapshot or recapture a later CDC watermark.
                     if new_offset != offset {
-                        let mut stored = self
-                            .task_store
-                            .get_shard(&shard.shard_id)
-                            .await?
-                            .ok_or_else(|| {
-                                DatspoolError::Internal(format!(
-                                    "Shard {} disappeared while checkpointing source phase",
-                                    shard.shard_id
-                                ))
-                            })?;
-                        stored.update_progress(0, 0, new_offset.clone());
-                        self.task_store.save_shard(&stored).await?;
+                        self.persist_progress(lease.as_ref(), &shard.shard_id, 0, new_offset.clone()).await?;
                         offset = new_offset;
                     }
                     // A drained CDC feed is idle, not complete. Keep the source
@@ -325,16 +401,47 @@ impl<S: KvStore + Clone + 'static> ShardExecutor<S> {
                 break;
             }
 
-            // Persist payload + next cursor before attempting destination delivery.
-            cache
-                .enqueue_with_checkpoint(&batch, Some(new_offset.clone()), batch_size as u64)
-                .await?;
+            // Replicate payload + next cursor to the Raft state machine before
+            // attempting any destination write. A new owner can then replay it.
+            if let Some(lease) = lease.as_ref() {
+                self.ensure_lease(lease).await?;
+                cache.ensure_capacity().await?;
+                let batch_id = lease.next_batch_id()?;
+                let expected_batch_id = batch_id.clone();
+                let response = self.raft.as_ref()
+                    .ok_or_else(|| DatspoolError::Internal("Raft is required to replicate source batches".into()))?
+                    .propose(Command::CacheBatch {
+                        shard_id: shard.shard_id.to_string(),
+                        node_id: lease.node_id.to_string(),
+                        fencing_token: lease.fencing_token,
+                        issued_at_ms: chrono::Utc::now().timestamp_millis(),
+                        batch_id,
+                        records: batch.records().to_vec(),
+                        next_offset: Some(new_offset.clone()),
+                        source_count: batch_size as u64,
+                    }).await?;
+                if !response.success {
+                    return Err(DatspoolError::Internal(format!("Raft rejected source batch replication: {}", response.message)));
+                }
+                cache.wait_for_batch(&expected_batch_id, std::time::Duration::from_secs(15)).await?;
+            } else {
+                cache.enqueue_with_checkpoint(&batch, Some(new_offset.clone()), batch_size as u64).await?;
+            }
             let task_store = self.task_store.clone();
+            let executor = self.clone();
+            let lease_for_delivery = lease.clone();
+            let lease_for_ack = lease.clone();
+            let executor_for_ack = self.clone();
             let shard_id = shard.shard_id;
+            let shard_id_for_ack = shard.shard_id;
             let sink_ref = &mut *sink;
             cache
-                .deliver_one_with_checkpoint(|cached_batch, next_offset, source_count| async move {
-                    let write = sink_ref.write_batch(cached_batch).await?;
+                .deliver_one_with_checkpoint_and_ack(|cached_batch, next_offset, source_count| async move {
+                    executor.ensure_optional_lease(lease_for_delivery.as_ref()).await?;
+                    let write = match lease_for_delivery.as_ref() {
+                        Some(lease) => sink_ref.write_batch_fenced(cached_batch, lease.next_sink_version()?).await?,
+                        None => sink_ref.write_batch(cached_batch).await?,
+                    };
                     if write.rejected_count > 0 || write.failed_count > write.failed_records.len() {
                         return Err(crate::error::DatspoolError::Internal(format!(
                             "batch delivery failed for shard {}: {} failed, {} rejected: {}",
@@ -345,23 +452,45 @@ impl<S: KvStore + Clone + 'static> ShardExecutor<S> {
                         )));
                     }
                     if !write.failed_records.is_empty() {
-                        let dlq = DeadLetterQueue::new(
-                            Arc::new(task_store.kv_store().clone()),
-                            &shard_id.to_string(),
-                        );
-                        dlq.enqueue(write.failed_records).await?;
+                        if let Some(lease) = lease_for_delivery.as_ref() {
+                            let response = executor.raft.as_ref()
+                                .ok_or_else(|| DatspoolError::Internal("Raft is required to persist dead letters".into()))?
+                                .propose(Command::PersistDeadLetters {
+                                    shard_id: shard_id.to_string(),
+                                    node_id: lease.node_id.to_string(),
+                                    fencing_token: lease.fencing_token,
+                                    issued_at_ms: chrono::Utc::now().timestamp_millis(),
+                                    failures: write.failed_records,
+                                }).await?;
+                            if !response.success {
+                                return Err(DatspoolError::Internal(format!("Fenced DLQ persistence rejected: {}", response.message)));
+                            }
+                        } else {
+                            let dlq = DeadLetterQueue::new(
+                                Arc::new(task_store.kv_store().clone()),
+                                &shard_id.to_string(),
+                            );
+                            dlq.enqueue(write.failed_records).await?;
+                        }
                     }
                     if let Some(next_offset) = next_offset {
-                        let mut stored =
-                            task_store.get_shard(&shard_id).await?.ok_or_else(|| {
-                                crate::error::DatspoolError::Internal(format!(
-                                    "Shard {} not found",
-                                    shard_id
-                                ))
-                            })?;
-                        if stored.offset != next_offset {
-                            stored.update_progress(source_count, 0, next_offset);
-                            task_store.save_shard(&stored).await?;
+                        executor.persist_progress(lease_for_delivery.as_ref(), &shard_id, source_count, next_offset).await?;
+                    }
+                    Ok(())
+                }, move |cache_key| async move {
+                    if let Some(lease) = lease_for_ack.as_ref() {
+                        executor_for_ack.ensure_lease(lease).await?;
+                        let response = executor_for_ack.raft.as_ref()
+                            .ok_or_else(|| DatspoolError::Internal("Raft is required to acknowledge replicated cache".into()))?
+                            .propose(Command::AckCacheBatch {
+                                shard_id: shard_id_for_ack.to_string(),
+                                node_id: lease.node_id.to_string(),
+                                fencing_token: lease.fencing_token,
+                                issued_at_ms: chrono::Utc::now().timestamp_millis(),
+                                cache_key: cache_key.to_string(),
+                            }).await?;
+                        if !response.success {
+                            return Err(DatspoolError::Internal(format!("Replicated cache acknowledgement rejected: {}", response.message)));
                         }
                     }
                     Ok(())
@@ -391,6 +520,68 @@ impl<S: KvStore + Clone + 'static> ShardExecutor<S> {
 
         stats.end_time = Some(std::time::Instant::now());
         Ok(stats)
+    }
+
+    async fn ensure_optional_lease(&self, lease: Option<&ShardLease>) -> Result<()> {
+        if let Some(lease) = lease { self.ensure_lease(lease).await?; }
+        Ok(())
+    }
+
+    async fn ensure_lease(&self, lease: &ShardLease) -> Result<()> {
+        if self.raft.is_none() {
+            return Err(DatspoolError::Internal("Leased execution requires an OpenRaft node".into()));
+        }
+        let shard = self.task_store.get_shard(&lease.shard_id).await?
+            .ok_or_else(|| DatspoolError::Internal(format!("Shard {} not found", lease.shard_id)))?;
+        let owner_matches = matches!(&shard.state, crate::types::ShardState::Running { node_id, .. } if node_id == &lease.node_id);
+        if !owner_matches || shard.fencing_token != lease.fencing_token
+            || shard.lease_expires_at.as_ref().is_none_or(|expires| expires <= &chrono::Utc::now()) {
+            return Err(DatspoolError::Internal(format!("Shard {} lease is no longer valid (fencing token {})", lease.shard_id, lease.fencing_token)));
+        }
+        Ok(())
+    }
+
+    async fn persist_progress(&self, lease: Option<&ShardLease>, shard_id: &crate::types::ShardId, batch_records: u64, offset: crate::pipeline::OffsetValue) -> Result<()> {
+        if let Some(lease) = lease {
+            self.ensure_lease(lease).await?;
+            let current = self.task_store.get_shard(shard_id).await?
+                .ok_or_else(|| DatspoolError::Internal(format!("Shard {shard_id} not found")))?;
+            if current.offset == offset { return Ok(()); }
+            let response = self.raft.as_ref().ok_or_else(|| DatspoolError::Internal("Raft is required for lease checkpoint".into()))?
+                .propose(Command::UpdateShardProgress {
+                    shard_id: shard_id.to_string(),
+                    node_id: lease.node_id.to_string(),
+                    fencing_token: lease.fencing_token,
+                    issued_at_ms: chrono::Utc::now().timestamp_millis(),
+                    processed_records: current.records_processed.saturating_add(batch_records),
+                    offset: serde_json::to_string(&offset).map_err(|e| DatspoolError::Serialization(e.to_string()))?,
+                }).await?;
+            if !response.success {
+                return Err(DatspoolError::Internal(format!("Fenced checkpoint rejected: {}", response.message)));
+            }
+        } else {
+            let mut current = self.task_store.get_shard(shard_id).await?
+                .ok_or_else(|| DatspoolError::Internal(format!("Shard {shard_id} not found")))?;
+            if current.offset != offset {
+                current.update_progress(batch_records, 0, offset);
+                self.task_store.save_shard(&current).await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn release_lease(&self, lease: Option<&ShardLease>) {
+        let Some(lease) = lease else { return; };
+        let Some(raft) = self.raft.as_ref() else { return; };
+        let result = raft.propose(Command::ReleaseShardLease {
+            shard_id: lease.shard_id.to_string(),
+            node_id: lease.node_id.to_string(),
+            fencing_token: lease.fencing_token,
+            issued_at_ms: chrono::Utc::now().timestamp_millis(),
+        }).await;
+        if let Err(error) = result {
+            tracing::warn!(shard_id = %lease.shard_id, %error, "Unable to release shard lease; it will expire naturally");
+        }
     }
 }
 #[cfg(test)]
