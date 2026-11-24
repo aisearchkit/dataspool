@@ -49,6 +49,19 @@ struct BatchDeliveryRequest {
     bytes_written: u64,
 }
 
+struct CdcCutoverRequest {
+    task_id: String,
+    alias: String,
+    old_index: Option<String>,
+    new_index: String,
+    final_watermark: u64,
+    applied_watermark: u64,
+    fencing_shard_id: String,
+    node_id: String,
+    fencing_token: u64,
+    issued_at_ms: i64,
+}
+
 struct ShardProgressRequest {
     shard_id: String,
     node_id: String,
@@ -251,6 +264,32 @@ impl<S: KvStore + Clone> MetaStateMachine<S> {
                     processed_bytes,
                     offset,
                     batch_id,
+                })
+                .await
+            }
+            Command::RecordCdcCutover {
+                task_id,
+                alias,
+                old_index,
+                new_index,
+                final_watermark,
+                applied_watermark,
+                fencing_shard_id,
+                node_id,
+                fencing_token,
+                issued_at_ms,
+            } => {
+                self.apply_record_cdc_cutover(CdcCutoverRequest {
+                    task_id,
+                    alias,
+                    old_index,
+                    new_index,
+                    final_watermark,
+                    applied_watermark,
+                    fencing_shard_id,
+                    node_id,
+                    fencing_token,
+                    issued_at_ms,
                 })
                 .await
             }
@@ -1528,6 +1567,17 @@ impl<S: KvStore + Clone> MetaStateMachine<S> {
         request_id: String,
         actor: String,
     ) -> Result<CommandResponse> {
+        if serde_json::from_str::<crate::drivers::factory::SourceConfig>(&task.source_config)
+            .is_ok_and(|source| {
+                matches!(
+                    source,
+                    crate::drivers::factory::SourceConfig::ElasticsearchOnline { .. }
+                )
+            })
+        {
+            task.metadata
+                .insert("_dataspool_cdc_cutover_required".into(), "true".into());
+        }
         let task_id = task.task_id;
         let request_id = if request_id.trim().is_empty() {
             // Older persisted Raft entries predate CreateTask request IDs.
@@ -2380,6 +2430,112 @@ impl<S: KvStore + Clone> MetaStateMachine<S> {
         ))
     }
 
+    async fn apply_record_cdc_cutover(
+        &self,
+        request: CdcCutoverRequest,
+    ) -> Result<CommandResponse> {
+        let CdcCutoverRequest {
+            task_id,
+            alias,
+            old_index,
+            new_index,
+            final_watermark,
+            applied_watermark,
+            fencing_shard_id,
+            node_id,
+            fencing_token,
+            issued_at_ms,
+        } = request;
+        if alias.trim().is_empty()
+            || new_index.trim().is_empty()
+            || applied_watermark < final_watermark
+        {
+            return Ok(rejected(
+                "CDC cutover metadata is incomplete or target watermark is behind source",
+            ));
+        }
+        let shard_id = parse_shard_id(&fencing_shard_id)?;
+        let Some(shard) = self.task_store.get_shard(&shard_id).await? else {
+            return Ok(rejected("CDC cutover fencing shard not found"));
+        };
+        if shard.task_id.to_string() != task_id
+            || !lease_matches(
+                &shard,
+                &node_id,
+                fencing_token,
+                chrono::DateTime::from_timestamp_millis(issued_at_ms).ok_or_else(|| {
+                    DatspoolError::Serialization("Invalid cutover timestamp".into())
+                })?,
+            )
+        {
+            return Ok(rejected(
+                "CDC cutover rejected by task identity or fencing token",
+            ));
+        }
+        let Some(mut task) = self.task_store.get_task(&shard.task_id).await? else {
+            return Ok(rejected("CDC cutover task not found"));
+        };
+        if task
+            .metadata
+            .get("_dataspool_cdc_cutover_committed")
+            .is_some_and(|value| value == "true")
+        {
+            let previous_final = task
+                .metadata
+                .get("_dataspool_cdc_final_watermark")
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(0);
+            let previous_applied = task
+                .metadata
+                .get("_dataspool_cdc_applied_watermark")
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(0);
+            let previous_alias = task.metadata.get("_dataspool_cdc_alias");
+            let previous_index = task.metadata.get("_dataspool_cdc_new_index");
+            if final_watermark < previous_final
+                || applied_watermark < previous_applied
+                || previous_alias.is_some_and(|value| value != &alias)
+                || previous_index.is_some_and(|value| value != &new_index)
+            {
+                return Ok(rejected(
+                    "CDC cutover record cannot regress watermarks or change its committed alias destination",
+                ));
+            }
+        }
+        task.metadata
+            .insert("_dataspool_cdc_cutover_required".into(), "true".into());
+        task.metadata.insert("_dataspool_cdc_alias".into(), alias);
+        task.metadata
+            .insert("_dataspool_cdc_new_index".into(), new_index);
+        task.metadata.insert(
+            "_dataspool_cdc_final_watermark".into(),
+            final_watermark.to_string(),
+        );
+        task.metadata.insert(
+            "_dataspool_cdc_applied_watermark".into(),
+            applied_watermark.to_string(),
+        );
+        task.metadata
+            .insert("_dataspool_cdc_cutover_committed".into(), "true".into());
+        task.metadata.insert(
+            "_dataspool_cdc_cutover_at_ms".into(),
+            issued_at_ms.to_string(),
+        );
+        if let Some(old_index) = old_index {
+            task.metadata
+                .insert("_dataspool_cdc_old_index".into(), old_index);
+        }
+        self.task_store.save_task(&task).await?;
+        Ok(accepted(
+            "CDC cutover committed in Raft",
+            serde_json::json!({
+                "final_watermark": final_watermark,
+                "applied_watermark": applied_watermark,
+                "alias": task.metadata.get("_dataspool_cdc_alias"),
+            }),
+        ))
+    }
+
     async fn apply_complete(
         &self,
         shard_id: String,
@@ -2400,6 +2556,45 @@ impl<S: KvStore + Clone> MetaStateMachine<S> {
             .is_some_and(|task| matches!(task.state, crate::types::TaskState::Cancelled { .. }))
         {
             return Ok(rejected("Task has been cancelled"));
+        }
+        let task = self.task_store.get_task(&shard.task_id).await?;
+        if let Some(task) = task.as_ref()
+            && task
+                .metadata
+                .get("_dataspool_cdc_cutover_required")
+                .is_some_and(|value| value == "true")
+        {
+            let final_watermark = task
+                .metadata
+                .get("_dataspool_cdc_final_watermark")
+                .and_then(|value| value.parse::<u64>().ok());
+            let applied_watermark = task
+                .metadata
+                .get("_dataspool_cdc_applied_watermark")
+                .and_then(|value| value.parse::<u64>().ok());
+            let committed = task
+                .metadata
+                .get("_dataspool_cdc_cutover_committed")
+                .is_some_and(|value| value == "true");
+            let alias = task
+                .metadata
+                .get("_dataspool_cdc_alias")
+                .is_some_and(|value| !value.trim().is_empty());
+            let new_index = task
+                .metadata
+                .get("_dataspool_cdc_new_index")
+                .is_some_and(|value| !value.trim().is_empty());
+            if !committed
+                || !alias
+                || !new_index
+                || final_watermark.is_none()
+                || applied_watermark
+                    .is_none_or(|applied| applied < final_watermark.unwrap_or(u64::MAX))
+            {
+                return Ok(rejected(
+                    "Online shard completion requires a committed CDC cutover at or beyond the final source watermark",
+                ));
+            }
         }
         if matches!(&shard.state, ShardState::Completed { .. })
             && shard.fencing_token == fencing_token
@@ -3714,6 +3909,108 @@ mod tests {
             aggregate.state,
             crate::types::TaskState::Failed { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn online_shard_completion_requires_committed_cdc_cutover() {
+        let dir = tempdir().unwrap();
+        let db = RocksDbStore::open(dir.path()).unwrap();
+        let store = TaskStore::new(db);
+        let online_source = crate::drivers::factory::SourceConfig::ElasticsearchOnline {
+            snapshot: crate::drivers::document::DocumentConfig::local("source-index"),
+            change_log_connection: crate::drivers::document::DocumentConfig::local("change-log"),
+            cdc: crate::drivers::document::CdcConfig::default(),
+        };
+        let task = TaskMeta::new(
+            "online-cutover-gate".into(),
+            serde_json::to_string(&online_source).unwrap(),
+            "{}".into(),
+        );
+        let task_id = task.task_id;
+        let shard = ShardMeta::new(task_id, 0, "{}".into());
+        let shard_id = shard.shard_id;
+        let mut sm = MetaStateMachine::new(store.kv_store().clone());
+        let now = chrono::Utc::now().timestamp_millis();
+        assert!(
+            sm.apply_command(Command::CreateTask {
+                request_id: format!("create:{task_id}"),
+                actor: "test".into(),
+                task: Box::new(task),
+                shards: vec![shard],
+            })
+            .await
+            .unwrap()
+            .success
+        );
+        assert!(
+            sm.apply_command(Command::ClaimShard {
+                shard_id: shard_id.to_string(),
+                node_id: "worker-cutover".into(),
+                claim_id: "claim-cutover".into(),
+                issued_at_ms: now,
+                lease_expires_at_ms: now + 60_000,
+            })
+            .await
+            .unwrap()
+            .success
+        );
+        let fencing_token = crate::task::shard::FENCING_TOKEN_BASE + 1;
+        let complete = || Command::CompleteShard {
+            shard_id: shard_id.to_string(),
+            node_id: "worker-cutover".into(),
+            fencing_token,
+            issued_at_ms: now + 1,
+            total_records: 0,
+        };
+        let created_task = store.get_task(&task_id).await.unwrap().unwrap();
+        assert_eq!(
+            created_task
+                .metadata
+                .get("_dataspool_cdc_cutover_required")
+                .map(String::as_str),
+            Some("true")
+        );
+        let rejected_completion = sm.apply_command(complete()).await.unwrap();
+        assert!(
+            !rejected_completion.success,
+            "online completion must be gated before cutover"
+        );
+        let recorded = sm
+            .apply_command(Command::RecordCdcCutover {
+                task_id: task_id.to_string(),
+                alias: "live".into(),
+                old_index: Some("source-v1".into()),
+                new_index: "target-v2".into(),
+                final_watermark: 42,
+                applied_watermark: 42,
+                fencing_shard_id: shard_id.to_string(),
+                node_id: "worker-cutover".into(),
+                fencing_token,
+                issued_at_ms: now + 2,
+            })
+            .await
+            .unwrap();
+        assert!(recorded.success, "{}", recorded.message);
+        let regressed = sm
+            .apply_command(Command::RecordCdcCutover {
+                task_id: task_id.to_string(),
+                alias: "live".into(),
+                old_index: Some("source-v1".into()),
+                new_index: "target-v2".into(),
+                final_watermark: 41,
+                applied_watermark: 41,
+                fencing_shard_id: shard_id.to_string(),
+                node_id: "worker-cutover".into(),
+                fencing_token,
+                issued_at_ms: now + 3,
+            })
+            .await
+            .unwrap();
+        assert!(
+            !regressed.success,
+            "Raft must reject cutover watermark regression"
+        );
+        assert!(sm.apply_command(complete()).await.unwrap().success);
     }
 
     #[tokio::test]

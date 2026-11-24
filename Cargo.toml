@@ -9,6 +9,10 @@ repository = "https://github.com/aisearchkit/dataspool"
 keywords = ["data-migration", "elasticsearch", "raft", "distributed-systems"]
 categories = ["database", "command-line-utilities"]
 
+[features]
+default = []
+test-fault-injection = []
+
 [dependencies]
 # Async runtime
 tokio = { version = "1.40", features = ["full"] }

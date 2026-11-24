@@ -51,8 +51,10 @@ pub struct ShardExecutor<S: KvStore> {
     index_store: Arc<RwLock<TieredIndexStore<S>>>,
     batch_size: usize,
     raft: Option<Arc<RaftNode>>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-fault-injection"))]
     crash_after_sink_before_delivery: Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(feature = "test-fault-injection")]
+    process_crash_after_sink_before_delivery: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl<S: KvStore + Clone + 'static> Clone for ShardExecutor<S> {
@@ -62,8 +64,12 @@ impl<S: KvStore + Clone + 'static> Clone for ShardExecutor<S> {
             index_store: self.index_store.clone(),
             batch_size: self.batch_size,
             raft: self.raft.clone(),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-fault-injection"))]
             crash_after_sink_before_delivery: self.crash_after_sink_before_delivery.clone(),
+            #[cfg(feature = "test-fault-injection")]
+            process_crash_after_sink_before_delivery: self
+                .process_crash_after_sink_before_delivery
+                .clone(),
         }
     }
 }
@@ -78,8 +84,12 @@ impl<S: KvStore + Clone + 'static> ShardExecutor<S> {
             index_store,
             batch_size: 1000, // Default batch size
             raft: None,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-fault-injection"))]
             crash_after_sink_before_delivery: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            #[cfg(feature = "test-fault-injection")]
+            process_crash_after_sink_before_delivery: Arc::new(std::sync::atomic::AtomicBool::new(
+                false,
+            )),
         }
     }
 
@@ -99,8 +109,29 @@ impl<S: KvStore + Clone + 'static> ShardExecutor<S> {
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
+    #[cfg(feature = "test-fault-injection")]
+    pub fn with_process_crash_after_sink_before_delivery(self) -> Self {
+        self.process_crash_after_sink_before_delivery
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self
+    }
+
     fn maybe_inject_crash_after_sink_before_delivery(&self) -> Result<()> {
-        #[cfg(test)]
+        #[cfg(feature = "test-fault-injection")]
+        if self
+            .process_crash_after_sink_before_delivery
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            // Signal the parent harness and remain blocked at the exact boundary.
+            // The harness sends SIGKILL (-9), bypassing destructors and cleanup.
+            if let Ok(marker) = std::env::var("DATASPOOL_CRASH_MARKER") {
+                let _ = std::fs::write(marker, b"destination-committed-before-delivery-ack");
+            }
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(60));
+            }
+        }
+        #[cfg(any(test, feature = "test-fault-injection"))]
         if self
             .crash_after_sink_before_delivery
             .swap(false, std::sync::atomic::Ordering::SeqCst)
@@ -182,6 +213,17 @@ impl<S: KvStore + Clone + 'static> ShardExecutor<S> {
             .get_task(&shard.task_id)
             .await?
             .ok_or_else(|| DatspoolError::Internal(format!("Task {} not found", shard.task_id)))?;
+
+        if lease.is_none()
+            && task
+                .metadata
+                .get("_dataspool_cdc_cutover_required")
+                .is_some_and(|value| value == "true")
+        {
+            return Err(DatspoolError::Internal(
+                "Online CDC migrations require Raft-leased execution and a committed cutover record".into(),
+            ));
+        }
 
         let source_config: SourceConfig = serde_json::from_str(&task.source_config)
             .map_err(|e| DatspoolError::Configuration(format!("Invalid source config: {e}")))?;
@@ -1089,6 +1131,246 @@ mod tests {
         fn sink_type(&self) -> &str {
             "durable-target-test"
         }
+    }
+
+    struct ThreeRecordSource {
+        emitted: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl Source for ThreeRecordSource {
+        async fn connect(&mut self) -> Result<()> {
+            Ok(())
+        }
+        async fn read_batch(
+            &mut self,
+            _offset: &OffsetValue,
+            _batch_size: usize,
+        ) -> Result<(RecordBatch, OffsetValue)> {
+            if self.emitted {
+                return Ok((RecordBatch::new(), OffsetValue::DocumentCount(3)));
+            }
+            self.emitted = true;
+            let mut batch = RecordBatch::new();
+            for id in ["doc-ok-1", "doc-retry", "doc-dlq"] {
+                batch.push(crate::pipeline::Record::with_id(
+                    id,
+                    "partial-bulk-test",
+                    serde_json::json!({"id": id}),
+                ));
+            }
+            Ok((batch, OffsetValue::DocumentCount(3)))
+        }
+        async fn estimate_count(&self) -> Result<Option<u64>> {
+            Ok(Some(3))
+        }
+        async fn close(&mut self) -> Result<()> {
+            Ok(())
+        }
+        fn source_type(&self) -> &str {
+            "partial-bulk-test"
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct PartialRetrySink {
+        docs: Arc<std::sync::Mutex<std::collections::HashMap<String, serde_json::Value>>>,
+        submitted: Arc<std::sync::Mutex<Vec<Vec<String>>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Sink for PartialRetrySink {
+        async fn connect(&mut self) -> Result<()> {
+            Ok(())
+        }
+        async fn write_batch(&mut self, input: RecordBatch) -> Result<WriteResult> {
+            self.write_batch_fenced(input, 1, "test-shard", "test-batch")
+                .await
+        }
+        async fn write_batch_fenced(
+            &mut self,
+            input: RecordBatch,
+            _version: i64,
+            _shard: &str,
+            _batch: &str,
+        ) -> Result<WriteResult> {
+            let records = input.into_records();
+            let ids = records
+                .iter()
+                .filter_map(|record| record.id.clone())
+                .collect::<Vec<_>>();
+            self.submitted.lock().unwrap().push(ids);
+            let mut docs = self.docs.lock().unwrap();
+            for record in &records {
+                if record.id.as_deref() == Some("doc-ok-1") {
+                    docs.insert(record.id.clone().unwrap(), record.payload.clone());
+                }
+            }
+            // First bulk: doc-ok-1 succeeds, doc-retry gets 429, doc-dlq gets
+            // a permanent mapping error. Retry request contains only doc-retry.
+            self.submitted
+                .lock()
+                .unwrap()
+                .push(vec!["doc-retry".into()]);
+            let retry = records
+                .iter()
+                .find(|record| record.id.as_deref() == Some("doc-retry"))
+                .unwrap();
+            docs.insert(retry.id.clone().unwrap(), retry.payload.clone());
+            let failed = records
+                .into_iter()
+                .find(|record| record.id.as_deref() == Some("doc-dlq"))
+                .unwrap();
+            Ok(WriteResult {
+                failed_records: vec![crate::pipeline::FailedRecord {
+                    record: failed,
+                    status: 400,
+                    error_type: "mapper_parsing_exception".into(),
+                    reason: "permanent mapping error".into(),
+                }],
+                success_count: 2,
+                failed_count: 1,
+                rejected_count: 0,
+                retried_count: 1,
+                bytes_written: 64,
+                errors: vec!["doc-dlq: permanent mapping error".into()],
+            })
+        }
+        async fn flush(&mut self) -> Result<()> {
+            Ok(())
+        }
+        async fn close(&mut self) -> Result<()> {
+            Ok(())
+        }
+        fn sink_type(&self) -> &str {
+            "partial-retry-test"
+        }
+    }
+
+    #[tokio::test]
+    async fn executor_persists_partial_bulk_retry_dlq_manifest_and_checkpoint_atomically_in_flow() {
+        use crate::agent::ShardClaimer;
+        use crate::raft::{Command, RaftNode, default_raft_config};
+        use crate::task::{ShardMeta, TaskMeta};
+        use openraft::BasicNode;
+        use std::collections::BTreeMap;
+
+        let dir = tempdir().unwrap();
+        let db = RocksDbStore::open(dir.path().join("app")).unwrap();
+        let store = Arc::new(TaskStore::new(db.clone()));
+        let token = "executor-partial-bulk-test-token-012345".to_string();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let raft = RaftNode::new(
+            1,
+            dir.path().join("raft"),
+            (*store).clone(),
+            default_raft_config(),
+            token.clone(),
+        )
+        .await
+        .unwrap();
+        let router = crate::raft_router(raft.handle(), token);
+        let rpc = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        raft.initialize(BTreeMap::from([(1, BasicNode::new(address.to_string()))]))
+            .await
+            .unwrap();
+        raft.wait_for_leader(std::time::Duration::from_secs(10))
+            .await
+            .unwrap();
+
+        let task = TaskMeta::new("partial-bulk-executor".into(), "{}".into(), "{}".into());
+        let shard = ShardMeta::new(task.task_id, 0, "{}".into());
+        let shard_id = shard.shard_id;
+        let created = raft
+            .propose(Command::CreateTask {
+                request_id: format!("create:{}", task.task_id),
+                actor: "test".into(),
+                task: Box::new(task),
+                shards: vec![shard.clone()],
+            })
+            .await
+            .unwrap();
+        assert!(created.success, "{}", created.message);
+        let claimer = ShardClaimer::new(
+            "worker-partial".into(),
+            store.clone(),
+            Arc::new(raft.clone()),
+        )
+        .with_lease_seconds(30)
+        .unwrap();
+        let lease = claimer.try_claim().await.unwrap().unwrap();
+        let index_store = Arc::new(RwLock::new(TieredIndexStore::new(
+            TieredConfig::default(),
+            Arc::new(db.clone()),
+        )));
+        let executor =
+            ShardExecutor::new_with_raft(store.clone(), index_store, Arc::new(raft.clone()))
+                .with_batch_size(3);
+        let sink = PartialRetrySink::default();
+        let mut source = ThreeRecordSource { emitted: false };
+        let mut sink_instance = sink.clone();
+        executor
+            .execute_pipeline_with_lease(
+                &shard,
+                &mut source,
+                &mut sink_instance,
+                Some(lease.clone()),
+                CancellationToken::new(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let submissions = sink.submitted.lock().unwrap().clone();
+        assert_eq!(submissions[0], vec!["doc-ok-1", "doc-retry", "doc-dlq"]);
+        assert_eq!(
+            submissions[1],
+            vec!["doc-retry"],
+            "only transiently rejected item is retried"
+        );
+        let (target_count, has_successes, has_dlq_doc) = {
+            let target_docs = sink.docs.lock().unwrap();
+            (
+                target_docs.len(),
+                target_docs.contains_key("doc-ok-1") && target_docs.contains_key("doc-retry"),
+                target_docs.contains_key("doc-dlq"),
+            )
+        };
+        assert_eq!(target_count, 2);
+        assert!(has_successes);
+        assert!(!has_dlq_doc);
+
+        let dlq = DeadLetterQueue::new(Arc::new(db.clone()), &shard_id.to_string());
+        assert_eq!(
+            dlq.len().await.unwrap(),
+            1,
+            "permanent failure must be durably dead-lettered"
+        );
+        let persisted = store.get_shard(&shard_id).await.unwrap().unwrap();
+        assert_eq!(
+            persisted.records_processed, 3,
+            "checkpoint advances only after successes and DLQ persistence"
+        );
+        assert_eq!(persisted.offset, OffsetValue::DocumentCount(3));
+        let batch_id = format!("{:016x}-{:06x}", lease.fencing_token, 0);
+        let key = crate::pipeline::cache::BatchManifest::key(&shard_id.to_string(), &batch_id);
+        let manifest: serde_json::Value = serde_json::from_slice(
+            &store
+                .kv_store()
+                .get_cf(crate::storage::cf::META, &key)
+                .await
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(manifest["status"], "acknowledged");
+        assert_eq!(manifest["target_success_count"], 2);
+        assert_eq!(manifest["target_failed_count"], 1);
+        raft.shutdown().await.unwrap();
+        rpc.abort();
     }
 
     #[tokio::test]

@@ -59,6 +59,7 @@ pub(crate) fn normalize_command_timestamp(command: &mut Command) -> Result<()> {
         | Command::AckCacheBatch { issued_at_ms, .. }
         | Command::UpdateShardProgress { issued_at_ms, .. }
         | Command::CompleteShard { issued_at_ms, .. }
+        | Command::RecordCdcCutover { issued_at_ms, .. }
         | Command::FailShard { issued_at_ms, .. } => *issued_at_ms = now,
         Command::UpdateFederatedMigrationProgress { at_ms, .. } => *at_ms = now,
         Command::RecordFederatedRemoteOperation { operation, .. } => operation.updated_at_ms = now,

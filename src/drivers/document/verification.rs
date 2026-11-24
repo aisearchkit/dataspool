@@ -7,7 +7,9 @@ use super::{DocumentConfig, DocumentSource};
 use crate::error::Result;
 use crate::pipeline::{OffsetValue, Source};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct IndexVerification {
@@ -17,6 +19,16 @@ pub struct IndexVerification {
     pub id_set_digest: String,
     /// Order-independent SHA-256 aggregate over canonical _source, excluding `_dataspool`.
     pub content_digest: String,
+}
+
+/// Canonical content projection for migrations with intentional transforms.
+/// Each map is canonical field name -> endpoint-specific JSON Pointer. For
+/// example, source `{ "old_name": ... }` and target `{ "new_name": ... }`
+/// can both project to canonical field `name`. Empty maps compare full `_source`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VerificationProjection {
+    pub source_fields: BTreeMap<String, String>,
+    pub target_fields: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -62,7 +74,11 @@ impl DigestAccumulator {
     }
 }
 
-async fn verify_index(config: &DocumentConfig, page_size: usize) -> Result<IndexVerification> {
+async fn verify_index(
+    config: &DocumentConfig,
+    page_size: usize,
+    projection_fields: &BTreeMap<String, String>,
+) -> Result<IndexVerification> {
     let mut source = DocumentSource::new(config.clone());
     source.connect().await?;
     let mut offset = OffsetValue::initial();
@@ -91,8 +107,22 @@ async fn verify_index(config: &DocumentConfig, page_size: usize) -> Result<Index
                     ))
                 })?;
                 object.remove("_dataspool");
+                let projected = if projection_fields.is_empty() {
+                    payload
+                } else {
+                    let mut selected = serde_json::Map::new();
+                    for (canonical_name, pointer) in projection_fields {
+                        let value = payload.pointer(pointer).ok_or_else(|| {
+                            crate::error::DriverError::DataError(format!(
+                                "Verification projection pointer {pointer:?} for canonical field {canonical_name:?} is absent in document {id}"
+                            ))
+                        })?;
+                        selected.insert(canonical_name.clone(), value.clone());
+                    }
+                    Value::Object(selected)
+                };
                 ids.push(id.as_bytes());
-                let canonical = serde_json::to_vec(&payload).map_err(|error| {
+                let canonical = serde_json::to_vec(&projected).map_err(|error| {
                     crate::error::DriverError::DataError(format!(
                         "Unable to canonicalize document {id}: {error}"
                     ))
@@ -134,8 +164,35 @@ pub async fn verify_source_target(
     target: &DocumentConfig,
     page_size: usize,
 ) -> Result<VerificationReport> {
-    let source_result = verify_index(source, page_size).await?;
-    let target_result = verify_index(target, page_size).await?;
+    verify_source_target_with_projection(
+        source,
+        target,
+        page_size,
+        &VerificationProjection::default(),
+    )
+    .await
+}
+
+/// Verify independent endpoints using a stable JSON Pointer projection. This is
+/// intended for migrations that rename/enrich fields: callers select the shared
+/// semantic fields (or pre-normalize both sides into the same projection).
+pub async fn verify_source_target_with_projection(
+    source: &DocumentConfig,
+    target: &DocumentConfig,
+    page_size: usize,
+    projection: &VerificationProjection,
+) -> Result<VerificationReport> {
+    let source_keys = projection.source_fields.keys().collect::<Vec<_>>();
+    let target_keys = projection.target_fields.keys().collect::<Vec<_>>();
+    if source_keys != target_keys {
+        return Err(crate::error::DriverError::DataError(
+            "Source and target verification projections must define the same canonical fields"
+                .into(),
+        )
+        .into());
+    }
+    let source_result = verify_index(source, page_size, &projection.source_fields).await?;
+    let target_result = verify_index(target, page_size, &projection.target_fields).await?;
     Ok(VerificationReport {
         count_matches: source_result.document_count == target_result.document_count,
         id_set_matches: source_result.id_set_digest == target_result.id_set_digest,
@@ -158,6 +215,29 @@ mod tests {
         second.push(b"beta");
         second.push(b"alpha");
         assert_eq!(first.finish(), second.finish());
+    }
+
+    #[test]
+    fn projection_normalizes_renamed_fields_to_the_same_canonical_key() {
+        let source = serde_json::json!({"old_name":"Ada", "volatile":1});
+        let target = serde_json::json!({"new_name":"Ada", "volatile":99});
+        let mut source_projection = BTreeMap::new();
+        source_projection.insert("name".to_string(), "/old_name".to_string());
+        let mut target_projection = BTreeMap::new();
+        target_projection.insert("name".to_string(), "/new_name".to_string());
+        let project = |value: &Value, fields: &BTreeMap<String, String>| {
+            Value::Object(
+                fields
+                    .iter()
+                    .map(|(name, pointer)| (name.clone(), value.pointer(pointer).unwrap().clone()))
+                    .collect(),
+            )
+        };
+        assert_eq!(
+            project(&source, &source_projection),
+            project(&target, &target_projection)
+        );
+        assert!(source.pointer("/missing").is_none());
     }
 
     #[test]

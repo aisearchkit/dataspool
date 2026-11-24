@@ -113,3 +113,18 @@ The online source does not itself create a transactional outbox, pause applicati
 ### Coordinated CDC cutover
 
 `cutover_with_write_barrier` provides the orchestration boundary for a safe final cutover. The producer integration implements `CdcWriteBarrier::pause_and_capture_final_watermark` by stopping source mutations and returning the final durable outbox sequence; the supplied checkpoint callback reads the target's committed CDC sequence (for distributed workers, from Raft). The coordinator waits until the target reaches the final watermark, atomically switches the alias, and resumes producer writes. It also resumes writes after timeout or alias-switch failure. A producer that cannot provide a real write barrier must not use this API or claim zero-gap cutover. This operation is intentionally separate from shard execution; the caller must persist the successful cutover result before marking an online migration task complete.
+
+
+### Raft completion gate and transform projection
+
+Tasks created with the `ElasticsearchOnline` source configuration automatically receive `_dataspool_cdc_cutover_required=true`. A worker must commit `RecordCdcCutover` through Raft with the final source watermark, applied target watermark, alias, new index, and a valid shard fencing token before `CompleteShard` is accepted. The cutover record is persisted in task metadata by the state machine, so it survives Raft replay/restart. Ordinary snapshot-only tasks remain unaffected.
+
+For migrations with intentional field renames or enrichments, use `verify_source_target_with_projection` and a `VerificationProjection` with separate source/target maps from canonical field names to JSON Pointers. This supports renamed fields (for example, source `/old_name` and target `/new_name` both mapped to canonical `name`). The projection is applied independently to each endpoint before content hashing; mismatched canonical field sets or missing selected fields fail verification instead of silently weakening the comparison.
+
+### Process-level crash recovery validation
+
+The extended Elasticsearch matrix now also runs `worker_process_crash` with the `test-fault-injection` feature. It starts a real worker subprocess using the production source/sink factories, a persistent single-node Raft store, and two independent Elasticsearch clusters (source and target). At the exact post-Bulk/pre-`RecordBatchDelivery` boundary the child writes a marker and blocks; the parent sends SIGKILL, waits for lease expiry, and starts a new process against the same RocksDB/Raft directories. The recovery process claims the shard, replays the durable manifest, and verifies acknowledged manifests and completed shard state. The parent independently reconciles source and target count, ID set, and content digest. The fault-injection feature is disabled in normal builds.
+
+The executor integration test for partial Bulk outcomes combines a mixed first response (success, 429, permanent mapping failure), retry-only-the-429 behavior, Raft-persisted DLQ entry, delivery manifest, checkpoint advancement, and final cache acknowledgement. A checkpoint is accepted only after the permanent failure is durably represented in the DLQ.
+
+`cutover_with_raft` is the preferred online cutover entry point: it runs the write-barrier protocol and then commits `RecordCdcCutover` with the active shard fencing token. Online tasks cannot complete through Raft until that committed record has a non-empty alias/index and an applied watermark at least as high as the final source watermark. Such tasks also reject non-leased local executor completion.

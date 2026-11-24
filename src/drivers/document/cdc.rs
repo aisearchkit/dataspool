@@ -7,6 +7,7 @@
 
 use crate::error::{DatspoolError, DriverError, Result};
 use crate::pipeline::{OffsetValue, Record, RecordBatch, Source};
+use crate::raft::{Command, RaftNode};
 use async_trait::async_trait;
 use reqwest::{Client, ClientBuilder};
 use serde_json::{Value, json};
@@ -325,6 +326,14 @@ pub struct CdcCutoverConfig {
     pub timeout: Duration,
 }
 
+#[derive(Debug, Clone)]
+pub struct CdcRaftFence {
+    pub task_id: String,
+    pub shard_id: String,
+    pub node_id: String,
+    pub fencing_token: u64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CdcCutoverResult {
     pub final_watermark: u64,
@@ -400,6 +409,47 @@ where
     }
 }
 
+/// Run the write-barrier cutover and persist its successful result through Raft.
+/// The task completion gate remains closed if the alias switch succeeds but the
+/// Raft proposal fails; callers must retry recording before completing the task.
+pub async fn cutover_with_raft<B, F, Fut>(
+    client: &Client,
+    raft: &RaftNode,
+    config: &CdcCutoverConfig,
+    fence: &CdcRaftFence,
+    barrier: &mut B,
+    read_applied_watermark: F,
+) -> Result<CdcCutoverResult>
+where
+    B: CdcWriteBarrier,
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<u64>>,
+{
+    let result =
+        cutover_with_write_barrier(client, config, barrier, read_applied_watermark).await?;
+    let response = raft
+        .propose(Command::RecordCdcCutover {
+            task_id: fence.task_id.clone(),
+            alias: config.alias.clone(),
+            old_index: config.old_index.clone(),
+            new_index: config.new_index.clone(),
+            final_watermark: result.final_watermark,
+            applied_watermark: result.applied_watermark,
+            fencing_shard_id: fence.shard_id.clone(),
+            node_id: fence.node_id.clone(),
+            fencing_token: fence.fencing_token,
+            issued_at_ms: chrono::Utc::now().timestamp_millis(),
+        })
+        .await?;
+    if !response.success {
+        return Err(DatspoolError::Internal(format!(
+            "CDC alias cutover succeeded but Raft rejected its completion record: {}",
+            response.message
+        )));
+    }
+    Ok(result)
+}
+
 /// Atomically move an alias only after the consumer has caught up to the
 /// source's final sequence watermark. The caller supplies an authenticated client.
 pub async fn switch_alias_after_catchup(
@@ -416,6 +466,44 @@ pub async fn switch_alias_after_catchup(
             "Cutover blocked: target watermark {} is behind source watermark {}",
             applied_watermark, required_watermark
         )));
+    }
+    // A retry after the alias API committed but before the Raft cutover record
+    // must be safe. If the alias already points exclusively at the requested
+    // destination, treat the switch as idempotently complete.
+    let current = client
+        .get(format!(
+            "{}/_alias/{}",
+            target_base_url.trim_end_matches('/'),
+            alias
+        ))
+        .timeout(Duration::from_secs(15))
+        .send()
+        .await
+        .map_err(|error| DriverError::DataError(format!("Alias state query failed: {error}")))?;
+    if current.status().is_success() {
+        let mapping: Value = current.json().await.map_err(|error| {
+            DriverError::DataError(format!("Invalid alias state response: {error}"))
+        })?;
+        let already_switched = mapping.as_object().is_some_and(|indices| {
+            indices.len() == 1
+                && indices
+                    .get(new_index)
+                    .is_some_and(|entry| entry["aliases"].get(alias).is_some())
+        });
+        if already_switched {
+            info!(
+                alias,
+                new_index, applied_watermark, "Elasticsearch alias cutover already committed"
+            );
+            return Ok(());
+        }
+    } else if current.status() != reqwest::StatusCode::NOT_FOUND {
+        return Err(DriverError::DataError(format!(
+            "Alias state query failed: HTTP {}: {}",
+            current.status(),
+            current.text().await.unwrap_or_default()
+        ))
+        .into());
     }
     let mut actions = Vec::new();
     if let Some(old) = old_index {

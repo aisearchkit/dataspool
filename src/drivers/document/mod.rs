@@ -39,11 +39,15 @@ mod source;
 pub mod verification;
 
 pub use cdc::{
-    CdcConfig, CdcCutoverResult, CdcWriteBarrier, ElasticsearchCdcSource,
-    cutover_with_write_barrier, switch_alias_after_catchup,
+    CdcConfig, CdcCutoverConfig, CdcCutoverResult, CdcRaftFence, CdcWriteBarrier,
+    ElasticsearchCdcSource, cutover_with_raft, cutover_with_write_barrier,
+    switch_alias_after_catchup,
 };
 pub use config::DocumentConfig;
 pub use online::ElasticsearchOnlineMigrationSource;
 pub use sink::{ClusterNodePressure, DocumentSink, NodeWritePressure};
 pub use source::DocumentSource;
-pub use verification::{IndexVerification, VerificationReport, verify_source_target};
+pub use verification::{
+    IndexVerification, VerificationProjection, VerificationReport, verify_source_target,
+    verify_source_target_with_projection,
+};

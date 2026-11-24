@@ -7,7 +7,8 @@
 
 use dataspool::drivers::document::{
     CdcConfig, DocumentConfig, DocumentSink, DocumentSource, ElasticsearchCdcSource,
-    ElasticsearchOnlineMigrationSource, switch_alias_after_catchup, verify_source_target,
+    ElasticsearchOnlineMigrationSource, VerificationProjection, switch_alias_after_catchup,
+    verify_source_target, verify_source_target_with_projection,
 };
 use dataspool::pipeline::{BackpressureConfig, OffsetValue, Record, RecordBatch, Sink, Source};
 use reqwest::{Client, StatusCode};
@@ -193,21 +194,128 @@ async fn elasticsearch_pit_search_after_and_bulk_item_errors() {
             .error_for_status()
             .unwrap();
 
-        // Independently scan both endpoints with PIT and verify count, ID set,
-        // and canonical content. The same index is used here as a protocol smoke
-        // test; production callers pass independent source/target configurations.
-        let mut verification_config = DocumentConfig::local(index.clone());
-        verification_config.urls = vec![base_url.clone()];
-        let verification = verify_source_target(&verification_config, &verification_config, 1)
+        // Verify two independent indexes, including sink-owned metadata, then
+        // deliberately corrupt one target document to prove the content digest
+        // detects a real source/target divergence.
+        let target_index = format!("{index}-target");
+        http.put(format!("{base_url}/{target_index}"))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+        let target_bulk = r#"{"index":{"_id":"good-1"}}
+{"number":7,"_dataspool":{"shard":"s1","fence":9}}
+{"index":{"_id":"good-2"}}
+{"number":8,"_dataspool":{"shard":"s1","fence":9}}
+"#;
+        http.post(format!("{base_url}/{target_index}/_bulk"))
+            .header("content-type", "application/x-ndjson")
+            .body(target_bulk)
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+        for name in [&index, &target_index] {
+            http.post(format!("{base_url}/{name}/_refresh"))
+                .send()
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap();
+        }
+        let mut source_verification = DocumentConfig::local(index.clone());
+        source_verification.urls = vec![base_url.clone()];
+        let mut target_verification = DocumentConfig::local(target_index.clone());
+        target_verification.urls = vec![base_url.clone()];
+        let verification = verify_source_target(&source_verification, &target_verification, 1)
             .await
             .unwrap();
         assert!(
             verification.is_consistent(),
-            "{label}: verification mismatch: {verification:?}"
+            "{label}: independent verification mismatch: {verification:?}"
         );
         assert_eq!(
             verification.source.document_count, 2,
-            "{label}: verified document count"
+            "{label}: source count"
+        );
+        assert_eq!(
+            verification.target.document_count, 2,
+            "{label}: target count"
+        );
+
+        let transformed_index = format!("{index}-transformed");
+        http.put(format!("{base_url}/{transformed_index}"))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+        let transformed_bulk = r#"{"index":{"_id":"good-1"}}
+{"renamed_number":7}
+{"index":{"_id":"good-2"}}
+{"renamed_number":8}
+"#;
+        http.post(format!("{base_url}/{transformed_index}/_bulk"))
+            .header("content-type", "application/x-ndjson")
+            .body(transformed_bulk)
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+        http.post(format!("{base_url}/{transformed_index}/_refresh"))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+        let mut projection = VerificationProjection::default();
+        projection
+            .source_fields
+            .insert("value".into(), "/number".into());
+        projection
+            .target_fields
+            .insert("value".into(), "/renamed_number".into());
+        let mut transformed_target = DocumentConfig::local(transformed_index);
+        transformed_target.urls = vec![base_url.clone()];
+        let projected = verify_source_target_with_projection(
+            &source_verification,
+            &transformed_target,
+            1,
+            &projection,
+        )
+        .await
+        .unwrap();
+        assert!(
+            projected.is_consistent(),
+            "{label}: transform-aware projection mismatch: {projected:?}"
+        );
+
+        http.post(format!("{base_url}/{target_index}/_doc/good-2"))
+            .json(&json!({"number": 999, "_dataspool":{"shard":"s1","fence":10}}))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+        http.post(format!("{base_url}/{target_index}/_refresh"))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+        let divergent = verify_source_target(&source_verification, &target_verification, 1)
+            .await
+            .unwrap();
+        assert!(
+            divergent.count_matches && divergent.id_set_matches,
+            "{label}: expected equal counts and IDs"
+        );
+        assert!(
+            !divergent.content_matches,
+            "{label}: verifier failed to detect content divergence"
         );
 
         let pit_response: Value = http
@@ -488,6 +596,20 @@ async fn elasticsearch_pit_search_after_and_bulk_item_errors() {
         assert!(
             alias_state.get(&new_index).is_some(),
             "{label}: alias points to new index"
+        );
+        assert!(
+            switch_alias_after_catchup(
+                &http,
+                &base_url,
+                "dataspool-live",
+                Some(&old_index),
+                &new_index,
+                2,
+                2,
+            )
+            .await
+            .is_ok(),
+            "{label}: alias cutover retry must be idempotent after the alias API committed"
         );
         let blocked = switch_alias_after_catchup(
             &http,

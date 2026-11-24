@@ -151,6 +151,20 @@ pub enum Command {
         batch_id: Option<String>,
     },
 
+    /// Persist a producer-barriered CDC cutover before online migration completion.
+    RecordCdcCutover {
+        task_id: String,
+        alias: String,
+        old_index: Option<String>,
+        new_index: String,
+        final_watermark: u64,
+        applied_watermark: u64,
+        fencing_shard_id: String,
+        node_id: String,
+        fencing_token: u64,
+        issued_at_ms: i64,
+    },
+
     /// Mark shard as completed
     CompleteShard {
         shard_id: String,
@@ -338,6 +352,14 @@ impl Command {
             }
             Command::UpdateShardProgress { shard_id, .. } => {
                 format!("UpdateShardProgress({})", shard_id)
+            }
+            Command::RecordCdcCutover {
+                task_id,
+                final_watermark,
+                applied_watermark,
+                ..
+            } => {
+                format!("RecordCdcCutover({task_id}, {applied_watermark}/{final_watermark})")
             }
             Command::CompleteShard {
                 shard_id,
