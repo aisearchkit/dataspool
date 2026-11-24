@@ -589,3 +589,518 @@ async fn independent_raft_clusters_recover_from_partition_lost_acks_and_source_c
     source.node().shutdown().await.unwrap();
     target.node().shutdown().await.unwrap();
 }
+
+/// Three-member Raft group used to exercise federation recovery across actual
+/// leader replacement (rather than restarting the same single-member group).
+struct TestRaftGroup {
+    directories: Vec<TempDir>,
+    stores: Vec<RocksDbStore>,
+    nodes: Vec<Option<RaftNode>>,
+    addresses: Vec<String>,
+    tokens: String,
+    servers: Vec<Option<JoinHandle<()>>>,
+    ids: [u64; 3],
+}
+
+impl TestRaftGroup {
+    async fn start(token: &str) -> Self {
+        let mut directories = Vec::new();
+        let mut stores = Vec::new();
+        let mut listeners = Vec::new();
+        let mut addresses = Vec::new();
+        for _ in 0..3 {
+            let directory = tempfile::tempdir().unwrap();
+            stores.push(RocksDbStore::open(directory.path().join("app")).unwrap());
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            addresses.push(listener.local_addr().unwrap().to_string());
+            directories.push(directory);
+            listeners.push(listener);
+        }
+        let ids = [11, 22, 33];
+        let members = ids
+            .iter()
+            .zip(&addresses)
+            .map(|(id, address)| (*id, BasicNode::new(address.clone())))
+            .collect::<BTreeMap<_, _>>();
+        let config = raft_config(Duration::from_millis(150), Duration::from_millis(600));
+        let mut nodes = Vec::new();
+        let mut servers = Vec::new();
+        for index in 0..3 {
+            let node = RaftNode::new(
+                ids[index],
+                directories[index].path().join("raft"),
+                TaskStore::new(stores[index].clone()),
+                config.clone(),
+                token.to_string(),
+            )
+            .await
+            .unwrap();
+            let router = raft_router(node.handle(), token.to_string());
+            let listener = listeners.remove(0);
+            servers.push(Some(tokio::spawn(async move {
+                let _ = axum::serve(listener, router).await;
+            })));
+            nodes.push(Some(node));
+        }
+        nodes[0]
+            .as_ref()
+            .unwrap()
+            .initialize(members)
+            .await
+            .unwrap();
+        let group = Self {
+            directories,
+            stores,
+            nodes,
+            addresses,
+            tokens: token.to_string(),
+            servers,
+            ids,
+        };
+        group.wait_for_leader(None).await;
+        group
+    }
+
+    fn node(&self, index: usize) -> &RaftNode {
+        self.nodes[index].as_ref().expect("Raft member is running")
+    }
+
+    fn task_store(&self, index: usize) -> Arc<TaskStore<RocksDbStore>> {
+        Arc::new(TaskStore::new(self.stores[index].clone()))
+    }
+
+    async fn wait_for_leader(&self, excluded: Option<usize>) -> usize {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                for (index, node) in self.nodes.iter().enumerate() {
+                    if Some(index) != excluded
+                        && let Some(node) = node
+                        && node.is_leader().await
+                    {
+                        return index;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(75)).await;
+            }
+        })
+        .await
+        .expect("three-member Raft group did not elect a leader")
+    }
+
+    async fn stop(&mut self, index: usize) {
+        if let Some(server) = self.servers[index].take() {
+            server.abort();
+            let _ = server.await;
+        }
+        if let Some(node) = self.nodes[index].take() {
+            node.shutdown().await.unwrap();
+            drop(node);
+        }
+    }
+
+    async fn restart(&mut self, index: usize) {
+        let listener = TcpListener::bind(&self.addresses[index]).await.unwrap();
+        let node = RaftNode::new(
+            self.ids[index],
+            self.directories[index].path().join("raft"),
+            TaskStore::new(self.stores[index].clone()),
+            raft_config(Duration::from_millis(150), Duration::from_millis(600)),
+            self.tokens.clone(),
+        )
+        .await
+        .unwrap();
+        let router = raft_router(node.handle(), self.tokens.clone());
+        self.servers[index] = Some(tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        }));
+        self.nodes[index] = Some(node);
+    }
+
+    async fn wait_replicated_migration(&self, migration_id: &str, expected: MigrationState) {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                let mut all = true;
+                for (index, store) in self.stores.iter().enumerate() {
+                    if self.nodes[index].is_none() {
+                        continue;
+                    }
+                    let value = TaskStore::new(store.clone())
+                        .get_federated_migration(migration_id)
+                        .await
+                        .unwrap();
+                    if value.is_none_or(|migration| migration.state != expected) {
+                        all = false;
+                        break;
+                    }
+                }
+                if all {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("federated migration did not replicate to every Raft member");
+    }
+
+    async fn wait_replicated_remote_operation(
+        &self,
+        migration_id: &str,
+        generation: u64,
+        expected: FederatedRemoteOperationState,
+    ) {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                let mut all = true;
+                for (index, store) in self.stores.iter().enumerate() {
+                    if self.nodes[index].is_none() {
+                        continue;
+                    }
+                    let value = TaskStore::new(store.clone())
+                        .get_federated_remote_operation(migration_id, generation)
+                        .await
+                        .unwrap();
+                    if value.is_none_or(|operation| operation.state != expected) {
+                        all = false;
+                        break;
+                    }
+                }
+                if all {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("remote operation did not replicate to every Raft member");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn federation_mtls_recovery_survives_two_source_and_target_leader_changes() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let mut source = TestRaftGroup::start("federation-source-ha-token").await;
+    let mut target = TestRaftGroup::start("federation-target-ha-token").await;
+    let source_leader = source.wait_for_leader(None).await;
+    let target_leader = target.wait_for_leader(None).await;
+
+    let target_service = Arc::new(RwLock::new(TaskServiceImpl {
+        task_store: target.task_store(target_leader),
+        raft_node: Some(Arc::new(target.node(target_leader).clone())),
+    }));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let target_addr = listener.local_addr().unwrap().to_string();
+    let tls = ServerTlsConfig::new()
+        .identity(Identity::from_pem(SERVER_CERT, SERVER_KEY))
+        .client_ca_root(Certificate::from_pem(CA_CERT));
+    let shutdown = ShutdownToken::new();
+    let server_shutdown = shutdown.clone();
+    let faults = AckFaults::default();
+    let server_faults = faults.clone();
+    let server_service = target_service.clone();
+    let server = tokio::spawn(async move {
+        Server::builder()
+            .layer(DropFederationAckLayer(server_faults))
+            .tls_config(tls)
+            .unwrap()
+            .add_service(task::task_service_server::TaskServiceServer::new(
+                server_service,
+            ))
+            .serve_with_incoming_shutdown(
+                tokio_stream::wrappers::TcpListenerStream::new(listener),
+                server_shutdown.cancelled_owned(),
+            )
+            .await
+            .unwrap();
+    });
+
+    let endpoint = format!(
+        "https://localhost:{}",
+        target_addr.rsplit(':').next().unwrap()
+    );
+    for (group, local, peer, peer_endpoint) in [
+        (
+            &source,
+            "federation-source-ha",
+            "federation-target-ha",
+            endpoint.clone(),
+        ),
+        (
+            &target,
+            "federation-target-ha",
+            "federation-source-ha",
+            "https://127.0.0.1:1".into(),
+        ),
+    ] {
+        for index in 0..3 {
+            let node = group.node(index);
+            let now = chrono::Utc::now().timestamp_millis();
+            for (cluster_id, cluster_endpoint) in [
+                (local, "https://127.0.0.1:1".to_string()),
+                (peer, peer_endpoint.clone()),
+            ] {
+                let result = node
+                    .propose(Command::UpsertFederatedCluster {
+                        cluster: FederatedCluster {
+                            cluster_id: cluster_id.into(),
+                            endpoint: cluster_endpoint,
+                            identity_fingerprint: client_fingerprint(),
+                            version: env!("CARGO_PKG_VERSION").into(),
+                            capabilities: BTreeSet::from([
+                                "task-provisioning".into(),
+                                "checkpoint-exchange".into(),
+                                "distributed-commit".into(),
+                            ]),
+                            status: FederatedClusterStatus::Healthy,
+                            last_seen_at_ms: now,
+                            updated_at_ms: now,
+                        },
+                        request_id: format!("ha-register:{cluster_id}"),
+                        actor: "e2e-ha".into(),
+                    })
+                    .await
+                    .unwrap();
+                assert!(result.success, "{}", result.message);
+            }
+        }
+    }
+
+    let now = chrono::Utc::now().timestamp_millis();
+    let migration = FederatedMigration {
+        migration_id: "ha-leader-change-migration".into(),
+        source_cluster: "federation-source-ha".into(),
+        target_cluster: "federation-target-ha".into(),
+        task_id: "ha-logical-task".into(),
+        required_capabilities: BTreeSet::from(["task-provisioning".into()]),
+        state: MigrationState::Planned,
+        generation: 0,
+        created_at_ms: now,
+        updated_at_ms: now,
+        last_error: None,
+        task_name: "ha-federated-task".into(),
+        source_config: "{}".into(),
+        sink_config: "{}".into(),
+        transform_config: None,
+        sharding_strategy: None,
+        priority: 1,
+        tags: HashMap::new(),
+        remote_task_id: None,
+        remote_task_state: None,
+        remote_checkpoint: None,
+        last_reconciled_at_ms: None,
+        deadline_at_ms: None,
+        execution_budget_ms: None,
+        retry_budget: Some(5),
+        timeout_policy: MigrationTimeoutPolicy::Fail,
+    };
+    let created = source
+        .node(source_leader)
+        .propose(Command::CreateFederatedMigration {
+            migration: Box::new(migration),
+            request_id: "ha-create-migration".into(),
+            actor: "e2e-ha".into(),
+        })
+        .await
+        .unwrap();
+    assert!(created.success, "{}", created.message);
+    source
+        .wait_replicated_migration("ha-leader-change-migration", MigrationState::Planned)
+        .await;
+
+    let cert_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let orchestrator = |index: usize, group: &TestRaftGroup| {
+        crate::federation::orchestrator::FederatedOrchestrator::new(
+            group.task_store(index),
+            Arc::new(group.node(index).clone()),
+            "federation-source-ha",
+            cert_dir.join("federation-test-ca.pem"),
+            cert_dir.join("federation-test-client.pem"),
+            cert_dir.join("federation-test-client.key.pem"),
+        )
+    };
+    // A source follower may run the reconciliation entry point, but it must
+    // not perform remote side effects or provision a second copy of the task.
+    let follower_index = (source_leader + 1) % 3;
+    let follower = orchestrator(follower_index, &source);
+    follower.reconcile_once().await.unwrap();
+    assert!(
+        target
+            .task_store(target_leader)
+            .list_tasks()
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    drop(follower);
+
+    let first = orchestrator(source_leader, &source);
+    first.reconcile_once().await.unwrap();
+    first.reconcile_once().await.unwrap();
+    let remote_id = source
+        .task_store(source_leader)
+        .get_federated_migration("ha-leader-change-migration")
+        .await
+        .unwrap()
+        .unwrap()
+        .remote_task_id
+        .unwrap();
+    complete_remote_task_on_member(&target, target_leader, &remote_id).await;
+
+    // Prepare is acknowledged, but the Commit response is deliberately lost
+    // after the target has durably committed. This leaves source in Committing.
+    first.reconcile_once().await.unwrap();
+    faults.commit.store(true, Ordering::SeqCst);
+    first.reconcile_once().await.unwrap();
+    assert!(faults.commit_dropped.load(Ordering::SeqCst));
+    let source_before_crash = source
+        .task_store(source_leader)
+        .get_federated_migration("ha-leader-change-migration")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(source_before_crash.state, MigrationState::Committing);
+    let committed = target
+        .task_store(target_leader)
+        .get_federated_remote_operation("ha-leader-change-migration", 0)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(committed.state, FederatedRemoteOperationState::Committed);
+
+    // Ensure the durable target commit has reached every member before the
+    // original leader is stopped; the new leader must recover that same record.
+    target
+        .wait_replicated_remote_operation(
+            "ha-leader-change-migration",
+            0,
+            FederatedRemoteOperationState::Committed,
+        )
+        .await;
+
+    // Target leader replacement: rebind the live mTLS service to the new leader
+    // while preserving the same gRPC listener and peer identity.
+    target.stop(target_leader).await;
+    let target_leader_2 = target.wait_for_leader(Some(target_leader)).await;
+    *target_service.write().await = TaskServiceImpl {
+        task_store: target.task_store(target_leader_2),
+        raft_node: Some(Arc::new(target.node(target_leader_2).clone())),
+    };
+    target
+        .wait_replicated_remote_operation(
+            "ha-leader-change-migration",
+            0,
+            FederatedRemoteOperationState::Committed,
+        )
+        .await;
+
+    // Source leader #1 crashes after target commit. Replacement leader recovers
+    // the source state machine and completes the migration via the target's
+    // durable idempotent Commit response.
+    drop(first);
+    source.stop(source_leader).await;
+    let source_leader_2 = source.wait_for_leader(Some(source_leader)).await;
+    let second = orchestrator(source_leader_2, &source);
+    second.reconcile_once().await.unwrap();
+    source
+        .wait_replicated_migration("ha-leader-change-migration", MigrationState::Completed)
+        .await;
+
+    // Restart old leader from its own disk and wait until its state catches up.
+    source.restart(source_leader).await;
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let state = source
+                .task_store(source_leader)
+                .get_federated_migration("ha-leader-change-migration")
+                .await
+                .unwrap();
+            if state.is_some_and(|migration| migration.state == MigrationState::Completed) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("restarted former leader did not catch up");
+
+    // Crash the replacement leader as well: a second election must preserve the
+    // terminal state and reconciliation must remain a no-op on the new leader.
+    second.reconcile_once().await.unwrap();
+    source.stop(source_leader_2).await;
+    let source_leader_3 = source.wait_for_leader(Some(source_leader_2)).await;
+    let third = orchestrator(source_leader_3, &source);
+    third.reconcile_once().await.unwrap();
+    source
+        .wait_replicated_migration("ha-leader-change-migration", MigrationState::Completed)
+        .await;
+    assert_eq!(
+        target
+            .task_store(target_leader_2)
+            .list_tasks()
+            .await
+            .unwrap()
+            .len(),
+        1,
+        "leader changes must not duplicate remote task provisioning"
+    );
+    assert_eq!(
+        target
+            .task_store(target_leader_2)
+            .get_federated_remote_operation("ha-leader-change-migration", 0)
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        FederatedRemoteOperationState::Committed
+    );
+
+    shutdown.cancel();
+    let _ = server.await;
+    for index in 0..3 {
+        source.stop(index).await;
+        target.stop(index).await;
+    }
+}
+
+async fn complete_remote_task_on_member(group: &TestRaftGroup, member: usize, task_id: &str) {
+    let parsed: crate::types::TaskId = task_id.parse().unwrap();
+    let (_, shards) = group
+        .task_store(member)
+        .get_task_with_aggregate_and_shards(&parsed)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(shards.len(), 1);
+    let shard = &shards[0];
+    let now = chrono::Utc::now().timestamp_millis();
+    let claimed = group
+        .node(member)
+        .propose(Command::ClaimShard {
+            shard_id: shard.shard_id.to_string(),
+            node_id: "ha-e2e-worker".into(),
+            claim_id: "ha-e2e-claim".into(),
+            issued_at_ms: now,
+            lease_expires_at_ms: now + 60_000,
+        })
+        .await
+        .unwrap();
+    assert!(claimed.success, "{}", claimed.message);
+    let state = group
+        .task_store(member)
+        .get_shard(&shard.shard_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let completed = group
+        .node(member)
+        .propose(Command::CompleteShard {
+            shard_id: shard.shard_id.to_string(),
+            node_id: "ha-e2e-worker".into(),
+            fencing_token: state.fencing_token,
+            issued_at_ms: chrono::Utc::now().timestamp_millis(),
+            total_records: 3,
+        })
+        .await
+        .unwrap();
+    assert!(completed.success, "{}", completed.message);
+}
