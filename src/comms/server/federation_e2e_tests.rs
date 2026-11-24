@@ -886,13 +886,12 @@ impl TestRaftGroup {
         if let Some(shutdown) = self.server_shutdowns[index].take() {
             shutdown.cancel();
         }
-        if let Some(mut server) = self.servers[index].take() {
-            if tokio::time::timeout(Duration::from_secs(2), &mut server)
+        if let Some(mut server) = self.servers[index].take()
+            && tokio::time::timeout(Duration::from_secs(2), &mut server)
                 .await
                 .is_err()
-            {
-                server.abort();
-            }
+        {
+            server.abort();
             let _ = server.await;
         }
         if let Some(node) = self.nodes[index].take() {
