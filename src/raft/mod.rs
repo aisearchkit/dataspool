@@ -13,6 +13,8 @@ mod storage;
 
 pub use command::Command;
 pub use network::router as raft_router;
+#[cfg(test)]
+pub(crate) use network::test_router_with_shared_raft;
 pub use node::{Raft, RaftNode, stable_node_id};
 pub use state_machine::{CommandResponse, MetaStateMachine};
 pub use storage::{RocksNodeId, TypeConfig};

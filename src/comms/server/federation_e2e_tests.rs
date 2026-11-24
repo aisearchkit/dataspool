@@ -9,7 +9,7 @@ use crate::{
         FederatedCluster, FederatedClusterStatus, FederatedMigration,
         FederatedRemoteOperationState, MigrationState, MigrationTimeoutPolicy,
     },
-    raft::{Command, RaftNode, raft_config, raft_router},
+    raft::{Command, RaftNode, raft_config, raft_router, test_router_with_shared_raft},
     storage::RocksDbStore,
     task::TaskStore,
 };
@@ -780,10 +780,10 @@ struct TestRaftGroup {
     directories: Vec<TempDir>,
     stores: Vec<RocksDbStore>,
     nodes: Vec<Option<RaftNode>>,
-    addresses: Vec<String>,
     tokens: String,
     servers: Vec<Option<JoinHandle<()>>>,
     server_shutdowns: Vec<Option<ShutdownToken>>,
+    raft_handles: Vec<Arc<RwLock<Option<Arc<crate::raft::Raft>>>>>,
     ids: [u64; 3],
 }
 
@@ -814,6 +814,7 @@ impl TestRaftGroup {
         let mut nodes = Vec::new();
         let mut servers = Vec::new();
         let mut server_shutdowns = Vec::new();
+        let mut raft_handles = Vec::new();
         for index in 0..3 {
             let node = RaftNode::new(
                 ids[index],
@@ -824,7 +825,8 @@ impl TestRaftGroup {
             )
             .await
             .unwrap();
-            let router = raft_router(node.handle(), token.to_string());
+            let raft_handle = Arc::new(RwLock::new(Some(node.handle())));
+            let router = test_router_with_shared_raft(raft_handle.clone(), token.to_string());
             let listener = listeners.remove(0);
             let shutdown = ShutdownToken::new();
             let server_shutdown = shutdown.clone();
@@ -834,6 +836,7 @@ impl TestRaftGroup {
                     .await;
             })));
             server_shutdowns.push(Some(shutdown));
+            raft_handles.push(raft_handle);
             nodes.push(Some(node));
         }
         nodes[0]
@@ -846,10 +849,10 @@ impl TestRaftGroup {
             directories,
             stores,
             nodes,
-            addresses,
             tokens: token.to_string(),
             servers,
             server_shutdowns,
+            raft_handles,
             ids,
         };
         group.wait_for_leader(None).await;
@@ -883,31 +886,16 @@ impl TestRaftGroup {
     }
 
     async fn stop(&mut self, index: usize) {
-        if let Some(shutdown) = self.server_shutdowns[index].take() {
-            shutdown.cancel();
-        }
-        if let Some(mut server) = self.servers[index].take()
-            && tokio::time::timeout(Duration::from_secs(2), &mut server)
-                .await
-                .is_err()
-        {
-            server.abort();
-            let _ = server.await;
-        }
         if let Some(node) = self.nodes[index].take() {
             node.shutdown().await.unwrap();
             drop(node);
         }
+        *self.raft_handles[index].write().await = None;
     }
 
     async fn restart(&mut self, index: usize) {
-        // Repeated fault cycles can leave accepted connections in TIME_WAIT.
-        // Reuse the stable Raft address without making the test depend on the
-        // kernel's ephemeral TCP teardown timing.
-        let socket = TcpSocket::new_v4().unwrap();
-        socket.set_reuseaddr(true).unwrap();
-        socket.bind(self.addresses[index].parse().unwrap()).unwrap();
-        let listener = socket.listen(1024).unwrap();
+        // Drop the old, shut-down Raft handle before reopening its RocksDB path.
+        *self.raft_handles[index].write().await = None;
         let node = RaftNode::new(
             self.ids[index],
             self.directories[index].path().join("raft"),
@@ -917,16 +905,21 @@ impl TestRaftGroup {
         )
         .await
         .unwrap();
-        let router = raft_router(node.handle(), self.tokens.clone());
-        let shutdown = ShutdownToken::new();
-        let server_shutdown = shutdown.clone();
-        self.servers[index] = Some(tokio::spawn(async move {
-            let _ = axum::serve(listener, router)
-                .with_graceful_shutdown(server_shutdown.cancelled_owned())
-                .await;
-        }));
-        self.server_shutdowns[index] = Some(shutdown);
+        *self.raft_handles[index].write().await = Some(node.handle());
         self.nodes[index] = Some(node);
+    }
+
+    async fn shutdown_all(&mut self) {
+        for index in 0..3 {
+            self.stop(index).await;
+        }
+        for shutdown in self.server_shutdowns.iter_mut().filter_map(Option::take) {
+            shutdown.cancel();
+        }
+        for server in self.servers.iter_mut().filter_map(Option::take) {
+            server.abort();
+            let _ = server.await;
+        }
     }
 
     async fn wait_replicated_migration(&self, migration_id: &str, expected: MigrationState) {
@@ -1563,10 +1556,8 @@ async fn federation_mtls_recovery_survives_two_source_and_target_leader_changes(
     proxy.task.abort();
     shutdown.cancel();
     let _ = server.await;
-    for index in 0..3 {
-        source.stop(index).await;
-        target.stop(index).await;
-    }
+    source.shutdown_all().await;
+    target.shutdown_all().await;
 }
 
 async fn complete_remote_task_on_member(group: &TestRaftGroup, member: usize, task_id: &str) {

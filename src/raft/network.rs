@@ -257,3 +257,122 @@ async fn snapshot(
         .map(Json)
         .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)
 }
+
+#[cfg(test)]
+#[derive(Clone)]
+struct MutableRaftHttpState {
+    raft: Arc<RwLock<Option<Arc<Raft>>>>,
+    token: Arc<[u8]>,
+}
+
+/// Test-only router whose Raft handle can be replaced while the TCP listener
+/// remains stable. This models a process restart without rebinding a socket
+/// that may still have accepted connections in flight.
+#[cfg(test)]
+pub(crate) fn test_router_with_shared_raft(
+    raft: Arc<RwLock<Option<Arc<Raft>>>>,
+    token: String,
+) -> Router {
+    let state = MutableRaftHttpState {
+        raft,
+        token: Arc::from(token.into_bytes()),
+    };
+    Router::new()
+        .route("/raft/vote", post(test_vote))
+        .route("/raft/append", post(test_append))
+        .route("/raft/snapshot", post(test_snapshot))
+        .route("/raft/propose", post(test_client_write))
+        .layer(DefaultBodyLimit::max(64 * 1024 * 1024))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            test_authorize,
+        ))
+        .with_state(state)
+}
+
+#[cfg(test)]
+async fn test_authorize(
+    State(state): State<MutableRaftHttpState>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    use subtle::ConstantTimeEq;
+    let supplied = request
+        .headers()
+        .get("x-dataspool-raft-token")
+        .map(|value| value.as_bytes())
+        .unwrap_or_default();
+    if supplied.len() != state.token.len() || !bool::from(supplied.ct_eq(state.token.as_ref())) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    next.run(request).await
+}
+
+#[cfg(test)]
+async fn test_client_write(
+    State(state): State<MutableRaftHttpState>,
+    Json(mut command): Json<super::Command>,
+) -> Result<Json<super::CommandResponse>, StatusCode> {
+    super::node::normalize_command_timestamp(&mut command).map_err(|_| StatusCode::BAD_REQUEST)?;
+    state
+        .raft
+        .read()
+        .await
+        .clone()
+        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?
+        .client_write(command)
+        .await
+        .map(|response| Json(response.data))
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)
+}
+
+#[cfg(test)]
+async fn test_vote(
+    State(state): State<MutableRaftHttpState>,
+    Json(request): Json<VoteRequest<RocksNodeId>>,
+) -> Result<Json<VoteResponse<RocksNodeId>>, StatusCode> {
+    state
+        .raft
+        .read()
+        .await
+        .clone()
+        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?
+        .vote(request)
+        .await
+        .map(Json)
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)
+}
+
+#[cfg(test)]
+async fn test_append(
+    State(state): State<MutableRaftHttpState>,
+    Json(request): Json<AppendEntriesRequest<TypeConfig>>,
+) -> Result<Json<AppendEntriesResponse<RocksNodeId>>, StatusCode> {
+    state
+        .raft
+        .read()
+        .await
+        .clone()
+        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?
+        .append_entries(request)
+        .await
+        .map(Json)
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)
+}
+
+#[cfg(test)]
+async fn test_snapshot(
+    State(state): State<MutableRaftHttpState>,
+    Json(request): Json<InstallSnapshotRequest<TypeConfig>>,
+) -> Result<Json<InstallSnapshotResponse<RocksNodeId>>, StatusCode> {
+    state
+        .raft
+        .read()
+        .await
+        .clone()
+        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?
+        .install_snapshot(request)
+        .await
+        .map(Json)
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)
+}
