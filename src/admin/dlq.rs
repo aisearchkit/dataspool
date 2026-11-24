@@ -299,6 +299,11 @@ async fn transition_federated_migration<S: KvStore + Clone>(
 }
 
 async fn list_federated_clusters<S: KvStore + Clone>(State(state): State<ApiState<S>>) -> Response {
+    if let Some(raft) = state.raft.as_ref()
+        && let Err(error) = raft.ensure_linearizable().await
+    {
+        return (StatusCode::SERVICE_UNAVAILABLE, error.to_string()).into_response();
+    }
     match state.tasks.list_federated_clusters().await {
         Ok(clusters) => {
             Json(serde_json::json!({"clusters": clusters, "total": clusters.len()})).into_response()
@@ -310,6 +315,11 @@ async fn list_federated_clusters<S: KvStore + Clone>(State(state): State<ApiStat
 async fn list_federated_migrations<S: KvStore + Clone>(
     State(state): State<ApiState<S>>,
 ) -> Response {
+    if let Some(raft) = state.raft.as_ref()
+        && let Err(error) = raft.ensure_linearizable().await
+    {
+        return (StatusCode::SERVICE_UNAVAILABLE, error.to_string()).into_response();
+    }
     match state.tasks.list_federated_migrations().await {
         Ok(migrations) => {
             Json(serde_json::json!({"migrations": migrations, "total": migrations.len()}))
@@ -323,6 +333,11 @@ async fn get_federated_migration<S: KvStore + Clone>(
     State(state): State<ApiState<S>>,
     Path(migration_id): Path<String>,
 ) -> Response {
+    if let Some(raft) = state.raft.as_ref()
+        && let Err(error) = raft.ensure_linearizable().await
+    {
+        return (StatusCode::SERVICE_UNAVAILABLE, error.to_string()).into_response();
+    }
     match state.tasks.get_federated_migration(&migration_id).await {
         Ok(Some(migration)) => Json(migration).into_response(),
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
