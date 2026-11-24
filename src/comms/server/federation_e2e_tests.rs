@@ -1521,6 +1521,12 @@ async fn federation_mtls_recovery_survives_two_source_and_target_leader_changes(
     if !target_follower_running {
         target.restart(target_follower).await;
     }
+    // A DropCommitAck event that occurred while partitioned cannot be consumed
+    // by an RPC. Do not carry that pending one-shot fault into the explicit
+    // network-healed recovery phase; the final retry must be allowed to observe
+    // the target's durable Committed response.
+    faults.prepare.store(false, Ordering::SeqCst);
+    faults.commit.store(false, Ordering::SeqCst);
     proxy.set_partitioned(false);
     second.reconcile_once().await.unwrap();
     target
