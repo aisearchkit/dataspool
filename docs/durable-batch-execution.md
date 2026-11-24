@@ -40,3 +40,8 @@ The manifest is stored in the metadata column family, which is included in Raft 
 The batch manifest records the destination's acknowledged Bulk API result; it is not an independent read-after-write verification of target document contents. Source and target content verification, incremental change capture, and cutover safety are separate follow-up work. Elasticsearch external-version fencing requires stable document IDs, object-shaped document payloads (to persist `_dataspool.fencing_version` and `_dataspool.fencing_shard_id`), and writes that pass through the fenced sink path. This reserved `_dataspool` object is merged with existing `_dataspool` fields; its fencing keys are owned by Dataspool.
 
 Manifest history is retained for audit/recovery. A bounded retention/compaction policy should be added before very long-running deployments accumulate unbounded terminal manifests.
+
+
+### Stable payload digests across process restarts
+
+Batch payload checksums are computed from canonical JSON values rather than directly serializing Rust records. This is required because Elasticsearch source metadata is held in hash maps whose iteration order is not stable across processes. Without canonicalization, an unchanged replayed batch can appear to have a different digest after a Worker restart (notably when legacy Elasticsearch `_type` metadata is present).

@@ -6,11 +6,22 @@ use super::traits::OffsetValue;
 use crate::error::{DatspoolError, Result};
 use crate::storage::kv::{KvStore, cf};
 use serde::{Deserialize, Serialize};
+use sha2::Digest;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+/// Hash a batch through serde_json::Value so unordered maps inside records
+/// (notably Elasticsearch hit metadata) are canonicalized before hashing.
+pub(crate) fn records_payload_digest(records: &[Record]) -> Result<String> {
+    let canonical = serde_json::to_value(records)?;
+    Ok(format!(
+        "{:x}",
+        sha2::Sha256::digest(serde_json::to_vec(&canonical)?)
+    ))
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub(crate) struct CacheEntry {
@@ -308,6 +319,22 @@ mod tests {
     use crate::storage::rocksdb::RocksDbStore;
     use serde_json::json;
     use tempfile::tempdir;
+
+    #[test]
+    fn payload_digest_is_stable_across_hash_map_insertion_orders() {
+        let mut first = Record::with_id("1", "elasticsearch", serde_json::json!({"v": 1}));
+        first.add_metadata("_index", "source");
+        first.add_metadata("_type", "_doc");
+        first.add_metadata("_routing", "route");
+        let mut second = Record::with_id("1", "elasticsearch", serde_json::json!({"v": 1}));
+        second.add_metadata("_routing", "route");
+        second.add_metadata("_type", "_doc");
+        second.add_metadata("_index", "source");
+        assert_eq!(
+            records_payload_digest(&[first]).unwrap(),
+            records_payload_digest(&[second]).unwrap()
+        );
+    }
 
     #[tokio::test]
     async fn persists_checkpoint_until_acknowledged() {

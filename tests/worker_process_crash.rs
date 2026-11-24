@@ -95,7 +95,7 @@ async fn run_worker_process(phase: &str) {
     let shard_id = if phase == "crash" {
         let mut source = DocumentConfig::local("dataspool-worker-crash-source");
         source.urls = vec![base_url.clone()];
-        source.batch_size = 2;
+        source.batch_size = 3;
         let mut sink = DocumentConfig::local("dataspool-worker-crash-target");
         sink.urls = vec![target_url];
         let task = TaskMeta::new(
@@ -147,7 +147,7 @@ async fn run_worker_process(phase: &str) {
         Arc::new(db),
     )));
     let executor = ShardExecutor::new_with_raft(store.clone(), index_store, Arc::new(raft.clone()))
-        .with_batch_size(2);
+        .with_batch_size(3);
     if phase == "crash" {
         // This call runs the production factory -> DocumentSource -> DocumentSink
         // -> durable batch manifest -> fenced Elasticsearch Bulk path.

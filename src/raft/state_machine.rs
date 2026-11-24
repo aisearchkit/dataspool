@@ -1886,10 +1886,7 @@ impl<S: KvStore + Clone> MetaStateMachine<S> {
             let existing: crate::pipeline::cache::BatchManifest =
                 serde_json::from_slice(&existing)?;
             if existing.payload_digest
-                != format!(
-                    "{:x}",
-                    sha2::Sha256::digest(serde_json::to_vec(&entry.records)?)
-                )
+                != crate::pipeline::cache::records_payload_digest(&entry.records)?
             {
                 return Ok(rejected("Legacy batch manifest payload digest mismatch"));
             }
@@ -1911,10 +1908,7 @@ impl<S: KvStore + Clone> MetaStateMachine<S> {
             source_offset: shard.offset.clone(),
             next_offset: entry.next_offset.clone(),
             source_count: entry.source_count,
-            payload_digest: format!(
-                "{:x}",
-                sha2::Sha256::digest(serde_json::to_vec(&entry.records)?)
-            ),
+            payload_digest: crate::pipeline::cache::records_payload_digest(&entry.records)?,
             target_success_count: None,
             target_failed_count: None,
             target_bytes_written: None,
@@ -2028,10 +2022,7 @@ impl<S: KvStore + Clone> MetaStateMachine<S> {
         {
             let existing: crate::pipeline::cache::BatchManifest =
                 serde_json::from_slice(&existing)?;
-            let digest = format!(
-                "{:x}",
-                sha2::Sha256::digest(serde_json::to_vec(&entry.records)?)
-            );
+            let digest = crate::pipeline::cache::records_payload_digest(&entry.records)?;
             if existing.payload_digest != digest
                 || existing.next_offset != entry.next_offset
                 || existing.source_count != entry.source_count
@@ -2056,10 +2047,7 @@ impl<S: KvStore + Clone> MetaStateMachine<S> {
             source_offset: shard.offset.clone(),
             next_offset: entry.next_offset.clone(),
             source_count: entry.source_count,
-            payload_digest: format!(
-                "{:x}",
-                sha2::Sha256::digest(serde_json::to_vec(&entry.records)?)
-            ),
+            payload_digest: crate::pipeline::cache::records_payload_digest(&entry.records)?,
             target_success_count: None,
             target_failed_count: None,
             target_bytes_written: None,
@@ -2135,10 +2123,7 @@ impl<S: KvStore + Clone> MetaStateMachine<S> {
             ));
         };
         let cache_entry: crate::pipeline::cache::CacheEntry = serde_json::from_slice(&cache_bytes)?;
-        let actual_digest = format!(
-            "{:x}",
-            sha2::Sha256::digest(serde_json::to_vec(&cache_entry.records)?)
-        );
+        let actual_digest = crate::pipeline::cache::records_payload_digest(&cache_entry.records)?;
         if cache_entry.batch_id != batch_id
             || cache_entry.next_offset != manifest.next_offset
             || cache_entry.source_count != manifest.source_count
@@ -3424,10 +3409,7 @@ mod tests {
 
         // Simulate Elasticsearch committing the document while the response is lost.
         // The Worker dies before RecordBatchDelivery reaches the source Raft cluster.
-        let digest = format!(
-            "{:x}",
-            sha2::Sha256::digest(serde_json::to_vec(&records).unwrap())
-        );
+        let digest = crate::pipeline::cache::records_payload_digest(&records).unwrap();
         let target_key = b"doc:doc-1";
         target
             .put_cf(
