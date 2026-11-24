@@ -814,10 +814,8 @@ async fn federation_mtls_recovery_survives_two_source_and_target_leader_changes(
             .unwrap();
     });
 
-    let endpoint = format!(
-        "https://localhost:{}",
-        target_addr.rsplit(':').next().unwrap()
-    );
+    let proxy = TcpFaultProxy::start(target_addr.clone()).await;
+    let endpoint = proxy.endpoint.clone();
     for (group, local, peer, peer_endpoint) in [
         (
             &source,
@@ -934,6 +932,18 @@ async fn federation_mtls_recovery_survives_two_source_and_target_leader_changes(
     drop(follower);
 
     let first = orchestrator(source_leader, &source);
+    first.reconcile_once().await.unwrap(); // Planned -> Preparing
+    proxy.set_partitioned(true);
+    first.reconcile_once().await.unwrap();
+    assert!(
+        target
+            .task_store(target_leader)
+            .list_tasks()
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    proxy.set_partitioned(false);
     first.reconcile_once().await.unwrap();
     first.reconcile_once().await.unwrap();
     let remote_id = source
@@ -977,14 +987,26 @@ async fn federation_mtls_recovery_survives_two_source_and_target_leader_changes(
         )
         .await;
 
-    // Target leader replacement: rebind the live mTLS service to the new leader
-    // while preserving the same gRPC listener and peer identity.
+    // Partition the inter-cluster link, then replace both leaders while each
+    // Raft group retains its own quorum. Neither side may infer remote progress
+    // from an unreachable peer.
+    proxy.set_partitioned(true);
     target.stop(target_leader).await;
+    source.stop(source_leader).await;
     let target_leader_2 = target.wait_for_leader(Some(target_leader)).await;
+    let source_leader_2 = source.wait_for_leader(Some(source_leader)).await;
     *target_service.write().await = TaskServiceImpl {
         task_store: target.task_store(target_leader_2),
         raft_node: Some(Arc::new(target.node(target_leader_2).clone())),
     };
+    target
+        .wait_replicated_remote_operation(
+            "ha-leader-change-migration",
+            0,
+            FederatedRemoteOperationState::Committed,
+        )
+        .await;
+    target.restart(target_leader).await;
     target
         .wait_replicated_remote_operation(
             "ha-leader-change-migration",
@@ -997,9 +1019,48 @@ async fn federation_mtls_recovery_survives_two_source_and_target_leader_changes(
     // the source state machine and completes the migration via the target's
     // durable idempotent Commit response.
     drop(first);
-    source.stop(source_leader).await;
-    let source_leader_2 = source.wait_for_leader(Some(source_leader)).await;
     let second = orchestrator(source_leader_2, &source);
+    // The peer remains partitioned: source must stay Committing, not create a
+    // replacement task or incorrectly mark the migration complete.
+    second.reconcile_once().await.unwrap();
+    let isolated = source
+        .task_store(source_leader_2)
+        .get_federated_migration("ha-leader-change-migration")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(isolated.state, MigrationState::Committing);
+
+    // Repeatedly reconnect and repartition while the distributed commit is
+    // in-doubt. Every reconciliation under partition must remain retryable and
+    // must not create another target task or advance source state prematurely.
+    for cycle in 0..12 {
+        proxy.set_partitioned(false);
+        tokio::time::sleep(Duration::from_millis(15)).await;
+        proxy.set_partitioned(true);
+        second.reconcile_once().await.unwrap();
+        let current = source
+            .task_store(source_leader_2)
+            .get_federated_migration("ha-leader-change-migration")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            current.state,
+            MigrationState::Committing,
+            "partition cycle {cycle} must not falsely complete migration"
+        );
+        assert_eq!(
+            target
+                .task_store(target_leader_2)
+                .list_tasks()
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+    proxy.set_partitioned(false);
     second.reconcile_once().await.unwrap();
     source
         .wait_replicated_migration("ha-leader-change-migration", MigrationState::Completed)
@@ -1054,6 +1115,130 @@ async fn federation_mtls_recovery_survives_two_source_and_target_leader_changes(
         FederatedRemoteOperationState::Committed
     );
 
+    // A stale generation from the pre-failover reconciler cannot mutate the
+    // completed migration. Replaying an identical request ID is idempotent;
+    // reusing that ID for a different payload is rejected.
+    let stale_transition = Command::TransitionFederatedMigration {
+        migration_id: "ha-leader-change-migration".into(),
+        next_state: MigrationState::Failed,
+        expected_generation: 99,
+        at_ms: chrono::Utc::now().timestamp_millis(),
+        error: Some("stale old-leader report".into()),
+        request_id: "ha-stale-generation-transition".into(),
+        actor: "stale-leader".into(),
+    };
+    assert!(
+        !source
+            .node(source_leader_3)
+            .propose(stale_transition.clone())
+            .await
+            .unwrap()
+            .success
+    );
+    assert!(
+        !source
+            .node(source_leader_3)
+            .propose(stale_transition)
+            .await
+            .unwrap()
+            .success
+    );
+    let conflicting_reuse = Command::TransitionFederatedMigration {
+        migration_id: "ha-leader-change-migration".into(),
+        next_state: MigrationState::Cancelled,
+        expected_generation: 99,
+        at_ms: chrono::Utc::now().timestamp_millis(),
+        error: None,
+        request_id: "ha-stale-generation-transition".into(),
+        actor: "stale-leader".into(),
+    };
+    assert!(
+        !source
+            .node(source_leader_3)
+            .propose(conflicting_reuse)
+            .await
+            .unwrap()
+            .success
+    );
+    assert_eq!(
+        source
+            .task_store(source_leader_3)
+            .get_federated_migration("ha-leader-change-migration")
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        MigrationState::Completed
+    );
+
+    // Repeatedly flap the inter-cluster TCP path and run terminal reconciliation.
+    // The operation must converge without recreating tasks or changing terminal state.
+    for cycle in 0..20 {
+        proxy.set_partitioned(true);
+        third.reconcile_once().await.unwrap();
+        proxy.set_partitioned(false);
+        third.reconcile_once().await.unwrap();
+        assert_eq!(
+            target
+                .task_store(target_leader_2)
+                .list_tasks()
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "fault cycle {cycle} must not duplicate target task"
+        );
+        assert_eq!(
+            source
+                .task_store(source_leader_3)
+                .get_federated_migration("ha-leader-change-migration")
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            MigrationState::Completed
+        );
+    }
+
+    // Old shard fencing tokens must not be able to mutate the completed shard.
+    let parsed: crate::types::TaskId = remote_id.parse().unwrap();
+    let (_, shards) = target
+        .task_store(target_leader_2)
+        .get_task_with_aggregate_and_shards(&parsed)
+        .await
+        .unwrap()
+        .unwrap();
+    let shard = &shards[0];
+    let current = target
+        .task_store(target_leader_2)
+        .get_shard(&shard.shard_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let stale_fence = target
+        .node(target_leader_2)
+        .propose(Command::CompleteShard {
+            shard_id: shard.shard_id.to_string(),
+            node_id: "ha-e2e-worker".into(),
+            fencing_token: current.fencing_token.saturating_sub(1),
+            issued_at_ms: chrono::Utc::now().timestamp_millis(),
+            total_records: 999,
+        })
+        .await
+        .unwrap();
+    assert!(!stale_fence.success, "stale fencing token must be rejected");
+    let unchanged = target
+        .task_store(target_leader_2)
+        .get_shard(&shard.shard_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        unchanged.records_processed, 3,
+        "stale fencing token changed committed shard data"
+    );
+
+    proxy.task.abort();
     shutdown.cancel();
     let _ = server.await;
     for index in 0..3 {
