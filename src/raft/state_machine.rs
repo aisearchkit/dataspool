@@ -2474,6 +2474,17 @@ mod tests {
         );
         assert!(
             sm.apply_command(transition(
+                crate::federation::MigrationState::Running,
+                1,
+                8,
+                "running-g1"
+            ))
+            .await
+            .unwrap()
+            .success
+        );
+        assert!(
+            sm.apply_command(transition(
                 crate::federation::MigrationState::Committing,
                 1,
                 8,
