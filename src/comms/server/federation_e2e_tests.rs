@@ -22,7 +22,7 @@ use std::{
     path::PathBuf,
     pin::Pin,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
     task::{Context, Poll},
@@ -158,10 +158,25 @@ impl TestRaftCluster {
     }
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 struct AckFaults {
     prepare: Arc<AtomicBool>,
     commit: Arc<AtomicBool>,
+    prepare_dropped: Arc<AtomicBool>,
+    commit_dropped: Arc<AtomicBool>,
+    observed_paths: Arc<Mutex<Vec<String>>>,
+}
+
+impl Default for AckFaults {
+    fn default() -> Self {
+        Self {
+            prepare: Arc::new(AtomicBool::new(false)),
+            commit: Arc::new(AtomicBool::new(false)),
+            prepare_dropped: Arc::new(AtomicBool::new(false)),
+            commit_dropped: Arc::new(AtomicBool::new(false)),
+            observed_paths: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -210,10 +225,20 @@ where
         let faults = self.faults.clone();
         Box::pin(async move {
             let mut response = inner.call(request).await?;
-            let drop_ack = if path.ends_with("/PrepareFederatedCommit") {
-                faults.prepare.swap(false, Ordering::SeqCst)
-            } else if path.ends_with("/CommitFederatedMigration") {
-                faults.commit.swap(false, Ordering::SeqCst)
+            faults.observed_paths.lock().unwrap().push(path.clone());
+            let lowered = path.to_ascii_lowercase();
+            let drop_ack = if lowered.contains("preparefederatedcommit") {
+                let drop = faults.prepare.swap(false, Ordering::SeqCst);
+                if drop {
+                    faults.prepare_dropped.store(true, Ordering::SeqCst);
+                }
+                drop
+            } else if lowered.contains("commitfederatedmigration") {
+                let drop = faults.commit.swap(false, Ordering::SeqCst);
+                if drop {
+                    faults.commit_dropped.store(true, Ordering::SeqCst);
+                }
+                drop
             } else {
                 false
             };
@@ -455,6 +480,11 @@ async fn independent_raft_clusters_recover_from_partition_lost_acks_and_source_c
         .unwrap()
         .unwrap();
     assert_eq!(prepared.state, FederatedRemoteOperationState::Prepared);
+    assert!(
+        faults.prepare_dropped.load(Ordering::SeqCst),
+        "Prepare response fault was not triggered; observed gRPC paths: {:?}",
+        faults.observed_paths.lock().unwrap()
+    );
     persisted = source
         .task_store
         .get_federated_migration("e2e-migration-commit-loss")
@@ -484,6 +514,7 @@ async fn independent_raft_clusters_recover_from_partition_lost_acks_and_source_c
         .unwrap()
         .unwrap();
     assert_eq!(committed.state, FederatedRemoteOperationState::Committed);
+    assert!(faults.commit_dropped.load(Ordering::SeqCst));
     persisted = source
         .task_store
         .get_federated_migration("e2e-migration-commit-loss")
