@@ -14,9 +14,44 @@ static SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub(crate) struct CacheEntry {
+    #[serde(default)]
+    pub(crate) batch_id: String,
     pub(crate) records: Vec<Record>,
     pub(crate) next_offset: Option<OffsetValue>,
     pub(crate) source_count: u64,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum BatchManifestStatus {
+    Prepared,
+    Delivered,
+    Checkpointed,
+    Acknowledged,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub(crate) struct BatchManifest {
+    pub schema_version: u32,
+    pub shard_id: String,
+    pub batch_id: String,
+    pub fencing_token: u64,
+    pub source_offset: OffsetValue,
+    pub next_offset: Option<OffsetValue>,
+    pub source_count: u64,
+    pub payload_digest: String,
+    pub target_success_count: Option<u64>,
+    pub target_failed_count: Option<u64>,
+    pub target_bytes_written: Option<u64>,
+    pub status: BatchManifestStatus,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+}
+
+impl BatchManifest {
+    pub(crate) fn key(shard_id: &str, batch_id: &str) -> Vec<u8> {
+        format!("batch_manifest:{shard_id}:{batch_id}").into_bytes()
+    }
 }
 
 /// A persistent queue scoped to one migration shard. Entries are acknowledged
@@ -144,6 +179,7 @@ impl<S: KvStore> LocalBatchCache<S> {
         self.ensure_capacity().await?;
         let key = [self.prefix.as_slice(), batch_id.as_bytes()].concat();
         let entry = CacheEntry {
+            batch_id: batch_id.to_string(),
             records: batch.records().to_vec(),
             next_offset,
             source_count,
@@ -214,7 +250,7 @@ impl<S: KvStore> LocalBatchCache<S> {
     /// the destination has accepted the complete batch.
     pub async fn deliver_one_with_checkpoint<F, Fut>(&self, deliver: F) -> Result<bool>
     where
-        F: FnOnce(RecordBatch, Option<OffsetValue>, u64) -> Fut,
+        F: FnOnce(RecordBatch, Option<OffsetValue>, u64, String) -> Fut,
         Fut: std::future::Future<Output = Result<()>>,
     {
         self.deliver_one_with_checkpoint_and_ack(deliver, |_| async { Ok(()) })
@@ -227,7 +263,7 @@ impl<S: KvStore> LocalBatchCache<S> {
         acknowledge: A,
     ) -> Result<bool>
     where
-        F: FnOnce(RecordBatch, Option<OffsetValue>, u64) -> Fut,
+        F: FnOnce(RecordBatch, Option<OffsetValue>, u64, String) -> Fut,
         Fut: std::future::Future<Output = Result<()>>,
         A: FnOnce(String) -> AFut,
         AFut: std::future::Future<Output = Result<()>>,
@@ -235,7 +271,21 @@ impl<S: KvStore> LocalBatchCache<S> {
         let Some((key, entry)) = self.peek_entry().await? else {
             return Ok(false);
         };
-        deliver(entry.records.into(), entry.next_offset, entry.source_count).await?;
+        let batch_id = if entry.batch_id.is_empty() {
+            let prefix = String::from_utf8_lossy(&self.prefix);
+            key.strip_prefix(prefix.as_ref())
+                .unwrap_or_default()
+                .to_string()
+        } else {
+            entry.batch_id
+        };
+        deliver(
+            entry.records.into(),
+            entry.next_offset,
+            entry.source_count,
+            batch_id,
+        )
+        .await?;
         // Replicate the acknowledgement before deleting the local cache copy.
         acknowledge(key.clone()).await?;
         self.ack(&key).await?;
@@ -247,7 +297,7 @@ impl<S: KvStore> LocalBatchCache<S> {
         F: FnOnce(RecordBatch) -> Fut,
         Fut: std::future::Future<Output = Result<()>>,
     {
-        self.deliver_one_with_checkpoint(|batch, _, _| deliver(batch))
+        self.deliver_one_with_checkpoint(|batch, _, _, _| deliver(batch))
             .await
     }
 }
@@ -271,12 +321,14 @@ mod tests {
             .await
             .unwrap();
         let acknowledged = cache
-            .deliver_one_with_checkpoint(|restored, next_offset, source_count| async move {
-                assert!(!restored.is_empty());
-                assert_eq!(next_offset, Some(offset));
-                assert_eq!(source_count, 1);
-                Ok(())
-            })
+            .deliver_one_with_checkpoint(
+                |restored, next_offset, source_count, _batch_id| async move {
+                    assert!(!restored.is_empty());
+                    assert_eq!(next_offset, Some(offset));
+                    assert_eq!(source_count, 1);
+                    Ok(())
+                },
+            )
             .await
             .unwrap();
         assert!(acknowledged);

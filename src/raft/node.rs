@@ -669,6 +669,7 @@ mod cluster_tests {
                 processed_records: 1,
                 processed_bytes: 128,
                 offset: serde_json::to_string(&OffsetValue::DocumentCount(1)).unwrap(),
+                batch_id: None,
             })
             .await
             .unwrap();

@@ -820,6 +820,7 @@ mod tests {
                 processed_records: 17,
                 processed_bytes: 1_700,
                 offset: serde_json::to_string(&checkpoint).unwrap(),
+                batch_id: None,
             })
             .await
             .unwrap();

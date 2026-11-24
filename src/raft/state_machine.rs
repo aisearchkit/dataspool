@@ -38,6 +38,17 @@ struct CacheBatchRequest {
     source_count: u64,
 }
 
+struct BatchDeliveryRequest {
+    shard_id: String,
+    node_id: String,
+    fencing_token: u64,
+    issued_at_ms: i64,
+    batch_id: String,
+    success_count: u64,
+    failed_count: u64,
+    bytes_written: u64,
+}
+
 struct ShardProgressRequest {
     shard_id: String,
     node_id: String,
@@ -46,6 +57,7 @@ struct ShardProgressRequest {
     processed_records: u64,
     processed_bytes: u64,
     offset: String,
+    batch_id: Option<String>,
 }
 
 impl<S: KvStore + Clone> MetaStateMachine<S> {
@@ -156,6 +168,28 @@ impl<S: KvStore + Clone> MetaStateMachine<S> {
                 })
                 .await
             }
+            Command::RecordBatchDelivery {
+                shard_id,
+                node_id,
+                fencing_token,
+                issued_at_ms,
+                batch_id,
+                success_count,
+                failed_count,
+                bytes_written,
+            } => {
+                self.apply_record_batch_delivery(BatchDeliveryRequest {
+                    shard_id,
+                    node_id,
+                    fencing_token,
+                    issued_at_ms,
+                    batch_id,
+                    success_count,
+                    failed_count,
+                    bytes_written,
+                })
+                .await
+            }
             Command::PersistDeadLetters {
                 shard_id,
                 node_id,
@@ -206,6 +240,7 @@ impl<S: KvStore + Clone> MetaStateMachine<S> {
                 processed_records,
                 processed_bytes,
                 offset,
+                batch_id,
             } => {
                 self.apply_progress(ShardProgressRequest {
                     shard_id,
@@ -215,6 +250,7 @@ impl<S: KvStore + Clone> MetaStateMachine<S> {
                     processed_records,
                     processed_bytes,
                     offset,
+                    batch_id,
                 })
                 .await
             }
@@ -1411,6 +1447,15 @@ impl<S: KvStore + Clone> MetaStateMachine<S> {
     }
 
     async fn persist_shard_and_aggregate(&self, shard: &ShardMeta) -> Result<()> {
+        self.persist_shard_and_aggregate_with_manifest(shard, None)
+            .await
+    }
+
+    async fn persist_shard_and_aggregate_with_manifest(
+        &self,
+        shard: &ShardMeta,
+        batch_manifest: Option<(Vec<u8>, crate::pipeline::cache::BatchManifest)>,
+    ) -> Result<()> {
         let mut task = self
             .task_store
             .get_task(&shard.task_id)
@@ -1466,8 +1511,13 @@ impl<S: KvStore + Clone> MetaStateMachine<S> {
         } else {
             None
         };
+        let batch_manifest = if let Some((key, manifest)) = batch_manifest {
+            Some((key, serde_json::to_vec(&manifest)?))
+        } else {
+            None
+        };
         self.task_store
-            .save_shard_and_task_with_audit(shard, &task, audit)
+            .save_shard_and_task_with_audit(shard, &task, audit, batch_manifest)
             .await
     }
 
@@ -1741,35 +1791,87 @@ impl<S: KvStore + Clone> MetaStateMachine<S> {
         if !valid_batch_id(&batch_id) || !batch_id.starts_with("0000000000000000-") {
             return Ok(rejected("Invalid legacy cache import ID"));
         }
+        // Legacy cache entries created before cursor-aware batches have no next offset.
+        // Preserve the shard's current cursor explicitly so the manifest can still
+        // advance through Delivered -> Checkpointed -> Acknowledged.
+        let next_offset = Some(next_offset.unwrap_or_else(|| shard.offset.clone()));
         let key = crate::pipeline::cache::LocalBatchCache::<S>::key_for_shard(&shard_id, &batch_id);
         let entry = crate::pipeline::cache::CacheEntry {
+            batch_id: batch_id.clone(),
             records,
             next_offset,
             source_count,
         };
-        if let Some(existing) = self
+        let cache_entry_exists = if let Some(existing) = self
             .task_store
             .kv_store()
             .get_cf(crate::storage::cf::CACHE, &key)
             .await?
         {
             let existing: crate::pipeline::cache::CacheEntry = serde_json::from_slice(&existing)?;
-            return if existing == entry {
-                Ok(accepted(
-                    "Legacy cache entry already imported",
-                    serde_json::json!({"batch_id": batch_id}),
-                ))
-            } else {
-                Ok(rejected(
+            if existing != entry {
+                return Ok(rejected(
                     "Legacy cache import ID was reused with a different payload",
-                ))
-            };
-        }
-        if self.task_store.cache_batch_count(&shard_id).await? >= 128 {
+                ));
+            }
+            true
+        } else {
+            false
+        };
+        if !cache_entry_exists && self.task_store.cache_batch_count(&shard_id).await? >= 128 {
             return Ok(rejected("Replicated shard cache is full during bootstrap"));
         }
         self.task_store
             .save_cache_batch(&shard_id, &batch_id, &entry)
+            .await?;
+        let manifest_key = crate::pipeline::cache::BatchManifest::key(&shard_id, &batch_id);
+        if let Some(existing) = self
+            .task_store
+            .kv_store()
+            .get_cf(crate::storage::cf::META, &manifest_key)
+            .await?
+        {
+            let existing: crate::pipeline::cache::BatchManifest =
+                serde_json::from_slice(&existing)?;
+            if existing.payload_digest
+                != format!(
+                    "{:x}",
+                    sha2::Sha256::digest(serde_json::to_vec(&entry.records)?)
+                )
+            {
+                return Ok(rejected("Legacy batch manifest payload digest mismatch"));
+            }
+            return Ok(accepted(
+                "Legacy cache entry already imported",
+                serde_json::json!({"batch_id": batch_id}),
+            ));
+        }
+        let manifest = crate::pipeline::cache::BatchManifest {
+            schema_version: 1,
+            shard_id: shard_id.clone(),
+            batch_id: batch_id.clone(),
+            fencing_token: 0,
+            source_offset: shard.offset.clone(),
+            next_offset: entry.next_offset.clone(),
+            source_count: entry.source_count,
+            payload_digest: format!(
+                "{:x}",
+                sha2::Sha256::digest(serde_json::to_vec(&entry.records)?)
+            ),
+            target_success_count: None,
+            target_failed_count: None,
+            target_bytes_written: None,
+            status: crate::pipeline::cache::BatchManifestStatus::Prepared,
+            created_at_ms: 0,
+            updated_at_ms: 0,
+        };
+        self.task_store
+            .kv_store()
+            .put_cf(
+                crate::storage::cf::META,
+                &crate::pipeline::cache::BatchManifest::key(&shard_id, &batch_id),
+                &serde_json::to_vec(&manifest)?,
+            )
             .await?;
         Ok(accepted(
             "Legacy cache entry imported",
@@ -1832,35 +1934,204 @@ impl<S: KvStore + Clone> MetaStateMachine<S> {
         }
         let key = crate::pipeline::cache::LocalBatchCache::<S>::key_for_shard(&shard_id, &batch_id);
         let entry = crate::pipeline::cache::CacheEntry {
+            batch_id: batch_id.clone(),
             records,
             next_offset,
             source_count,
         };
-        if let Some(existing) = self
+        let cache_entry_exists = if let Some(existing) = self
             .task_store
             .kv_store()
             .get_cf(crate::storage::cf::CACHE, &key)
             .await?
         {
             let existing: crate::pipeline::cache::CacheEntry = serde_json::from_slice(&existing)?;
-            if existing == entry {
-                return Ok(accepted(
-                    "Source batch already replicated",
-                    serde_json::json!({"batch_id": batch_id}),
+            if (!existing.batch_id.is_empty() && existing.batch_id != entry.batch_id)
+                || existing.records != entry.records
+                || existing.next_offset != entry.next_offset
+                || existing.source_count != entry.source_count
+            {
+                return Ok(rejected(
+                    "Cache batch ID was reused with a different payload",
                 ));
             }
-            return Ok(rejected(
-                "Cache batch ID was reused with a different payload",
-            ));
-        }
-        if self.task_store.cache_batch_count(&shard_id).await? >= 128 {
+            true
+        } else {
+            false
+        };
+        if !cache_entry_exists && self.task_store.cache_batch_count(&shard_id).await? >= 128 {
             return Ok(rejected("Replicated shard cache is full"));
         }
         self.task_store
             .save_cache_batch(&shard_id, &batch_id, &entry)
             .await?;
+        let manifest_key = crate::pipeline::cache::BatchManifest::key(&shard_id, &batch_id);
+        if let Some(existing) = self
+            .task_store
+            .kv_store()
+            .get_cf(crate::storage::cf::META, &manifest_key)
+            .await?
+        {
+            let existing: crate::pipeline::cache::BatchManifest =
+                serde_json::from_slice(&existing)?;
+            let digest = format!(
+                "{:x}",
+                sha2::Sha256::digest(serde_json::to_vec(&entry.records)?)
+            );
+            if existing.payload_digest != digest
+                || existing.next_offset != entry.next_offset
+                || existing.source_count != entry.source_count
+            {
+                return Ok(rejected("Source batch manifest payload mismatch"));
+            }
+            return Ok(accepted(
+                "Source batch already replicated",
+                serde_json::json!({"batch_id": batch_id}),
+            ));
+        }
+        let manifest = crate::pipeline::cache::BatchManifest {
+            schema_version: 1,
+            shard_id: shard_id.clone(),
+            batch_id: batch_id.clone(),
+            fencing_token,
+            source_offset: shard.offset.clone(),
+            next_offset: entry.next_offset.clone(),
+            source_count: entry.source_count,
+            payload_digest: format!(
+                "{:x}",
+                sha2::Sha256::digest(serde_json::to_vec(&entry.records)?)
+            ),
+            target_success_count: None,
+            target_failed_count: None,
+            target_bytes_written: None,
+            status: crate::pipeline::cache::BatchManifestStatus::Prepared,
+            created_at_ms: issued_at_ms,
+            updated_at_ms: issued_at_ms,
+        };
+        self.task_store
+            .kv_store()
+            .put_cf(
+                crate::storage::cf::META,
+                &crate::pipeline::cache::BatchManifest::key(&shard_id, &batch_id),
+                &serde_json::to_vec(&manifest)?,
+            )
+            .await?;
         Ok(accepted(
             "Source batch replicated",
+            serde_json::json!({"batch_id": batch_id}),
+        ))
+    }
+
+    async fn apply_record_batch_delivery(
+        &self,
+        request: BatchDeliveryRequest,
+    ) -> Result<CommandResponse> {
+        let BatchDeliveryRequest {
+            shard_id,
+            node_id,
+            fencing_token,
+            issued_at_ms,
+            batch_id,
+            success_count,
+            failed_count,
+            bytes_written,
+        } = request;
+        let shard = match self
+            .task_store
+            .get_shard(&parse_shard_id(&shard_id)?)
+            .await?
+        {
+            Some(shard) => shard,
+            None => return Ok(rejected("Shard not found")),
+        };
+        let at = chrono::DateTime::from_timestamp_millis(issued_at_ms).ok_or_else(|| {
+            DatspoolError::Serialization("Invalid batch delivery timestamp".into())
+        })?;
+        if !lease_matches(&shard, &node_id, fencing_token, at) {
+            return Ok(rejected("Batch delivery result rejected by fencing token"));
+        }
+        let key = crate::pipeline::cache::BatchManifest::key(&shard_id, &batch_id);
+        let Some(value) = self
+            .task_store
+            .kv_store()
+            .get_cf(crate::storage::cf::META, &key)
+            .await?
+        else {
+            return Ok(rejected("Batch manifest not found"));
+        };
+        let mut manifest: crate::pipeline::cache::BatchManifest = serde_json::from_slice(&value)?;
+        if manifest.fencing_token > fencing_token
+            || manifest.shard_id != shard_id
+            || manifest.batch_id != batch_id
+        {
+            return Ok(rejected(
+                "Batch manifest identity or fencing generation mismatch",
+            ));
+        }
+        let cache_key =
+            crate::pipeline::cache::LocalBatchCache::<S>::key_for_shard(&shard_id, &batch_id);
+        let Some(cache_bytes) = self
+            .task_store
+            .kv_store()
+            .get_cf(crate::storage::cf::CACHE, &cache_key)
+            .await?
+        else {
+            return Ok(rejected(
+                "Replicated batch payload is missing before delivery acknowledgement",
+            ));
+        };
+        let cache_entry: crate::pipeline::cache::CacheEntry = serde_json::from_slice(&cache_bytes)?;
+        let actual_digest = format!(
+            "{:x}",
+            sha2::Sha256::digest(serde_json::to_vec(&cache_entry.records)?)
+        );
+        if cache_entry.batch_id != batch_id
+            || cache_entry.next_offset != manifest.next_offset
+            || cache_entry.source_count != manifest.source_count
+            || cache_entry.records.len() as u64 != manifest.source_count
+            || actual_digest != manifest.payload_digest
+        {
+            return Ok(rejected(
+                "Replicated batch payload does not match its durable manifest",
+            ));
+        }
+        if matches!(
+            manifest.status,
+            crate::pipeline::cache::BatchManifestStatus::Delivered
+                | crate::pipeline::cache::BatchManifestStatus::Checkpointed
+                | crate::pipeline::cache::BatchManifestStatus::Acknowledged
+        ) {
+            return Ok(accepted(
+                "Batch delivery result already recorded",
+                serde_json::json!({"batch_id": batch_id}),
+            ));
+        }
+        manifest.fencing_token = fencing_token;
+        if manifest.status != crate::pipeline::cache::BatchManifestStatus::Prepared {
+            return Ok(rejected(
+                "Batch manifest is not awaiting destination delivery",
+            ));
+        }
+        if success_count.saturating_add(failed_count) != manifest.source_count {
+            return Ok(rejected(
+                "Destination result does not account for every source record",
+            ));
+        }
+        manifest.target_success_count = Some(success_count);
+        manifest.target_failed_count = Some(failed_count);
+        manifest.target_bytes_written = Some(bytes_written);
+        manifest.status = crate::pipeline::cache::BatchManifestStatus::Delivered;
+        manifest.updated_at_ms = issued_at_ms;
+        self.task_store
+            .kv_store()
+            .put_cf(
+                crate::storage::cf::META,
+                &key,
+                &serde_json::to_vec(&manifest)?,
+            )
+            .await?;
+        Ok(accepted(
+            "Batch delivery result recorded",
             serde_json::json!({"batch_id": batch_id}),
         ))
     }
@@ -1947,8 +2218,29 @@ impl<S: KvStore + Clone> MetaStateMachine<S> {
             Some(_) => return Ok(rejected("Cache batches must be acknowledged in FIFO order")),
             None => return Ok(rejected("Replicated cache batch does not exist")),
         }
+        let manifest_key = crate::pipeline::cache::BatchManifest::key(&shard_id, &batch_id);
+        let Some(manifest_bytes) = self
+            .task_store
+            .kv_store()
+            .get_cf(crate::storage::cf::META, &manifest_key)
+            .await?
+        else {
+            return Ok(rejected("Batch manifest not found during acknowledgement"));
+        };
+        let mut manifest: crate::pipeline::cache::BatchManifest =
+            serde_json::from_slice(&manifest_bytes)?;
+        if manifest.fencing_token > fencing_token
+            || manifest.status != crate::pipeline::cache::BatchManifestStatus::Checkpointed
+        {
+            return Ok(rejected(
+                "Batch must be checkpointed by the current fencing generation before acknowledgement",
+            ));
+        }
+        manifest.fencing_token = fencing_token;
+        manifest.status = crate::pipeline::cache::BatchManifestStatus::Acknowledged;
+        manifest.updated_at_ms = issued_at_ms;
         self.task_store
-            .ack_cache_batch(&shard_id, &batch_id, cache_key.as_bytes())
+            .ack_cache_batch(&shard_id, &batch_id, cache_key.as_bytes(), &manifest)
             .await?;
         Ok(accepted(
             "Replicated cache entry acknowledged",
@@ -2011,6 +2303,7 @@ impl<S: KvStore + Clone> MetaStateMachine<S> {
             processed_records,
             processed_bytes,
             offset,
+            batch_id,
         } = request;
         let shard_id = parse_shard_id(&shard_id)?;
         let mut shard = match self.task_store.get_shard(&shard_id).await? {
@@ -2030,8 +2323,53 @@ impl<S: KvStore + Clone> MetaStateMachine<S> {
             .map_err(|e| DatspoolError::Serialization(e.to_string()))?;
         let at = chrono::DateTime::from_timestamp_millis(issued_at_ms)
             .ok_or_else(|| DatspoolError::Serialization("Invalid progress timestamp".into()))?;
+        let mut manifest_update = None;
+        if let Some(batch_id) = batch_id.as_ref() {
+            let key = crate::pipeline::cache::BatchManifest::key(&shard_id.to_string(), batch_id);
+            let Some(value) = self
+                .task_store
+                .kv_store()
+                .get_cf(crate::storage::cf::META, &key)
+                .await?
+            else {
+                return Ok(rejected("Checkpoint batch manifest not found"));
+            };
+            let mut manifest: crate::pipeline::cache::BatchManifest =
+                serde_json::from_slice(&value)?;
+            if manifest.fencing_token > fencing_token
+                || manifest.next_offset.as_ref() != Some(&offset)
+                || !matches!(
+                    manifest.status,
+                    crate::pipeline::cache::BatchManifestStatus::Delivered
+                        | crate::pipeline::cache::BatchManifestStatus::Checkpointed
+                )
+            {
+                return Ok(rejected(
+                    "Batch manifest is not eligible for checkpoint commit",
+                ));
+            }
+            if manifest.status == crate::pipeline::cache::BatchManifestStatus::Checkpointed {
+                if shard.offset == offset
+                    && shard.records_processed == processed_records
+                    && shard.bytes_processed == processed_bytes
+                {
+                    return Ok(accepted(
+                        "Batch checkpoint already committed",
+                        serde_json::json!({"batch_id": batch_id}),
+                    ));
+                }
+                return Ok(rejected(
+                    "Checkpointed batch conflicts with current shard progress",
+                ));
+            }
+            manifest.fencing_token = fencing_token;
+            manifest.status = crate::pipeline::cache::BatchManifestStatus::Checkpointed;
+            manifest.updated_at_ms = issued_at_ms;
+            manifest_update = Some((key, manifest));
+        }
         shard.set_progress_at(processed_records, processed_bytes, offset, at);
-        self.persist_shard_and_aggregate(&shard).await?;
+        self.persist_shard_and_aggregate_with_manifest(&shard, manifest_update)
+            .await?;
         Ok(accepted(
             "Shard progress updated",
             serde_json::json!({"fencing_token": fencing_token}),
@@ -2611,6 +2949,188 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn durable_batch_manifest_requires_delivery_checkpoint_and_ack_in_order() {
+        use crate::pipeline::{OffsetValue, Record};
+        use serde_json::json;
+
+        let dir = tempdir().unwrap();
+        let store = TaskStore::new(RocksDbStore::open(dir.path()).unwrap());
+        let task = TaskMeta::new("durable-batch-manifest".into(), "{}".into(), "{}".into());
+        let shard = ShardMeta::new(task.task_id, 0, "{}".into());
+        let shard_id = shard.shard_id;
+        let mut sm = MetaStateMachine::new(store.kv_store().clone());
+        assert!(
+            sm.apply_command(Command::CreateTask {
+                task: Box::new(task),
+                shards: vec![shard],
+                request_id: "create-durable-batch".into(),
+                actor: "test".into(),
+            })
+            .await
+            .unwrap()
+            .success
+        );
+
+        let claimed_at = chrono::Utc::now().timestamp_millis();
+        assert!(
+            sm.apply_command(Command::ClaimShard {
+                shard_id: shard_id.to_string(),
+                node_id: "worker-a".into(),
+                claim_id: "claim-durable-batch".into(),
+                issued_at_ms: claimed_at,
+                lease_expires_at_ms: claimed_at + 60_000,
+            })
+            .await
+            .unwrap()
+            .success
+        );
+        let claimed = store.get_shard(&shard_id).await.unwrap().unwrap();
+        let fencing_token = claimed.fencing_token;
+        let batch_id = format!("{fencing_token:016x}-000000");
+        let records = vec![Record::with_id(
+            "doc-1",
+            "elasticsearch",
+            json!({"value": 1}),
+        )];
+        let next_offset = OffsetValue::DocumentCount(1);
+        let cache_batch = Command::CacheBatch {
+            shard_id: shard_id.to_string(),
+            node_id: "worker-a".into(),
+            fencing_token,
+            issued_at_ms: claimed_at + 1,
+            batch_id: batch_id.clone(),
+            records,
+            next_offset: Some(next_offset.clone()),
+            source_count: 1,
+        };
+        assert!(sm.apply_command(cache_batch.clone()).await.unwrap().success);
+        assert!(sm.apply_command(cache_batch).await.unwrap().success);
+        let manifest_key =
+            crate::pipeline::cache::BatchManifest::key(&shard_id.to_string(), &batch_id);
+        let read_manifest = || async {
+            let bytes = store
+                .kv_store()
+                .get_cf(crate::storage::cf::META, &manifest_key)
+                .await
+                .unwrap()
+                .unwrap();
+            serde_json::from_slice::<crate::pipeline::cache::BatchManifest>(&bytes).unwrap()
+        };
+        assert_eq!(
+            read_manifest().await.status,
+            crate::pipeline::cache::BatchManifestStatus::Prepared
+        );
+
+        let delivered = sm
+            .apply_command(Command::RecordBatchDelivery {
+                shard_id: shard_id.to_string(),
+                node_id: "worker-a".into(),
+                fencing_token,
+                issued_at_ms: claimed_at + 2,
+                batch_id: batch_id.clone(),
+                success_count: 1,
+                failed_count: 0,
+                bytes_written: 64,
+            })
+            .await
+            .unwrap();
+        assert!(delivered.success, "{}", delivered.message);
+        assert_eq!(
+            read_manifest().await.status,
+            crate::pipeline::cache::BatchManifestStatus::Delivered
+        );
+
+        let progress_command = Command::UpdateShardProgress {
+            shard_id: shard_id.to_string(),
+            node_id: "worker-a".into(),
+            fencing_token,
+            issued_at_ms: claimed_at + 3,
+            processed_records: 1,
+            processed_bytes: 64,
+            offset: serde_json::to_string(&next_offset).unwrap(),
+            batch_id: Some(batch_id.clone()),
+        };
+        let progress = sm.apply_command(progress_command.clone()).await.unwrap();
+        assert!(progress.success, "{}", progress.message);
+        let replayed_progress = sm.apply_command(progress_command).await.unwrap();
+        assert!(replayed_progress.success, "{}", replayed_progress.message);
+        assert_eq!(
+            read_manifest().await.status,
+            crate::pipeline::cache::BatchManifestStatus::Checkpointed
+        );
+        assert_eq!(
+            store
+                .get_shard(&shard_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .records_processed,
+            1
+        );
+
+        let cache_key = String::from_utf8(
+            crate::pipeline::cache::LocalBatchCache::<RocksDbStore>::key_for_shard(
+                &shard_id.to_string(),
+                &batch_id,
+            ),
+        )
+        .unwrap();
+        let ack = sm
+            .apply_command(Command::AckCacheBatch {
+                shard_id: shard_id.to_string(),
+                node_id: "worker-a".into(),
+                fencing_token,
+                issued_at_ms: claimed_at + 4,
+                cache_key,
+            })
+            .await
+            .unwrap();
+        assert!(ack.success, "{}", ack.message);
+        assert_eq!(
+            read_manifest().await.status,
+            crate::pipeline::cache::BatchManifestStatus::Acknowledged
+        );
+        assert_eq!(
+            store
+                .cache_batch_count(&shard_id.to_string())
+                .await
+                .unwrap(),
+            0
+        );
+
+        assert!(
+            sm.apply_command(Command::ClaimShard {
+                shard_id: shard_id.to_string(),
+                node_id: "worker-b".into(),
+                claim_id: "claim-after-recovery".into(),
+                issued_at_ms: claimed_at + 60_001,
+                lease_expires_at_ms: claimed_at + 120_001,
+            })
+            .await
+            .unwrap()
+            .success
+        );
+        let stale_delivery = sm
+            .apply_command(Command::RecordBatchDelivery {
+                shard_id: shard_id.to_string(),
+                node_id: "worker-a".into(),
+                fencing_token,
+                issued_at_ms: claimed_at + 5,
+                batch_id,
+                success_count: 1,
+                failed_count: 0,
+                bytes_written: 64,
+            })
+            .await
+            .unwrap();
+        assert!(!stale_delivery.success);
+        assert_eq!(
+            read_manifest().await.status,
+            crate::pipeline::cache::BatchManifestStatus::Acknowledged
+        );
+    }
+
+    #[tokio::test]
     async fn legacy_cache_import_is_idempotent_and_closed_after_bootstrap() {
         use crate::pipeline::{OffsetValue, Record};
         use serde_json::json;
@@ -2846,6 +3366,7 @@ mod tests {
                 processed_bytes: 2048,
                 offset: serde_json::to_string(&crate::pipeline::OffsetValue::DocumentCount(10))
                     .unwrap(),
+                batch_id: None,
             })
             .await
             .unwrap();
@@ -3200,6 +3721,7 @@ mod tests {
                 processed_bytes: 512,
                 offset: serde_json::to_string(&crate::pipeline::OffsetValue::DocumentCount(5))
                     .unwrap(),
+                batch_id: None,
             })
             .await
             .unwrap();

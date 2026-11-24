@@ -504,6 +504,128 @@ async fn elasticsearch_pit_search_after_and_bulk_item_errors() {
             },
         );
         sink.connect().await.unwrap();
+
+        // A stale generation from the same shard is an idempotent no-op only
+        // when the stored document carries a newer Dataspool fencing marker.
+        let fence_shard = format!("compat-fence-{suffix}");
+        let fence_version = (1_i64 << 62) + 10;
+        let fence_batch = "0000000000000002-000000";
+        let first_fenced = sink
+            .write_batch_fenced(
+                RecordBatch::from(vec![Record::with_id(
+                    "fenced-replay",
+                    "compat",
+                    json!({"number":111}),
+                )]),
+                fence_version + 1,
+                &fence_shard,
+                fence_batch,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            first_fenced.success_count, 1,
+            "{label}: initial fenced write"
+        );
+        let stale_fenced = sink
+            .write_batch_fenced(
+                RecordBatch::from(vec![Record::with_id(
+                    "fenced-replay",
+                    "compat",
+                    json!({"number":999}),
+                )]),
+                fence_version,
+                &fence_shard,
+                "0000000000000001-000000",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            stale_fenced.success_count, 1,
+            "{label}: stale same-shard replay must be a no-op"
+        );
+        assert_eq!(
+            stale_fenced.failed_count, 0,
+            "{label}: same-shard stale replay is safely fenced"
+        );
+
+        // A numerically higher version from a different shard is not proof that
+        // this shard's write was delivered; fail closed rather than checkpoint it.
+        let foreign_version = fence_version + 20;
+        let foreign = sink
+            .write_batch_fenced(
+                RecordBatch::from(vec![Record::with_id(
+                    "fenced-foreign",
+                    "compat",
+                    json!({"number":777}),
+                )]),
+                foreign_version,
+                &format!("{fence_shard}-other"),
+                "0000000000000003-000000",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            foreign.success_count, 1,
+            "{label}: foreign shard initial write"
+        );
+        let foreign_conflict = sink
+            .write_batch_fenced(
+                RecordBatch::from(vec![Record::with_id(
+                    "fenced-foreign",
+                    "compat",
+                    json!({"number":222}),
+                )]),
+                fence_version + 19,
+                &fence_shard,
+                "0000000000000002-000001",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            foreign_conflict.failed_count, 1,
+            "{label}: foreign shard version conflict must fail closed"
+        );
+        assert!(
+            !foreign_conflict.errors.is_empty(),
+            "{label}: foreign conflict needs an actionable error"
+        );
+
+        http.post(format!("{base_url}/{index}/_refresh"))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+        let fenced_document: Value = http
+            .get(format!("{base_url}/{index}/_doc/fenced-replay"))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(
+            fenced_document["_source"]["number"], 111,
+            "{label}: stale worker overwrote newer data"
+        );
+        let foreign_document: Value = http
+            .get(format!("{base_url}/{index}/_doc/fenced-foreign"))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(
+            foreign_document["_source"]["number"], 777,
+            "{label}: foreign shard conflict overwrote target data"
+        );
+
         let retry_records = (0..2048)
             .map(|n| Record::with_id(format!("sink-retry-{n}"), "compat", json!({"number":n})))
             .collect::<Vec<_>>();

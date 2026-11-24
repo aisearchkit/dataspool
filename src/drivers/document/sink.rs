@@ -283,23 +283,42 @@ impl DocumentSink {
             body.push('\n');
             if operation != "delete" {
                 let mut payload = record.payload.clone();
-                if let (Some(migration_id), Some(generation)) = (
-                    record.get_metadata("_dataspool_compensation_migration_id"),
-                    record.get_metadata("_dataspool_compensation_generation"),
-                ) && let Value::Object(ref mut fields) = payload
-                {
-                    let payload_digest = format!(
-                        "{:x}",
-                        sha2::Sha256::digest(record.payload.to_string().as_bytes())
-                    );
-                    fields.insert(
-                        "_dataspool".into(),
-                        json!({
-                            "migration_id": migration_id,
-                            "generation": generation.parse::<u64>().unwrap_or_default(),
-                            "payload_digest": payload_digest,
-                        }),
-                    );
+                if let Value::Object(ref mut fields) = payload {
+                    let mut datas_pool = fields
+                        .get("_dataspool")
+                        .and_then(Value::as_object)
+                        .cloned()
+                        .unwrap_or_default();
+                    if let (Some(migration_id), Some(generation)) = (
+                        record.get_metadata("_dataspool_compensation_migration_id"),
+                        record.get_metadata("_dataspool_compensation_generation"),
+                    ) {
+                        let payload_digest = format!(
+                            "{:x}",
+                            sha2::Sha256::digest(record.payload.to_string().as_bytes())
+                        );
+                        datas_pool.insert("migration_id".into(), json!(migration_id));
+                        datas_pool.insert(
+                            "generation".into(),
+                            json!(generation.parse::<u64>().unwrap_or_default()),
+                        );
+                        datas_pool.insert("payload_digest".into(), json!(payload_digest));
+                    }
+                    if let (Some(fencing_version), Some(shard_id), Some(batch_id)) = (
+                        record.get_metadata("_dataspool_fencing_token"),
+                        record.get_metadata("_dataspool_fencing_shard_id"),
+                        record.get_metadata("_dataspool_fencing_batch_id"),
+                    ) {
+                        datas_pool.insert(
+                            "fencing_version".into(),
+                            json!(fencing_version.parse::<i64>().unwrap_or_default()),
+                        );
+                        datas_pool.insert("fencing_shard_id".into(), json!(shard_id));
+                        datas_pool.insert("fencing_batch_id".into(), json!(batch_id));
+                    }
+                    if !datas_pool.is_empty() {
+                        fields.insert("_dataspool".into(), Value::Object(datas_pool));
+                    }
                 }
                 body.push_str(&payload.to_string());
                 body.push('\n');
@@ -457,9 +476,61 @@ impl DocumentSink {
                                 "Compensatable create conflict for document {document_id}: existing document is not the same migration generation and payload"
                             ));
                         }
+                    } else if let (Some(version), Some(shard_id), Some(document_id)) = (
+                        record
+                            .get_metadata("_dataspool_fencing_token")
+                            .and_then(|value| value.parse::<i64>().ok()),
+                        record.get_metadata("_dataspool_fencing_shard_id"),
+                        record.id.as_deref(),
+                    ) {
+                        // A conflict is idempotent only if the stored document proves that
+                        // this same shard has already written it with an equal/newer fence.
+                        // An unrelated pre-existing document must never advance the checkpoint.
+                        let index = record
+                            .get_metadata("_target_index")
+                            .unwrap_or(&target_index);
+                        let existing = client
+                            .post(format!(
+                                "{}/{}/_mget",
+                                url.trim_end_matches("/_bulk"),
+                                index
+                            ))
+                            .json(&json!({"ids":[document_id]}))
+                            .send()
+                            .await;
+                        let fenced_by_same_shard = match existing {
+                            Ok(response) if response.status().is_success() => {
+                                match response.json::<Value>().await {
+                                    Ok(value) => value["docs"]
+                                        .as_array()
+                                        .and_then(|docs| docs.first())
+                                        .is_some_and(|doc| {
+                                            doc["found"] == true
+                                                && doc["_version"]
+                                                    .as_i64()
+                                                    .is_some_and(|stored| stored >= version)
+                                                && doc["_source"]["_dataspool"]["fencing_version"]
+                                                    .as_i64()
+                                                    .is_some_and(|stored| stored >= version)
+                                                && doc["_source"]["_dataspool"]["fencing_shard_id"]
+                                                    == shard_id
+                                        }),
+                                    Err(_) => false,
+                                }
+                            }
+                            _ => false,
+                        };
+                        if fenced_by_same_shard {
+                            result.success_count += 1;
+                        } else {
+                            result.failed_count += 1;
+                            result.add_error(format!(
+                                "Fenced write conflict for document {document_id}: stored version is not proven to belong to shard {shard_id}"
+                            ));
+                        }
                     } else {
-                        // A newer lease generation already wrote this document.
-                        result.success_count += 1;
+                        result.failed_count += 1;
+                        result.add_error("Version conflict cannot be treated as an idempotent fenced write: missing fencing identity".into());
                     }
                     continue;
                 }
@@ -869,6 +940,8 @@ impl Sink for DocumentSink {
         &mut self,
         batch: RecordBatch,
         fencing_version: i64,
+        shard_id: &str,
+        batch_id: &str,
     ) -> Result<WriteResult> {
         if fencing_version <= 0 {
             return Err(
@@ -883,7 +956,14 @@ impl Sink for DocumentSink {
                 )
                 .into());
             }
+            if record.get_metadata("_op") != Some("delete") && !record.payload.is_object() {
+                return Err(DriverError::Unsupported(
+                    "Fenced Elasticsearch writes require object document payloads to persist fencing provenance".into(),
+                ).into());
+            }
             record.add_metadata("_dataspool_fencing_token", fencing_version.to_string());
+            record.add_metadata("_dataspool_fencing_shard_id", shard_id.to_string());
+            record.add_metadata("_dataspool_fencing_batch_id", batch_id.to_string());
         }
         self.write_batch(RecordBatch::from(records)).await
     }

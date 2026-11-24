@@ -99,6 +99,18 @@ pub enum Command {
         source_count: u64,
     },
 
+    /// Record a destination-confirmed batch result before advancing its source checkpoint.
+    RecordBatchDelivery {
+        shard_id: String,
+        node_id: String,
+        fencing_token: u64,
+        issued_at_ms: i64,
+        batch_id: String,
+        success_count: u64,
+        failed_count: u64,
+        bytes_written: u64,
+    },
+
     /// Replicate permanent sink failures to every state-machine replica.
     PersistDeadLetters {
         shard_id: String,
@@ -135,6 +147,8 @@ pub enum Command {
         processed_records: u64,
         processed_bytes: u64,
         offset: String, // JSON-serialized OffsetValue
+        #[serde(default)]
+        batch_id: Option<String>,
     },
 
     /// Mark shard as completed
@@ -298,6 +312,11 @@ impl Command {
                     shard_id,
                     failures.len()
                 )
+            }
+            Command::RecordBatchDelivery {
+                shard_id, batch_id, ..
+            } => {
+                format!("RecordBatchDelivery({}, {})", shard_id, batch_id)
             }
             Command::AckCacheBatch {
                 shard_id,

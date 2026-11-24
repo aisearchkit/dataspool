@@ -562,6 +562,7 @@ impl<S: KvStore> TaskStore<S> {
         shard: &ShardMeta,
         task: &TaskMeta,
         audit: Option<AuditEvent>,
+        batch_manifest: Option<(Vec<u8>, Vec<u8>)>,
     ) -> Result<()> {
         let shard_key = format!("shard:{}", shard.shard_id);
         let task_shard_key = format!("task_shard:{}:{}", shard.task_id, shard.shard_id);
@@ -576,6 +577,9 @@ impl<S: KvStore> TaskStore<S> {
                 format!("audit:{:020}", event.log_index),
                 serde_json::to_vec(&event)?,
             );
+        }
+        if let Some((key, value)) = batch_manifest {
+            batch.put_cf(cf::META, key, value);
         }
         self.store.write_batch(batch).await?;
         Ok(())
@@ -733,6 +737,7 @@ impl<S: KvStore> TaskStore<S> {
         shard_id: &str,
         batch_id: &str,
         key: &[u8],
+        manifest: &crate::pipeline::cache::BatchManifest,
     ) -> Result<()> {
         let watermark_key = format!("shard_cache_ack:{shard_id}");
         let mut batch = crate::storage::WriteBatch::new();
@@ -741,6 +746,11 @@ impl<S: KvStore> TaskStore<S> {
             cf::META,
             watermark_key,
             bytes::Bytes::copy_from_slice(batch_id.as_bytes()),
+        );
+        batch.put_cf(
+            cf::META,
+            crate::pipeline::cache::BatchManifest::key(shard_id, batch_id),
+            bytes::Bytes::from(serde_json::to_vec(manifest)?),
         );
         self.store.write_batch(batch).await?;
         Ok(())

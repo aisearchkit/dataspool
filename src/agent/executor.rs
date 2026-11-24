@@ -358,15 +358,30 @@ impl<S: KvStore + Clone + 'static> ShardExecutor<S> {
             let shard_id_for_ack = shard.shard_id;
             let sink_ref = &mut *sink;
             let delivered = cache
-                .deliver_one_with_checkpoint_and_ack(|batch, next_offset, source_count| async move {
+                .deliver_one_with_checkpoint_and_ack(|batch, next_offset, source_count, batch_id| async move {
                     let batch_bytes = batch.records().iter().map(|record| record.to_bytes().map(|bytes| bytes.len() as u64))
                         .collect::<std::result::Result<Vec<_>, _>>()?.into_iter().sum();
                     executor.ensure_optional_lease(lease_for_delivery.as_ref()).await?;
+                    if let Some(lease) = lease_for_delivery.as_ref() {
+                        let manifest_key = crate::pipeline::cache::BatchManifest::key(&shard_id.to_string(), &batch_id);
+                        if task_store.kv_store().get_cf(crate::storage::cf::META, &manifest_key).await?.is_none() {
+                            let response = executor.raft.as_ref().ok_or_else(|| DatspoolError::Internal("Raft is required to backfill a legacy batch manifest".into()))?
+                                .propose(Command::CacheBatch {
+                                    shard_id: shard_id.to_string(), node_id: lease.node_id.to_string(),
+                                    fencing_token: lease.fencing_token, issued_at_ms: chrono::Utc::now().timestamp_millis(),
+                                    batch_id: batch_id.clone(), records: batch.records().to_vec(),
+                                    next_offset: next_offset.clone(), source_count,
+                                }).await?;
+                            if !response.success { return Err(DatspoolError::Internal(format!("Legacy batch manifest backfill rejected: {}", response.message))); }
+                        }
+                    }
                     let write = if let Some((migration_id, generation)) = compensation_for_delivery.as_ref() {
                         sink_ref.write_batch_compensatable(batch, migration_id, *generation).await?
                     } else {
                         match lease_for_delivery.as_ref() {
-                            Some(lease) => sink_ref.write_batch_fenced(batch, lease.next_sink_version()?).await?,
+                            Some(lease) => sink_ref.write_batch_fenced(
+                                batch, lease.next_sink_version()?, &shard_id.to_string(), &batch_id,
+                            ).await?,
                             None => sink_ref.write_batch(batch).await?,
                         }
                     };
@@ -395,8 +410,18 @@ impl<S: KvStore + Clone + 'static> ShardExecutor<S> {
                             dlq.enqueue(write.failed_records).await?;
                         }
                     }
+                    if let Some(lease) = lease_for_delivery.as_ref() {
+                        let response = executor.raft.as_ref().ok_or_else(|| DatspoolError::Internal("Raft is required to record batch delivery".into()))?
+                            .propose(Command::RecordBatchDelivery {
+                                shard_id: shard_id.to_string(), node_id: lease.node_id.to_string(),
+                                fencing_token: lease.fencing_token, issued_at_ms: chrono::Utc::now().timestamp_millis(),
+                                batch_id: batch_id.clone(), success_count: source_count.saturating_sub(write.failed_count as u64),
+                                failed_count: write.failed_count as u64, bytes_written: write.bytes_written,
+                            }).await?;
+                        if !response.success { return Err(DatspoolError::Internal(format!("Batch delivery manifest rejected: {}", response.message))); }
+                    }
                     if let Some(next_offset) = next_offset {
-                        executor.persist_progress(lease_for_delivery.as_ref(), &shard_id, source_count, batch_bytes, next_offset).await?;
+                        executor.persist_progress(lease_for_delivery.as_ref(), &shard_id, source_count, batch_bytes, next_offset, Some(batch_id)).await?;
                     }
                     Ok(())
                 }, move |cache_key| async move {
@@ -454,6 +479,7 @@ impl<S: KvStore + Clone + 'static> ShardExecutor<S> {
                             0,
                             0,
                             new_offset.clone(),
+                            None,
                         )
                         .await?;
                         offset = new_offset;
@@ -524,7 +550,7 @@ impl<S: KvStore + Clone + 'static> ShardExecutor<S> {
             let sink_ref = &mut *sink;
             cache
                 .deliver_one_with_checkpoint_and_ack(
-                    |cached_batch, next_offset, source_count| async move {
+                    |cached_batch, next_offset, source_count, batch_id| async move {
                         let batch_bytes = cached_batch
                             .records()
                             .iter()
@@ -548,6 +574,8 @@ impl<S: KvStore + Clone + 'static> ShardExecutor<S> {
                                         .write_batch_fenced(
                                             cached_batch,
                                             lease.next_sink_version()?,
+                                            &shard_id.to_string(),
+                                            &batch_id,
                                         )
                                         .await?
                                 }
@@ -597,6 +625,34 @@ impl<S: KvStore + Clone + 'static> ShardExecutor<S> {
                                 dlq.enqueue(write.failed_records).await?;
                             }
                         }
+                        if let Some(lease) = lease_for_delivery.as_ref() {
+                            let response = executor
+                                .raft
+                                .as_ref()
+                                .ok_or_else(|| {
+                                    DatspoolError::Internal(
+                                        "Raft is required to record batch delivery".into(),
+                                    )
+                                })?
+                                .propose(Command::RecordBatchDelivery {
+                                    shard_id: shard_id.to_string(),
+                                    node_id: lease.node_id.to_string(),
+                                    fencing_token: lease.fencing_token,
+                                    issued_at_ms: chrono::Utc::now().timestamp_millis(),
+                                    batch_id: batch_id.clone(),
+                                    success_count: source_count
+                                        .saturating_sub(write.failed_count as u64),
+                                    failed_count: write.failed_count as u64,
+                                    bytes_written: write.bytes_written,
+                                })
+                                .await?;
+                            if !response.success {
+                                return Err(DatspoolError::Internal(format!(
+                                    "Batch delivery manifest rejected: {}",
+                                    response.message
+                                )));
+                            }
+                        }
                         if let Some(next_offset) = next_offset {
                             executor
                                 .persist_progress(
@@ -605,6 +661,7 @@ impl<S: KvStore + Clone + 'static> ShardExecutor<S> {
                                     source_count,
                                     batch_bytes,
                                     next_offset,
+                                    Some(batch_id),
                                 )
                                 .await?;
                         }
@@ -728,6 +785,7 @@ impl<S: KvStore + Clone + 'static> ShardExecutor<S> {
         batch_records: u64,
         batch_bytes: u64,
         offset: crate::pipeline::OffsetValue,
+        batch_id: Option<String>,
     ) -> Result<()> {
         if let Some(lease) = lease {
             self.ensure_lease(lease).await?;
@@ -735,7 +793,34 @@ impl<S: KvStore + Clone + 'static> ShardExecutor<S> {
                 self.task_store.get_shard(shard_id).await?.ok_or_else(|| {
                     DatspoolError::Internal(format!("Shard {shard_id} not found"))
                 })?;
-            if current.offset == offset {
+            let offset_unchanged = current.offset == offset;
+            let checkpoint_already_applied = if let Some(batch_id) = batch_id.as_ref() {
+                let key =
+                    crate::pipeline::cache::BatchManifest::key(&shard_id.to_string(), batch_id);
+                self.task_store
+                    .kv_store()
+                    .get_cf(crate::storage::cf::META, &key)
+                    .await?
+                    .map(|bytes| {
+                        serde_json::from_slice::<crate::pipeline::cache::BatchManifest>(&bytes)
+                    })
+                    .transpose()
+                    .map_err(|error| DatspoolError::Serialization(error.to_string()))?
+                    .is_some_and(|manifest| {
+                        matches!(
+                            manifest.status,
+                            crate::pipeline::cache::BatchManifestStatus::Checkpointed
+                        )
+                    })
+            } else {
+                offset_unchanged
+            };
+            if checkpoint_already_applied {
+                return self
+                    .persist_progress_checkpoint_replay(lease, shard_id, offset, batch_id, &current)
+                    .await;
+            }
+            if offset_unchanged && batch_id.is_none() {
                 return Ok(());
             }
             let response = self
@@ -753,6 +838,7 @@ impl<S: KvStore + Clone + 'static> ShardExecutor<S> {
                     processed_bytes: current.bytes_processed.saturating_add(batch_bytes),
                     offset: serde_json::to_string(&offset)
                         .map_err(|e| DatspoolError::Serialization(e.to_string()))?,
+                    batch_id,
                 })
                 .await?;
             if !response.success {
@@ -770,6 +856,39 @@ impl<S: KvStore + Clone + 'static> ShardExecutor<S> {
                 current.update_progress(batch_records, batch_bytes, offset);
                 self.task_store.save_shard(&current).await?;
             }
+        }
+        Ok(())
+    }
+
+    async fn persist_progress_checkpoint_replay(
+        &self,
+        lease: &ShardLease,
+        shard_id: &crate::types::ShardId,
+        offset: crate::pipeline::OffsetValue,
+        batch_id: Option<String>,
+        current: &crate::task::ShardMeta,
+    ) -> Result<()> {
+        let response = self
+            .raft
+            .as_ref()
+            .ok_or_else(|| DatspoolError::Internal("Raft is required for lease checkpoint".into()))?
+            .propose(Command::UpdateShardProgress {
+                shard_id: shard_id.to_string(),
+                node_id: lease.node_id.to_string(),
+                fencing_token: lease.fencing_token,
+                issued_at_ms: chrono::Utc::now().timestamp_millis(),
+                processed_records: current.records_processed,
+                processed_bytes: current.bytes_processed,
+                offset: serde_json::to_string(&offset)
+                    .map_err(|error| DatspoolError::Serialization(error.to_string()))?,
+                batch_id,
+            })
+            .await?;
+        if !response.success {
+            return Err(DatspoolError::Internal(format!(
+                "Fenced checkpoint replay rejected: {}",
+                response.message
+            )));
         }
         Ok(())
     }

@@ -142,6 +142,8 @@ pub trait Sink: Send + Sync {
         &mut self,
         _batch: RecordBatch,
         _fencing_version: i64,
+        _shard_id: &str,
+        _batch_id: &str,
     ) -> Result<WriteResult> {
         Err(DatspoolError::Driver(DriverError::Unsupported(format!(
             "Sink '{}' does not implement distributed fencing",
