@@ -1791,6 +1791,11 @@ impl<S: KvStore + Clone> MetaStateMachine<S> {
         if !valid_batch_id(&batch_id) || !batch_id.starts_with("0000000000000000-") {
             return Ok(rejected("Invalid legacy cache import ID"));
         }
+        if source_count != records.len() as u64 {
+            return Ok(rejected(
+                "Legacy cache source count does not match its payload",
+            ));
+        }
         // Legacy cache entries created before cursor-aware batches have no next offset.
         // Preserve the shard's current cursor explicitly so the manifest can still
         // advance through Delivered -> Checkpointed -> Acknowledged.
@@ -1915,6 +1920,11 @@ impl<S: KvStore + Clone> MetaStateMachine<S> {
         if !valid_batch_id(&batch_id) {
             return Ok(rejected(
                 "Invalid cache batch ID; expected a 16-hex generation and 6-hex sequence",
+            ));
+        }
+        if source_count != records.len() as u64 {
+            return Ok(rejected(
+                "Cache batch source count does not match its payload",
             ));
         }
         if self
@@ -3190,6 +3200,31 @@ mod tests {
             .await
             .unwrap()
             .success
+        );
+
+        let malformed = sm
+            .apply_command(Command::CacheBatch {
+                shard_id: shard_id.to_string(),
+                node_id: "worker-a".into(),
+                fencing_token: first_fence,
+                issued_at_ms: first_claim_at + 2,
+                batch_id: format!("{first_fence:016x}-000001"),
+                records: records.clone(),
+                next_offset: Some(next_offset.clone()),
+                source_count: 2,
+            })
+            .await
+            .unwrap();
+        assert!(
+            !malformed.success,
+            "manifest must reject a source count that differs from the payload"
+        );
+        assert_eq!(
+            store
+                .cache_batch_count(&shard_id.to_string())
+                .await
+                .unwrap(),
+            1
         );
 
         // Simulate Elasticsearch committing the document while the response is lost.
