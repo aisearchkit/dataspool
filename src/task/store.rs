@@ -983,6 +983,7 @@ mod tests {
         let (store, _temp) = create_test_store().await;
         let mut task = TaskMeta::new("sla-task".into(), "{}".into(), "{}".into());
         task.start(1);
+        task.started_at = Some(chrono::Utc::now() - chrono::Duration::seconds(2));
         task.metadata.insert(
             "sla.deadline_at".into(),
             (chrono::Utc::now() - chrono::Duration::minutes(1)).to_rfc3339(),
