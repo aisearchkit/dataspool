@@ -142,18 +142,32 @@ async fn three_member_raft_leader_failover_fences_stale_worker() {
         "stale fencing generation must be rejected"
     );
 
-    for store in &stores {
-        let persisted = TaskStore::new(store.clone())
-            .get_shard(&shard_id)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(persisted.fencing_token, recovered_lease.fencing_token);
-        assert_eq!(
-            persisted.records_processed, 0,
-            "stale progress must not be applied"
-        );
-    }
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let mut replicated = true;
+            for store in &stores {
+                let persisted = TaskStore::new(store.clone())
+                    .get_shard(&shard_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                if persisted.fencing_token != recovered_lease.fencing_token {
+                    replicated = false;
+                    break;
+                }
+                assert_eq!(
+                    persisted.records_processed, 0,
+                    "stale progress must not be applied"
+                );
+            }
+            if replicated {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("new fencing generation did not replicate to every Raft member");
 
     for (index, node) in nodes.iter().enumerate() {
         if index != leader_index {
