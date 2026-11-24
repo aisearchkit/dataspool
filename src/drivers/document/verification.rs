@@ -108,6 +108,15 @@ async fn verify_index(config: &DocumentConfig, page_size: usize) -> Result<Index
     let close = source.close().await;
     scan?;
     close?;
+    if let OffsetValue::Custom(cursor) = &offset
+        && let Some(raw_count) = cursor["docs_read"].as_u64()
+        && raw_count != count
+    {
+        return Err(crate::error::DriverError::DataError(format!(
+            "Verification for {} read {count} documents with _source but the reader observed {raw_count} matching hits; refusing an incomplete content digest",
+            config.index
+        )).into());
+    }
 
     Ok(IndexVerification {
         index: config.index.clone(),
