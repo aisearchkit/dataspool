@@ -56,7 +56,7 @@ struct TestRaftCluster {
     _directory: TempDir,
     store: RocksDbStore,
     task_store: Arc<TaskStore<RocksDbStore>>,
-    node: RaftNode,
+    node: Option<RaftNode>,
     node_id: u64,
     raft_addr: String,
     raft_token: String,
@@ -97,7 +97,7 @@ impl TestRaftCluster {
             _directory: directory,
             store,
             task_store,
-            node,
+            node: Some(node),
             node_id,
             raft_addr,
             raft_token,
@@ -105,12 +105,18 @@ impl TestRaftCluster {
         }
     }
 
+    fn node(&self) -> &RaftNode {
+        self.node.as_ref().expect("test Raft node is running")
+    }
+
     async fn restart(&mut self) {
         if let Some(server) = self.raft_server.take() {
             server.abort();
             let _ = server.await;
         }
-        self.node.shutdown().await.unwrap();
+        let old_node = self.node.take().expect("test Raft node is running");
+        old_node.shutdown().await.unwrap();
+        drop(old_node);
         let listener = TcpListener::bind(&self.raft_addr).await.unwrap();
         let node = RaftNode::new(
             self.node_id,
@@ -127,13 +133,13 @@ impl TestRaftCluster {
         }));
         node.wait_for_leader(Duration::from_secs(15)).await.unwrap();
         node.ensure_linearizable().await.unwrap();
-        self.node = node;
+        self.node = Some(node);
     }
 
     async fn register_peer(&self, peer_id: &str, endpoint: String) {
         let now = chrono::Utc::now().timestamp_millis();
         let response = self
-            .node
+            .node()
             .propose(Command::UpsertFederatedCluster {
                 cluster: FederatedCluster {
                     cluster_id: peer_id.into(),
@@ -199,18 +205,19 @@ struct DropFederationAck<S> {
     faults: AckFaults,
 }
 
-impl<S, B, Body> Service<tonic::codegen::http::Request<B>> for DropFederationAck<S>
+impl<S, B> Service<tonic::codegen::http::Request<B>> for DropFederationAck<S>
 where
-    S: Service<tonic::codegen::http::Request<B>, Response = tonic::codegen::http::Response<Body>>
-        + Clone
+    S: Service<
+            tonic::codegen::http::Request<B>,
+            Response = tonic::codegen::http::Response<tonic::body::BoxBody>,
+        > + Clone
         + Send
         + 'static,
     S::Future: Send + 'static,
     S::Error: Send + 'static,
-    Body: Send + 'static,
     B: Send + 'static,
 {
-    type Response = tonic::codegen::http::Response<Body>;
+    type Response = tonic::codegen::http::Response<tonic::body::BoxBody>;
     type Error = S::Error;
     type Future =
         Pin<Box<dyn Future<Output = std::result::Result<Self::Response, Self::Error>> + Send>>;
@@ -243,7 +250,13 @@ where
                 false
             };
             if drop_ack {
-                *response.status_mut() = tonic::codegen::http::StatusCode::SERVICE_UNAVAILABLE;
+                // Return a transport failure without the original gRPC trailers;
+                // changing only HTTP status would leave grpc-status=0 in the
+                // response and Tonic could correctly treat that as success.
+                response = tonic::codegen::http::Response::builder()
+                    .status(tonic::codegen::http::StatusCode::SERVICE_UNAVAILABLE)
+                    .body(tonic::body::empty_body())
+                    .expect("fault response is valid");
             }
             Ok(response)
         })
@@ -303,7 +316,7 @@ async fn start_target_grpc(
     let address = listener.local_addr().unwrap();
     let task_service = Arc::new(RwLock::new(TaskServiceImpl {
         task_store: target.task_store.clone(),
-        raft_node: Some(Arc::new(target.node.clone())),
+        raft_node: Some(Arc::new(target.node().clone())),
     }));
     let tls = ServerTlsConfig::new()
         .identity(Identity::from_pem(SERVER_CERT, SERVER_KEY))
@@ -340,7 +353,7 @@ async fn complete_remote_task(target: &TestRaftCluster, task_id: &str) {
     let shard = &shards[0];
     let now = chrono::Utc::now().timestamp_millis();
     let claim = target
-        .node
+        .node()
         .propose(Command::ClaimShard {
             shard_id: shard.shard_id.to_string(),
             node_id: "e2e-worker".into(),
@@ -358,7 +371,7 @@ async fn complete_remote_task(target: &TestRaftCluster, task_id: &str) {
         .unwrap()
         .unwrap();
     let complete = target
-        .node
+        .node()
         .propose(Command::CompleteShard {
             shard_id: shard.shard_id.to_string(),
             node_id: "e2e-worker".into(),
@@ -425,7 +438,7 @@ async fn independent_raft_clusters_recover_from_partition_lost_acks_and_source_c
         timeout_policy: MigrationTimeoutPolicy::Fail,
     };
     let created = source
-        .node
+        .node()
         .propose(Command::CreateFederatedMigration {
             migration: Box::new(migration),
             request_id: "e2e-create-migration".into(),
@@ -441,7 +454,7 @@ async fn independent_raft_clusters_recover_from_partition_lost_acks_and_source_c
     let client_key = cert_dir.join("federation-test-client.key.pem");
     let orchestrator = crate::federation::orchestrator::FederatedOrchestrator::new(
         source.task_store.clone(),
-        Arc::new(source.node.clone()),
+        Arc::new(source.node().clone()),
         "federation-source-e2e",
         ca.clone(),
         client_cert.clone(),
@@ -529,7 +542,7 @@ async fn independent_raft_clusters_recover_from_partition_lost_acks_and_source_c
     source.restart().await;
     let recovered = crate::federation::orchestrator::FederatedOrchestrator::new(
         source.task_store.clone(),
-        Arc::new(source.node.clone()),
+        Arc::new(source.node().clone()),
         "federation-source-e2e",
         ca,
         client_cert,
@@ -573,6 +586,6 @@ async fn independent_raft_clusters_recover_from_partition_lost_acks_and_source_c
     if let Some(server) = target.raft_server.take() {
         server.abort();
     }
-    source.node.shutdown().await.unwrap();
-    target.node.shutdown().await.unwrap();
+    source.node().shutdown().await.unwrap();
+    target.node().shutdown().await.unwrap();
 }
