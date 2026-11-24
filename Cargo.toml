@@ -38,6 +38,7 @@ rocksdb = { version = "0.23", default-features = false, features = ["lz4"] }
 
 # Networking
 tonic = { version = "0.12", features = ["tls"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 prost = "0.13"
 prost-types = "0.13"
 hyper = "1.0"

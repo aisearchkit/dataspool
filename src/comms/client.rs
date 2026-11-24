@@ -74,6 +74,10 @@ impl GrpcClient {
         let key = tokio::fs::read(private_key_file).await.map_err(|e| {
             DatspoolError::Configuration(format!("Unable to read client private key: {e}"))
         })?;
+        // Dataspool links multiple TLS stacks (Tonic, Reqwest, SQLx and AWS SDK),
+        // which may enable both rustls ring and aws-lc providers. Install one
+        // process-wide provider explicitly before Tonic builds its TLS connector.
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let tls = ClientTlsConfig::new()
             .ca_certificate(Certificate::from_pem(ca))
             .identity(Identity::from_pem(cert, key))
