@@ -76,6 +76,11 @@ impl FederatedOrchestrator {
         }
         self.raft.ensure_linearizable().await?;
         for migration in self.store.list_federated_migrations().await? {
+            // A migration is owned by its source cluster. Other clusters may
+            // replicate the plan but must not impersonate its orchestrator.
+            if migration.source_cluster != self.local_cluster_id {
+                continue;
+            }
             if let Err(error) = self.reconcile_migration(migration.clone()).await {
                 self.mark_target_failure(&migration.target_cluster).await?;
                 warn!(migration_id = %migration.migration_id, generation = migration.generation, %error,
