@@ -176,6 +176,18 @@ async fn live_cdc_snapshot_catchup_and_raft_alias_cutover() {
     )
     .await;
 
+    // An empty outbox still needs an explicit numeric mapping: Elasticsearch
+    // cannot sort an unmapped sequence field on the initial watermark query.
+    ensure_ok(
+        http.put(format!("{source_url}/{changes}/_mapping"))
+            .json(&json!({"properties":{"sequence":{"type":"long"}}}))
+            .send()
+            .await
+            .unwrap(),
+        "map CDC sequence as long",
+    )
+    .await;
+
     // Capture the outbox watermark before opening the snapshot view.
     let mut cdc_config = DocumentConfig::local(changes.clone());
     cdc_config.urls = vec![source_url.clone()];
