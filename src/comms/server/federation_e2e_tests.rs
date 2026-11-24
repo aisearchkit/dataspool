@@ -356,11 +356,19 @@ async fn independent_raft_clusters_recover_from_partition_lost_acks_and_source_c
         start_target_grpc(&target, faults.clone()).await;
     let proxy = TcpFaultProxy::start(target_addr).await;
 
+    // The registry stores both the local cluster identity and its federation
+    // peers; migration creation validates both endpoints are registered/healthy.
+    source
+        .register_peer("federation-source-e2e", "https://127.0.0.1:1".into())
+        .await;
     source
         .register_peer("federation-target-e2e", proxy.endpoint.clone())
         .await;
     target
-        .register_peer("federation-source-e2e", "https://localhost:1".into())
+        .register_peer("federation-target-e2e", "https://127.0.0.1:1".into())
+        .await;
+    target
+        .register_peer("federation-source-e2e", "https://127.0.0.1:1".into())
         .await;
 
     let now = chrono::Utc::now().timestamp_millis();
