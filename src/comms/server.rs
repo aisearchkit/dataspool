@@ -1220,3 +1220,6 @@ impl log::log_service_server::LogService for Arc<RwLock<LogServiceImpl>> {
         )))
     }
 }
+
+#[cfg(test)]
+mod federation_e2e_tests;
