@@ -1064,12 +1064,21 @@ mod tests {
             Ok(())
         }
         async fn write_batch(&mut self, batch: RecordBatch) -> Result<WriteResult> {
+            let count = batch.len();
             let mut docs = self.0.lock().unwrap();
             for record in batch.into_records() {
                 docs.entry(record.id.unwrap()).or_insert(record.payload);
             }
-            let count = docs.len();
             Ok(WriteResult::success(count, 16))
+        }
+        async fn write_batch_fenced(
+            &mut self,
+            batch: RecordBatch,
+            _fencing_version: i64,
+            _shard_id: &str,
+            _batch_id: &str,
+        ) -> Result<WriteResult> {
+            self.write_batch(batch).await
         }
         async fn flush(&mut self) -> Result<()> {
             Ok(())
