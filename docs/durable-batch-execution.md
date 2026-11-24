@@ -23,7 +23,7 @@ Prepared -> Delivered -> Checkpointed -> Acknowledged
 - `Checkpointed`: the shard's absolute progress, task aggregate, and manifest transition are committed in one RocksDB write batch, so recovery cannot observe an advanced cursor without the matching manifest state.
 - `Acknowledged`: the replicated payload is removed and the per-shard acknowledgement watermark is advanced in one RocksDB write batch; the manifest is retained as history.
 
-The manifest is stored in the metadata column family, which is included in Raft snapshots. Cache payload and manifest writes are individually replay-safe: if state-machine application is interrupted before the applied-log marker is durable, replay repairs a missing manifest without accepting a conflicting batch payload.
+The manifest is stored in the metadata column family, which is included in Raft snapshots. Initial cache payload and manifest creation use one RocksDB write batch. If a prior interrupted/legacy apply left a manifest without its payload, replay validates the immutable payload digest and restores both atomically; a conflicting payload is rejected.
 
 ## Recovery semantics
 

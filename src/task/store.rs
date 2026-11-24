@@ -681,18 +681,26 @@ impl<S: KvStore> TaskStore<S> {
             .collect())
     }
 
-    /// Persist a shard batch under its deterministic shard-scoped key.
-    pub(crate) async fn save_cache_batch(
+    /// Atomically persist a replicated batch payload and its recovery manifest.
+    pub(crate) async fn save_cache_batch_with_manifest(
         &self,
         shard_id: &str,
         batch_id: &str,
         entry: &crate::pipeline::cache::CacheEntry,
+        manifest: &crate::pipeline::cache::BatchManifest,
     ) -> Result<()> {
-        let key = crate::pipeline::cache::LocalBatchCache::<S>::key_for_shard(shard_id, batch_id);
-        let value = serde_json::to_vec(entry)?;
-        self.store
-            .put_cf(crate::storage::cf::CACHE, &key, &value)
-            .await?;
+        let mut batch = crate::storage::WriteBatch::new();
+        batch.put_cf(
+            crate::storage::cf::CACHE,
+            crate::pipeline::cache::LocalBatchCache::<S>::key_for_shard(shard_id, batch_id),
+            bytes::Bytes::from(serde_json::to_vec(entry)?),
+        );
+        batch.put_cf(
+            cf::META,
+            crate::pipeline::cache::BatchManifest::key(shard_id, batch_id),
+            bytes::Bytes::from(serde_json::to_vec(manifest)?),
+        );
+        self.store.write_batch(batch).await?;
         Ok(())
     }
 

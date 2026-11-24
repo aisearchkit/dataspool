@@ -1821,9 +1821,6 @@ impl<S: KvStore + Clone> MetaStateMachine<S> {
         if !cache_entry_exists && self.task_store.cache_batch_count(&shard_id).await? >= 128 {
             return Ok(rejected("Replicated shard cache is full during bootstrap"));
         }
-        self.task_store
-            .save_cache_batch(&shard_id, &batch_id, &entry)
-            .await?;
         let manifest_key = crate::pipeline::cache::BatchManifest::key(&shard_id, &batch_id);
         if let Some(existing) = self
             .task_store
@@ -1840,6 +1837,11 @@ impl<S: KvStore + Clone> MetaStateMachine<S> {
                 )
             {
                 return Ok(rejected("Legacy batch manifest payload digest mismatch"));
+            }
+            if !cache_entry_exists {
+                self.task_store
+                    .save_cache_batch_with_manifest(&shard_id, &batch_id, &entry, &existing)
+                    .await?;
             }
             return Ok(accepted(
                 "Legacy cache entry already imported",
@@ -1866,12 +1868,7 @@ impl<S: KvStore + Clone> MetaStateMachine<S> {
             updated_at_ms: 0,
         };
         self.task_store
-            .kv_store()
-            .put_cf(
-                crate::storage::cf::META,
-                &crate::pipeline::cache::BatchManifest::key(&shard_id, &batch_id),
-                &serde_json::to_vec(&manifest)?,
-            )
+            .save_cache_batch_with_manifest(&shard_id, &batch_id, &entry, &manifest)
             .await?;
         Ok(accepted(
             "Legacy cache entry imported",
@@ -1962,9 +1959,6 @@ impl<S: KvStore + Clone> MetaStateMachine<S> {
         if !cache_entry_exists && self.task_store.cache_batch_count(&shard_id).await? >= 128 {
             return Ok(rejected("Replicated shard cache is full"));
         }
-        self.task_store
-            .save_cache_batch(&shard_id, &batch_id, &entry)
-            .await?;
         let manifest_key = crate::pipeline::cache::BatchManifest::key(&shard_id, &batch_id);
         if let Some(existing) = self
             .task_store
@@ -1983,6 +1977,11 @@ impl<S: KvStore + Clone> MetaStateMachine<S> {
                 || existing.source_count != entry.source_count
             {
                 return Ok(rejected("Source batch manifest payload mismatch"));
+            }
+            if !cache_entry_exists {
+                self.task_store
+                    .save_cache_batch_with_manifest(&shard_id, &batch_id, &entry, &existing)
+                    .await?;
             }
             return Ok(accepted(
                 "Source batch already replicated",
@@ -2009,12 +2008,7 @@ impl<S: KvStore + Clone> MetaStateMachine<S> {
             updated_at_ms: issued_at_ms,
         };
         self.task_store
-            .kv_store()
-            .put_cf(
-                crate::storage::cf::META,
-                &crate::pipeline::cache::BatchManifest::key(&shard_id, &batch_id),
-                &serde_json::to_vec(&manifest)?,
-            )
+            .save_cache_batch_with_manifest(&shard_id, &batch_id, &entry, &manifest)
             .await?;
         Ok(accepted(
             "Source batch replicated",
