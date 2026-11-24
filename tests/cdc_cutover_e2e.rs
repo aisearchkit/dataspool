@@ -128,11 +128,24 @@ async fn live_cdc_snapshot_catchup_and_raft_alias_cutover() {
         (&target_url, &new_index),
     ] {
         let _ = http.delete(format!("{url}/{index}")).send().await;
-        ensure_ok(
-            http.put(format!("{url}/{index}")).send().await.unwrap(),
-            "create index",
-        )
-        .await;
+        let request = http.put(format!("{url}/{index}"));
+        let response = if index == &changes {
+            request
+                .json(&json!({"mappings":{"properties":{
+                    "sequence":{"type":"long"},
+                    "operation":{"type":"keyword"},
+                    "document_id":{"type":"keyword"},
+                    "target_index":{"type":"keyword"},
+                    "routing":{"type":"keyword"},
+                    "document":{"type":"object"}
+                }}}))
+                .send()
+                .await
+                .unwrap()
+        } else {
+            request.send().await.unwrap()
+        };
+        ensure_ok(response, "create index").await;
     }
 
     let initial = "{\"index\":{\"_id\":\"doc-1\"}}\n{\"value\":1}\n{\"index\":{\"_id\":\"doc-2\"}}\n{\"value\":2}\n{\"index\":{\"_id\":\"doc-3\"}}\n{\"value\":3}\n";
