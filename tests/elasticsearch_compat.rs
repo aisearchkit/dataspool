@@ -7,7 +7,7 @@
 
 use dataspool::drivers::document::{
     CdcConfig, DocumentConfig, DocumentSink, DocumentSource, ElasticsearchCdcSource,
-    ElasticsearchOnlineMigrationSource, switch_alias_after_catchup,
+    ElasticsearchOnlineMigrationSource, switch_alias_after_catchup, verify_source_target,
 };
 use dataspool::pipeline::{BackpressureConfig, OffsetValue, Record, RecordBatch, Sink, Source};
 use reqwest::{Client, StatusCode};
@@ -192,6 +192,23 @@ async fn elasticsearch_pit_search_after_and_bulk_item_errors() {
             .unwrap()
             .error_for_status()
             .unwrap();
+
+        // Independently scan both endpoints with PIT and verify count, ID set,
+        // and canonical content. The same index is used here as a protocol smoke
+        // test; production callers pass independent source/target configurations.
+        let mut verification_config = DocumentConfig::local(index.clone());
+        verification_config.urls = vec![base_url.clone()];
+        let verification = verify_source_target(&verification_config, &verification_config, 1)
+            .await
+            .unwrap();
+        assert!(
+            verification.is_consistent(),
+            "{label}: verification mismatch: {verification:?}"
+        );
+        assert_eq!(
+            verification.source.document_count, 2,
+            "{label}: verified document count"
+        );
 
         let pit_response: Value = http
             .post(format!("{base_url}/{index}/_pit?keep_alive=1m"))

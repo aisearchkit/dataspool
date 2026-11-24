@@ -36,9 +36,11 @@ pub mod local_reader;
 pub mod online;
 mod sink;
 mod source;
+pub mod verification;
 
 pub use cdc::{CdcConfig, ElasticsearchCdcSource, switch_alias_after_catchup};
 pub use config::DocumentConfig;
 pub use online::ElasticsearchOnlineMigrationSource;
 pub use sink::{ClusterNodePressure, DocumentSink, NodeWritePressure};
 pub use source::DocumentSource;
+pub use verification::{IndexVerification, VerificationReport, verify_source_target};
