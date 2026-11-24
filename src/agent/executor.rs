@@ -163,6 +163,30 @@ impl<S: KvStore + Clone + 'static> ShardExecutor<S> {
             .map_err(|e| DatspoolError::Configuration(format!("Invalid sink config: {e}")))?;
         let mut source = create_source(&source_config)?;
         let mut sink = create_sink(&sink_config)?;
+        let compensation = match (
+            task.metadata.get("_dataspool_federation_migration_id"),
+            task.metadata.get("_dataspool_federation_generation"),
+        ) {
+            (Some(migration_id), Some(generation)) => {
+                let generation = generation.parse::<u64>().map_err(|error| {
+                    DatspoolError::Configuration(format!(
+                        "Invalid federated migration generation: {error}"
+                    ))
+                })?;
+                if migration_id.trim().is_empty() {
+                    return Err(DatspoolError::Configuration(
+                        "Invalid federated migration compensation identity".into(),
+                    ));
+                }
+                Some((migration_id.clone(), generation))
+            }
+            (None, None) => None,
+            _ => {
+                return Err(DatspoolError::Configuration(
+                    "Incomplete federated migration compensation metadata".into(),
+                ));
+            }
+        };
 
         let execution = self
             .execute_pipeline_with_lease(
@@ -171,6 +195,7 @@ impl<S: KvStore + Clone + 'static> ShardExecutor<S> {
                 sink.as_mut(),
                 lease.clone(),
                 cancellation.clone(),
+                compensation,
             )
             .await;
         let control_stop = self
@@ -268,7 +293,7 @@ impl<S: KvStore + Clone + 'static> ShardExecutor<S> {
         source: &mut dyn Source,
         sink: &mut dyn Sink,
     ) -> Result<ExecutionStats> {
-        self.execute_pipeline_with_lease(shard, source, sink, None, CancellationToken::new())
+        self.execute_pipeline_with_lease(shard, source, sink, None, CancellationToken::new(), None)
             .await
     }
 
@@ -281,7 +306,7 @@ impl<S: KvStore + Clone + 'static> ShardExecutor<S> {
         sink: &mut dyn Sink,
         cancellation: CancellationToken,
     ) -> Result<ExecutionStats> {
-        self.execute_pipeline_with_lease(shard, source, sink, None, cancellation)
+        self.execute_pipeline_with_lease(shard, source, sink, None, cancellation, None)
             .await
     }
 
@@ -292,6 +317,7 @@ impl<S: KvStore + Clone + 'static> ShardExecutor<S> {
         sink: &mut dyn Sink,
         lease: Option<ShardLease>,
         cancellation: CancellationToken,
+        compensation: Option<(String, u64)>,
     ) -> Result<ExecutionStats> {
         let mut stats = ExecutionStats {
             is_continuous: source.is_continuous(),
@@ -326,6 +352,7 @@ impl<S: KvStore + Clone + 'static> ShardExecutor<S> {
             let executor = self.clone();
             let lease_for_delivery = lease.clone();
             let lease_for_ack = lease.clone();
+            let compensation_for_delivery = compensation.clone();
             let executor_for_ack = self.clone();
             let shard_id = shard.shard_id;
             let shard_id_for_ack = shard.shard_id;
@@ -335,9 +362,13 @@ impl<S: KvStore + Clone + 'static> ShardExecutor<S> {
                     let batch_bytes = batch.records().iter().map(|record| record.to_bytes().map(|bytes| bytes.len() as u64))
                         .collect::<std::result::Result<Vec<_>, _>>()?.into_iter().sum();
                     executor.ensure_optional_lease(lease_for_delivery.as_ref()).await?;
-                    let write = match lease_for_delivery.as_ref() {
-                        Some(lease) => sink_ref.write_batch_fenced(batch, lease.next_sink_version()?).await?,
-                        None => sink_ref.write_batch(batch).await?,
+                    let write = if let Some((migration_id, generation)) = compensation_for_delivery.as_ref() {
+                        sink_ref.write_batch_compensatable(batch, migration_id, *generation).await?
+                    } else {
+                        match lease_for_delivery.as_ref() {
+                            Some(lease) => sink_ref.write_batch_fenced(batch, lease.next_sink_version()?).await?,
+                            None => sink_ref.write_batch(batch).await?,
+                        }
                     };
                     if write.rejected_count > 0 || write.failed_count > write.failed_records.len() {
                         return Err(crate::error::DatspoolError::Internal(format!(
@@ -486,6 +517,7 @@ impl<S: KvStore + Clone + 'static> ShardExecutor<S> {
             let executor = self.clone();
             let lease_for_delivery = lease.clone();
             let lease_for_ack = lease.clone();
+            let compensation_for_delivery = compensation.clone();
             let executor_for_ack = self.clone();
             let shard_id = shard.shard_id;
             let shard_id_for_ack = shard.shard_id;
@@ -503,13 +535,24 @@ impl<S: KvStore + Clone + 'static> ShardExecutor<S> {
                         executor
                             .ensure_optional_lease(lease_for_delivery.as_ref())
                             .await?;
-                        let write = match lease_for_delivery.as_ref() {
-                            Some(lease) => {
-                                sink_ref
-                                    .write_batch_fenced(cached_batch, lease.next_sink_version()?)
-                                    .await?
+                        let write = if let Some((migration_id, generation)) =
+                            compensation_for_delivery.as_ref()
+                        {
+                            sink_ref
+                                .write_batch_compensatable(cached_batch, migration_id, *generation)
+                                .await?
+                        } else {
+                            match lease_for_delivery.as_ref() {
+                                Some(lease) => {
+                                    sink_ref
+                                        .write_batch_fenced(
+                                            cached_batch,
+                                            lease.next_sink_version()?,
+                                        )
+                                        .await?
+                                }
+                                None => sink_ref.write_batch(cached_batch).await?,
                             }
-                            None => sink_ref.write_batch(cached_batch).await?,
                         };
                         if write.rejected_count > 0
                             || write.failed_count > write.failed_records.len()

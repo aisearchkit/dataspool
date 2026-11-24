@@ -259,7 +259,46 @@ impl FederatedOrchestrator {
 
     async fn provision_remote_task(&self, migration: &FederatedMigration) -> crate::Result<()> {
         let mut peer = self.connect_target(&migration.target_cluster).await?;
+        if migration.generation > 0 {
+            let mut previous = migration.clone();
+            previous.generation -= 1;
+            let previous_task_id = deterministic_remote_task_id(&previous);
+            if peer
+                .get_remote_task(&previous_task_id, &self.local_cluster_id)
+                .await?
+                .is_some()
+            {
+                let compensation_request = format!(
+                    "federation:{}:g{}:retry-compensate",
+                    migration.migration_id, previous.generation
+                );
+                let compensation = peer
+                    .compensate_remote_migration(
+                        &migration.migration_id,
+                        previous.generation,
+                        &previous_task_id,
+                        &compensation_request,
+                        &self.local_cluster_id,
+                    )
+                    .await?;
+                if !compensation.accepted {
+                    return Err(crate::DatspoolError::Internal(format!(
+                        "Previous generation compensation rejected: {}",
+                        compensation.message
+                    )));
+                }
+            }
+        }
         let request_id = provision_request_id(migration);
+        let mut tags = migration.tags.clone();
+        tags.insert(
+            "_dataspool_federation_migration_id".into(),
+            migration.migration_id.clone(),
+        );
+        tags.insert(
+            "_dataspool_federation_generation".into(),
+            migration.generation.to_string(),
+        );
         let request = task::CreateTaskRequest {
             name: if migration.task_name.is_empty() {
                 migration.migration_id.clone()
@@ -271,7 +310,7 @@ impl FederatedOrchestrator {
             transform_config: migration.transform_config.clone().unwrap_or_default(),
             sharding_strategy: migration.sharding_strategy.clone().unwrap_or_default(),
             priority: migration.priority.clamp(0, 3),
-            tags: migration.tags.clone(),
+            tags,
             request_id,
         };
         let response = peer

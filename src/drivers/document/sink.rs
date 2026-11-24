@@ -27,6 +27,7 @@ use crate::pipeline::{
 use async_trait::async_trait;
 use reqwest::{Client, ClientBuilder};
 use serde_json::{Value, json};
+use sha2::Digest;
 use tracing::info;
 
 fn is_retryable_bulk_failure(status: u16, error_type: &str) -> bool {
@@ -132,6 +133,20 @@ fn parse_node_pressure(
         0
     };
     (pressure, rejected_delta)
+}
+
+fn validate_compensation_identity(migration_id: &str, _generation: u64) -> Result<()> {
+    if migration_id.is_empty()
+        || migration_id.len() > 96
+        || !migration_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+    {
+        return Err(DriverError::DataError(
+            "Invalid compensation identity: migration_id must be 1-96 ASCII alphanumeric/dash/underscore characters".into()
+        ).into());
+    }
+    Ok(())
 }
 
 impl DocumentSink {
@@ -254,12 +269,39 @@ impl DocumentSink {
                 meta.insert("version".into(), json!(version));
                 meta.insert("version_type".into(), json!("external_gte"));
             }
+            let operation = if record
+                .get_metadata("_dataspool_compensation_migration_id")
+                .is_some()
+            {
+                "create"
+            } else {
+                operation
+            };
             let mut action = serde_json::Map::new();
             action.insert(operation.to_string(), Value::Object(meta));
             body.push_str(&Value::Object(action).to_string());
             body.push('\n');
             if operation != "delete" {
-                body.push_str(&record.payload.to_string());
+                let mut payload = record.payload.clone();
+                if let (Some(migration_id), Some(generation)) = (
+                    record.get_metadata("_dataspool_compensation_migration_id"),
+                    record.get_metadata("_dataspool_compensation_generation"),
+                ) && let Value::Object(ref mut fields) = payload
+                {
+                    let payload_digest = format!(
+                        "{:x}",
+                        sha2::Sha256::digest(record.payload.to_string().as_bytes())
+                    );
+                    fields.insert(
+                        "_dataspool".into(),
+                        json!({
+                            "migration_id": migration_id,
+                            "generation": generation.parse::<u64>().unwrap_or_default(),
+                            "payload_digest": payload_digest,
+                        }),
+                    );
+                }
+                body.push_str(&payload.to_string());
                 body.push('\n');
             }
         }
@@ -359,8 +401,66 @@ impl DocumentSink {
                     .unwrap_or("no reason supplied")
                     .to_string();
                 if status == 409 && error_type == "version_conflict_engine_exception" {
-                    // A newer lease generation already wrote this document.
-                    result.success_count += 1;
+                    if let (Some(migration_id), Some(generation), Some(document_id)) = (
+                        record.get_metadata("_dataspool_compensation_migration_id"),
+                        record.get_metadata("_dataspool_compensation_generation"),
+                        record.id.as_deref(),
+                    ) {
+                        // Create-only replay is successful only when the existing document
+                        // carries this exact migration generation marker. Never hide a
+                        // pre-existing document ID collision as an idempotent success.
+                        let index = record
+                            .get_metadata("_target_index")
+                            .unwrap_or(&target_index);
+                        let existing = client
+                            .post(format!(
+                                "{}/{}/_mget",
+                                url.trim_end_matches("/_bulk"),
+                                index
+                            ))
+                            .json(&json!({"ids":[document_id]}))
+                            .send()
+                            .await;
+                        let matches_operation = match existing {
+                            Ok(response) if response.status().is_success() => {
+                                match response.json::<Value>().await {
+                                    Ok(value) => value["docs"]
+                                        .as_array()
+                                        .and_then(|docs| docs.first())
+                                        .is_some_and(|doc| {
+                                            doc["found"] == true
+                                                && doc["_source"]["_dataspool"]["migration_id"]
+                                                    == migration_id
+                                                && doc["_source"]["_dataspool"]["generation"]
+                                                    == generation.parse::<u64>().unwrap_or_default()
+                                                && doc["_source"]["_dataspool"]["payload_digest"]
+                                                    == format!(
+                                                        "{:x}",
+                                                        sha2::Sha256::digest(
+                                                            record.payload.to_string().as_bytes()
+                                                        )
+                                                    )
+                                        }),
+                                    Err(_) => false,
+                                }
+                            }
+                            _ => false,
+                        };
+                        if matches_operation {
+                            result.success_count += 1;
+                        } else {
+                            // A create conflict outside this exact payload identity is not
+                            // a DLQ-able record: acknowledging it could falsely complete a
+                            // migration while silently skipping or replacing user data.
+                            result.failed_count += 1;
+                            result.add_error(format!(
+                                "Compensatable create conflict for document {document_id}: existing document is not the same migration generation and payload"
+                            ));
+                        }
+                    } else {
+                        // A newer lease generation already wrote this document.
+                        result.success_count += 1;
+                    }
                     continue;
                 }
                 if is_retryable_bulk_failure(status, &error_type) && attempt < MAX_RETRIES {
@@ -393,6 +493,203 @@ impl DocumentSink {
             }
         }
         Ok((result, started.elapsed()))
+    }
+
+    /// Write documents in create-only mode and tag them with a migration identity.
+    /// Existing documents are never overwritten, making this mode safely compensatable.
+    pub async fn write_batch_compensatable(
+        &mut self,
+        batch: RecordBatch,
+        migration_id: &str,
+        generation: u64,
+    ) -> Result<WriteResult> {
+        validate_compensation_identity(migration_id, generation)?;
+        let mut records = batch.into_records();
+        for record in &mut records {
+            if record.id.is_none() {
+                return Err(DriverError::Unsupported(
+                    "Compensatable Elasticsearch writes require stable document IDs".into(),
+                )
+                .into());
+            }
+            if !record.payload.is_object() {
+                return Err(DriverError::DataError(
+                    "Compensatable Elasticsearch writes require object documents".into(),
+                )
+                .into());
+            }
+            if record
+                .get_metadata("_op")
+                .is_some_and(|operation| operation != "index")
+            {
+                return Err(DriverError::Unsupported(
+                    "Compensatable Elasticsearch writes support append-only index operations only"
+                        .into(),
+                )
+                .into());
+            }
+            if record
+                .get_metadata("_target_index")
+                .is_some_and(|index| index != self.target_index)
+            {
+                return Err(DriverError::Unsupported(
+                    "Compensatable Elasticsearch writes must target the configured index".into(),
+                )
+                .into());
+            }
+            if record.payload.get("_dataspool").is_some() {
+                return Err(DriverError::DataError(
+                    "Document payload uses reserved _dataspool field".into(),
+                )
+                .into());
+            }
+            record.add_metadata("_dataspool_compensation_migration_id", migration_id);
+            record.add_metadata("_dataspool_compensation_generation", generation.to_string());
+        }
+        self.write_batch(RecordBatch::from(records)).await
+    }
+
+    /// Replay-safe compensation for documents created by `write_batch_compensatable`.
+    /// The journal is stored in Elasticsearch so a restarted worker can resume a started
+    /// operation. The query is generation-scoped and cannot delete pre-existing documents.
+    pub async fn compensate_migration(&self, migration_id: &str, generation: u64) -> Result<u64> {
+        validate_compensation_identity(migration_id, generation)?;
+        let client = self.client.as_ref().ok_or_else(|| {
+            DriverError::ConnectionFailed("Not connected to document store".into())
+        })?;
+        let operation_id = format!("{}-{}", migration_id, generation);
+        let index_response = client
+            .put(format!("{}/.dataspool-compensation", self.base_url))
+            .send()
+            .await
+            .map_err(|error| {
+                DriverError::DataError(format!(
+                    "Failed to initialize compensation journal: {error}"
+                ))
+            })?;
+        if !index_response.status().is_success() {
+            let status = index_response.status();
+            let body = index_response.json::<Value>().await.unwrap_or(Value::Null);
+            if status.as_u16() != 400
+                || body["error"]["type"] != "resource_already_exists_exception"
+            {
+                return Err(DriverError::DataError(format!(
+                    "Failed to initialize compensation journal: HTTP {status}: {body}"
+                ))
+                .into());
+            }
+        }
+        let journal_url = format!(
+            "{}/.dataspool-compensation/_doc/{}",
+            self.base_url, operation_id
+        );
+        let journal = client.get(&journal_url).send().await.map_err(|error| {
+            DriverError::DataError(format!("Failed to read compensation journal: {error}"))
+        })?;
+        if journal.status().is_success() {
+            let value: Value = journal.json().await.map_err(|error| {
+                DriverError::DataError(format!("Invalid compensation journal: {error}"))
+            })?;
+            if value["_source"]["state"] == "completed" {
+                return Ok(value["_source"]["deleted"].as_u64().unwrap_or(0));
+            }
+        } else if journal.status().as_u16() != 404 {
+            return Err(DriverError::DataError(format!(
+                "Compensation journal lookup failed: HTTP {}",
+                journal.status()
+            ))
+            .into());
+        }
+
+        let started = client
+            .put(&journal_url)
+            .json(&json!({
+                "migration_id": migration_id,
+                "generation": generation,
+                "state": "started",
+                "updated_at_ms": chrono::Utc::now().timestamp_millis(),
+            }))
+            .send()
+            .await
+            .map_err(|error| {
+                DriverError::DataError(format!("Failed to persist compensation intent: {error}"))
+            })?;
+        if !started.status().is_success() {
+            return Err(DriverError::DataError(format!(
+                "Failed to persist compensation intent: HTTP {}",
+                started.status()
+            ))
+            .into());
+        }
+
+        let response = client
+            .post(format!(
+                "{}/{}/_delete_by_query?refresh=true&conflicts=abort",
+                self.base_url, self.target_index
+            ))
+            .json(&json!({"query":{"bool":{"filter":[
+                {"term":{"_dataspool.migration_id.keyword":migration_id}},
+                {"term":{"_dataspool.generation":generation}}
+            ]}}}))
+            .send()
+            .await
+            .map_err(|error| {
+                DriverError::DataError(format!(
+                    "Compensation delete request failed; journal remains started: {error}"
+                ))
+            })?;
+        let status = response.status();
+        let deleted = if status.as_u16() == 404 {
+            // No target index means no migration-owned documents were created.
+            0
+        } else {
+            if !status.is_success() {
+                return Err(DriverError::DataError(format!(
+                    "Compensation delete failed: HTTP {status}; journal remains started"
+                ))
+                .into());
+            }
+            let result: Value = response.json().await.map_err(|error| {
+                DriverError::DataError(format!(
+                    "Invalid compensation response; journal remains started: {error}"
+                ))
+            })?;
+            if result["timed_out"] == true
+                || result["version_conflicts"].as_u64().unwrap_or(0) > 0
+                || result["failures"]
+                    .as_array()
+                    .is_some_and(|failures| !failures.is_empty())
+            {
+                return Err(DriverError::DataError(
+                    "Elasticsearch reported partial compensation failures; operation remains recoverable".into()
+                ).into());
+            }
+            result["deleted"].as_u64().unwrap_or(0)
+        };
+        let completed = client
+            .put(&journal_url)
+            .json(&json!({
+                "migration_id": migration_id,
+                "generation": generation,
+                "state": "completed",
+                "deleted": deleted,
+                "updated_at_ms": chrono::Utc::now().timestamp_millis(),
+            }))
+            .send()
+            .await
+            .map_err(|error| {
+                DriverError::DataError(format!(
+                    "Compensation completed but journal finalization failed: {error}"
+                ))
+            })?;
+        if !completed.status().is_success() {
+            return Err(DriverError::DataError(format!(
+                "Compensation completed but journal finalization failed: HTTP {}",
+                completed.status()
+            ))
+            .into());
+        }
+        Ok(deleted)
     }
 
     /// Parse bulk response and extract errors
@@ -555,6 +852,19 @@ impl Sink for DocumentSink {
         Ok(aggregate)
     }
 
+    async fn write_batch_compensatable(
+        &mut self,
+        batch: RecordBatch,
+        migration_id: &str,
+        generation: u64,
+    ) -> Result<WriteResult> {
+        DocumentSink::write_batch_compensatable(self, batch, migration_id, generation).await
+    }
+
+    async fn compensate_migration(&mut self, migration_id: &str, generation: u64) -> Result<u64> {
+        DocumentSink::compensate_migration(self, migration_id, generation).await
+    }
+
     async fn write_batch_fenced(
         &mut self,
         batch: RecordBatch,
@@ -694,6 +1004,168 @@ mod tests {
         server.await.unwrap();
     }
 
+    #[tokio::test]
+    async fn compensatable_create_conflict_with_unowned_document_is_fatal_not_dlq() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        async fn read_request(stream: &mut tokio::net::TcpStream) {
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 4096];
+            loop {
+                let read = stream.read(&mut chunk).await.unwrap();
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..read]);
+                if let Some(header_end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let headers =
+                        String::from_utf8_lossy(&request[..header_end]).to_ascii_lowercase();
+                    let content_length = headers
+                        .lines()
+                        .find_map(|line| line.strip_prefix("content-length:"))
+                        .and_then(|value| value.trim().parse::<usize>().ok())
+                        .unwrap_or(0);
+                    if request.len() >= header_end + 4 + content_length {
+                        break;
+                    }
+                }
+            }
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for (status, body) in [
+                (
+                    "200 OK",
+                    r#"{"errors":true,"items":[{"create":{"status":409,"error":{"type":"version_conflict_engine_exception","reason":"document already exists"}}}]}"#,
+                ),
+                (
+                    "200 OK",
+                    r#"{"docs":[{"_id":"doc-1","found":true,"_source":{"_dataspool":{"migration_id":"another-migration","generation":0,"payload_digest":"different"}}}]}"#,
+                ),
+            ] {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                read_request(&mut stream).await;
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+                stream.shutdown().await.unwrap();
+            }
+        });
+
+        let mut record = Record::with_id("doc-1", "elasticsearch", json!({"value": 1}));
+        record.add_metadata("_dataspool_compensation_migration_id", "migration-1");
+        record.add_metadata("_dataspool_compensation_generation", "0");
+        let (result, _) = DocumentSink::write_worker(
+            Client::new(),
+            format!("http://{address}/_bulk"),
+            "target".into(),
+            vec![record],
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.failed_count, 1);
+        assert!(result.failed_records.is_empty());
+        assert!(!result.errors.is_empty());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn compensation_journal_makes_replay_after_lost_response_idempotent() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        async fn read_request(stream: &mut tokio::net::TcpStream) -> String {
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 4096];
+            loop {
+                let read = stream.read(&mut chunk).await.unwrap();
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..read]);
+                if let Some(header_end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let headers =
+                        String::from_utf8_lossy(&request[..header_end]).to_ascii_lowercase();
+                    let content_length = headers
+                        .lines()
+                        .find_map(|line| line.strip_prefix("content-length:"))
+                        .and_then(|value| value.trim().parse::<usize>().ok())
+                        .unwrap_or(0);
+                    if request.len() >= header_end + 4 + content_length {
+                        break;
+                    }
+                }
+            }
+            String::from_utf8_lossy(&request).to_string()
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut delete_requests = 0;
+            for request_number in 0..7 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let request = read_request(&mut stream).await;
+                let first_line = request.lines().next().unwrap_or_default();
+                let (status, body) = match request_number {
+                    0 if first_line.starts_with("PUT /.dataspool-compensation ") => {
+                        ("200 OK", "{}")
+                    }
+                    1 if first_line.starts_with("GET /.dataspool-compensation/_doc/") => {
+                        ("404 Not Found", "{}")
+                    }
+                    2 if first_line.starts_with("PUT /.dataspool-compensation/_doc/") => {
+                        ("201 Created", "{}")
+                    }
+                    3 if first_line.starts_with("POST /target/_delete_by_query") => {
+                        delete_requests += 1;
+                        (
+                            "200 OK",
+                            r#"{"deleted":2,"failures":[],"timed_out":false,"version_conflicts":0}"#,
+                        )
+                    }
+                    4 if first_line.starts_with("PUT /.dataspool-compensation/_doc/") => {
+                        ("200 OK", "{}")
+                    }
+                    5 if first_line.starts_with("PUT /.dataspool-compensation ") => (
+                        "400 Bad Request",
+                        r#"{"error":{"type":"resource_already_exists_exception"}}"#,
+                    ),
+                    6 if first_line.starts_with("GET /.dataspool-compensation/_doc/") => {
+                        ("200 OK", r#"{"_source":{"state":"completed","deleted":2}}"#)
+                    }
+                    _ => panic!("unexpected compensation request: {first_line}"),
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+                stream.shutdown().await.unwrap();
+            }
+            delete_requests
+        });
+
+        let mut sink = DocumentSink::new(DocumentConfig::local("target"), "target".into());
+        sink.base_url = format!("http://{address}");
+        sink.client = Some(Client::new());
+        assert_eq!(
+            sink.compensate_migration("migration-1", 1).await.unwrap(),
+            2
+        );
+        // Models a source leader losing the compensation response and replaying it.
+        assert_eq!(
+            sink.compensate_migration("migration-1", 1).await.unwrap(),
+            2
+        );
+        assert_eq!(server.await.unwrap(), 1, "delete-by-query must run once");
+    }
+
     #[test]
     fn parses_cluster_node_queue_capacity_and_rejection_deltas() {
         let stats = json!({"nodes":{
@@ -765,6 +1237,37 @@ mod tests {
         assert!(body.contains(r#""delete""#));
         assert!(body.contains(r#""_index":"events-2026""#));
         assert!(body.contains(r#""routing":"tenant-42""#));
+    }
+
+    #[test]
+    fn compensatable_bulk_writes_use_create_and_embed_generation_marker() {
+        let sink = DocumentSink::new(DocumentConfig::local("target"), "target".into());
+        let mut record = Record::with_id("doc-1", "test", json!({"value": 1}));
+        record.add_metadata("_dataspool_compensation_migration_id", "migration-a");
+        record.add_metadata("_dataspool_compensation_generation", "7");
+        let body = sink.build_bulk_body(&RecordBatch::from(vec![record]));
+        let mut lines = body.lines();
+        let action: Value = serde_json::from_str(lines.next().unwrap()).unwrap();
+        let source: Value = serde_json::from_str(lines.next().unwrap()).unwrap();
+        assert!(action.get("create").is_some());
+        assert_eq!(source["_dataspool"]["migration_id"], "migration-a");
+        assert_eq!(source["_dataspool"]["generation"], 7);
+        assert_eq!(
+            source["_dataspool"]["payload_digest"],
+            format!(
+                "{:x}",
+                sha2::Sha256::digest(json!({"value": 1}).to_string().as_bytes())
+            )
+        );
+        assert_eq!(source["value"], 1);
+    }
+
+    #[test]
+    fn compensation_identity_rejects_unsafe_ids_and_zero_generation() {
+        assert!(validate_compensation_identity("migration-1", 0).is_ok());
+        assert!(validate_compensation_identity("migration-1", 1).is_ok());
+        assert!(validate_compensation_identity("../index", 1).is_err());
+        assert!(validate_compensation_identity("", 1).is_err());
     }
 
     #[test]

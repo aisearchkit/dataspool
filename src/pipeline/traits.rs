@@ -114,6 +114,28 @@ pub trait Sink: Send + Sync {
     /// Returns statistics about the write operation.
     async fn write_batch(&mut self, batch: RecordBatch) -> Result<WriteResult>;
 
+    /// Write append-only documents under a migration identity so the sink can
+    /// later remove only documents created by this migration generation.
+    async fn write_batch_compensatable(
+        &mut self,
+        _batch: RecordBatch,
+        _migration_id: &str,
+        _generation: u64,
+    ) -> Result<WriteResult> {
+        Err(DatspoolError::Driver(DriverError::Unsupported(format!(
+            "Sink '{}' does not implement migration compensation",
+            self.sink_type()
+        ))))
+    }
+
+    /// Replay-safe sink-level compensation. Unsupported sinks must fail closed.
+    async fn compensate_migration(&mut self, _migration_id: &str, _generation: u64) -> Result<u64> {
+        Err(DatspoolError::Driver(DriverError::Unsupported(format!(
+            "Sink '{}' does not implement migration compensation",
+            self.sink_type()
+        ))))
+    }
+
     /// Write a batch under a distributed shard fencing generation. Sinks must
     /// reject writes from older generations; unsupported sinks fail closed.
     async fn write_batch_fenced(

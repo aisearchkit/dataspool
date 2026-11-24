@@ -68,7 +68,7 @@ pub struct FederatedMigration {
     #[serde(default)]
     pub required_capabilities: BTreeSet<String>,
     pub state: MigrationState,
-    /// Incremented on every explicit retry; used to fence stale stage reports.
+    /// Incremented for failed-attempt retries; pause/resume keeps the same attempt generation.
     pub generation: u64,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
@@ -168,16 +168,12 @@ impl FederatedMigration {
                 self.state, next
             ));
         }
-        if matches!(self.state, MigrationState::Failed | MigrationState::Paused)
-            && next == MigrationState::Preparing
-        {
+        if self.state == MigrationState::Failed && next == MigrationState::Preparing {
             self.generation = self.generation.saturating_add(1);
-            if self.state == MigrationState::Failed {
-                self.remote_task_id = None;
-                self.remote_task_state = None;
-                self.remote_checkpoint = None;
-                self.last_reconciled_at_ms = None;
-            }
+            self.remote_task_id = None;
+            self.remote_task_state = None;
+            self.remote_checkpoint = None;
+            self.last_reconciled_at_ms = None;
         }
         self.state = next;
         self.updated_at_ms = at_ms;
@@ -261,7 +257,7 @@ mod tests {
     }
 
     #[test]
-    fn paused_migration_retry_increments_generation_and_preserves_remote_progress() {
+    fn paused_migration_resume_preserves_generation_and_remote_progress() {
         let mut migration = FederatedMigration {
             migration_id: "m2".into(),
             source_cluster: "a".into(),
@@ -295,10 +291,49 @@ mod tests {
                 .transition(MigrationState::Preparing, 0, 3, None)
                 .is_ok()
         );
-        assert_eq!(migration.generation, 1);
+        assert_eq!(migration.generation, 0);
         assert_eq!(migration.remote_task_id.as_deref(), Some("remote-0"));
         assert_eq!(migration.remote_task_state.as_deref(), Some("paused"));
         assert_eq!(migration.remote_checkpoint.as_ref().unwrap()["offset"], 10);
+    }
+
+    #[test]
+    fn failed_migration_retry_advances_generation_and_discards_old_remote_progress() {
+        let mut migration = FederatedMigration {
+            migration_id: "m-failed".into(),
+            source_cluster: "a".into(),
+            target_cluster: "b".into(),
+            task_id: "t-failed".into(),
+            required_capabilities: BTreeSet::new(),
+            state: MigrationState::Failed,
+            generation: 4,
+            created_at_ms: 1,
+            updated_at_ms: 2,
+            last_error: Some("injected failure".into()),
+            task_name: "failed-retry".into(),
+            source_config: "{}".into(),
+            sink_config: "{}".into(),
+            transform_config: None,
+            sharding_strategy: None,
+            priority: 1,
+            tags: HashMap::new(),
+            remote_task_id: Some("remote-old".into()),
+            remote_task_state: Some("failed".into()),
+            remote_checkpoint: Some(serde_json::json!({"offset": 10})),
+            last_reconciled_at_ms: Some(2),
+            deadline_at_ms: None,
+            execution_budget_ms: None,
+            retry_budget: None,
+            timeout_policy: Default::default(),
+        };
+        migration
+            .transition(MigrationState::Preparing, 4, 3, None)
+            .unwrap();
+        assert_eq!(migration.generation, 5);
+        assert!(migration.remote_task_id.is_none());
+        assert!(migration.remote_task_state.is_none());
+        assert!(migration.remote_checkpoint.is_none());
+        assert!(migration.last_reconciled_at_ms.is_none());
     }
 
     #[test]

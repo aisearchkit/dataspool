@@ -515,6 +515,11 @@ impl<S: KvStore + Clone> MetaStateMachine<S> {
         if request_id.trim().is_empty()
             || request_id.len() > 128
             || migration.migration_id.trim().is_empty()
+            || migration.migration_id.len() > 96
+            || !migration
+                .migration_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
             || migration.task_id.trim().is_empty()
         {
             return Ok(rejected(
@@ -952,11 +957,7 @@ impl<S: KvStore + Clone> MetaStateMachine<S> {
             ));
         }
         if next_state == crate::federation::MigrationState::Preparing
-            && matches!(
-                migration.state,
-                crate::federation::MigrationState::Failed
-                    | crate::federation::MigrationState::Paused
-            )
+            && migration.state == crate::federation::MigrationState::Failed
             && migration
                 .retry_budget
                 .is_some_and(|budget| migration.generation >= u64::from(budget))
@@ -2576,18 +2577,17 @@ mod tests {
         };
         assert!(sm.apply_command(prepared.clone()).await.unwrap().success);
         assert!(sm.apply_command(prepared).await.unwrap().success);
-        assert!(
-            sm.apply_command(Command::RecordFederatedRemoteOperation {
-                operation: Box::new(operation(
-                    crate::federation::FederatedRemoteOperationState::Committed
-                )),
-                request_id: "commit-remote-op".into(),
-                actor: "peer".into(),
-            })
-            .await
-            .unwrap()
-            .success
-        );
+        // Simulate the target committing durably while the source leader loses
+        // the response. A replacement source leader replays the exact request.
+        let commit = Command::RecordFederatedRemoteOperation {
+            operation: Box::new(operation(
+                crate::federation::FederatedRemoteOperationState::Committed,
+            )),
+            request_id: "commit-remote-op".into(),
+            actor: "peer".into(),
+        };
+        assert!(sm.apply_command(commit.clone()).await.unwrap().success);
+        assert!(sm.apply_command(commit).await.unwrap().success);
         let rollback = sm
             .apply_command(Command::RecordFederatedRemoteOperation {
                 operation: Box::new(operation(

@@ -944,8 +944,102 @@ mod cluster_tests {
             .expect("post-failover task did not replicate to surviving members");
         }
 
+        // Restart the first failed member from its durable RocksDB state, then
+        // crash the replacement leader. The remaining quorum must elect a second
+        // replacement without losing the committed migration/task state.
+        let restarted = RaftNode::new(
+            ids[leader_index],
+            directories[leader_index].path().join("raft"),
+            TaskStore::new(stores[leader_index].clone()),
+            config.clone(),
+            token.clone(),
+        )
+        .await
+        .unwrap();
+        let listener = tokio::net::TcpListener::bind(&addresses[leader_index])
+            .await
+            .unwrap();
+        let router = super::super::network::router(restarted.handle(), token.clone());
+        server_tasks[leader_index] = tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        nodes[leader_index] = restarted;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if TaskStore::new(stores[leader_index].clone())
+                    .get_task(&after_failover_id)
+                    .await
+                    .unwrap()
+                    .is_some()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("restarted member did not recover committed task state");
+
+        server_tasks[new_leader_index].abort();
+        nodes[new_leader_index].shutdown().await.unwrap();
+        let second_leader_index = tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                for (index, node) in nodes.iter().enumerate() {
+                    if index != new_leader_index && node.is_leader().await {
+                        return index;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("cluster did not elect a second replacement leader");
+        assert_ne!(second_leader_index, new_leader_index);
+
+        let after_second_failover = TaskMeta::new(
+            "second-leader-failover-write".into(),
+            "{}".into(),
+            "{}".into(),
+        );
+        let second_failover_id = after_second_failover.task_id;
+        let second_failover_shard = ShardMeta::new(second_failover_id, 0, "{}".into());
+        let second_failover_created = nodes[second_leader_index]
+            .propose(Command::CreateTask {
+                request_id: format!("create:{}", after_second_failover.task_id),
+                actor: "system".into(),
+                task: Box::new(after_second_failover),
+                shards: vec![second_failover_shard],
+            })
+            .await
+            .unwrap();
+        assert!(
+            second_failover_created.success,
+            "{}",
+            second_failover_created.message
+        );
+        for (index, store) in stores.iter().enumerate() {
+            if index == new_leader_index {
+                continue;
+            }
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    if TaskStore::new(store.clone())
+                        .get_task(&second_failover_id)
+                        .await
+                        .unwrap()
+                        .is_some()
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            })
+            .await
+            .expect("second post-failover task did not replicate to surviving members");
+        }
+
         for (index, node) in nodes.iter().enumerate() {
-            if index != leader_index {
+            if index != new_leader_index {
                 node.shutdown().await.unwrap();
             }
         }

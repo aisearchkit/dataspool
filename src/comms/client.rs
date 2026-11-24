@@ -297,3 +297,56 @@ fn federated_operation_request(
         .insert("x-dataspool-peer-cluster", peer);
     Ok(request)
 }
+
+#[cfg(test)]
+mod federation_transport_tests {
+    use super::GrpcClient;
+    use std::time::{Duration, Instant};
+
+    #[tokio::test]
+    async fn unreachable_federated_peer_fails_with_bounded_connect_timeout() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener); // Inject a peer-side network partition/refused connection.
+
+        let directory = tempfile::tempdir().unwrap();
+        let ca = directory.path().join("ca.pem");
+        let certificate = directory.path().join("client.pem");
+        let private_key = directory.path().join("client.key");
+        tokio::fs::write(
+            &ca,
+            include_bytes!("../../tests/fixtures/federation-test-ca.pem"),
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(
+            &certificate,
+            include_bytes!("../../tests/fixtures/federation-test-client.pem"),
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(
+            &private_key,
+            include_bytes!("../../tests/fixtures/federation-test-client.key.pem"),
+        )
+        .await
+        .unwrap();
+
+        let started = Instant::now();
+        let result = GrpcClient::connect_mtls(
+            &format!("https://localhost:{port}"),
+            &ca,
+            &certificate,
+            &private_key,
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "unreachable peer must not be treated as connected"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(6),
+            "peer connect exceeded the configured five-second timeout"
+        );
+    }
+}

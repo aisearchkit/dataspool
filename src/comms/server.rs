@@ -665,6 +665,14 @@ impl task::task_service_server::TaskService for Arc<RwLock<TaskServiceImpl>> {
             .map_err(|e| Status::internal(e.to_string()))?
             .ok_or_else(|| Status::not_found("Target task not found"))?;
         task_meta.refresh_from_shards(&shards, chrono::Utc::now());
+        if task_meta.metadata.get("_dataspool_federation_migration_id") != Some(&req.migration_id)
+            || task_meta.metadata.get("_dataspool_federation_generation")
+                != Some(&req.generation.to_string())
+        {
+            return Err(Status::failed_precondition(
+                "Target task is not tagged for this migration generation",
+            ));
+        }
         if !matches!(task_meta.state, TaskState::Completed { .. })
             || shards.is_empty()
             || shards
@@ -813,19 +821,25 @@ impl task::task_service_server::TaskService for Arc<RwLock<TaskServiceImpl>> {
                 crate::federation::FederatedRemoteOperationState::Prepared => {}
             }
         }
-        let remote_task = store
-            .get_task(&task_id)
+        let (remote_task, mut shards) = store
+            .get_task_with_aggregate_and_shards(&task_id)
             .await
             .map_err(|e| Status::internal(e.to_string()))?
             .ok_or_else(|| Status::not_found("Target task not found"))?;
-        if matches!(remote_task.state, TaskState::Completed { .. }) {
+        if remote_task
+            .metadata
+            .get("_dataspool_federation_migration_id")
+            != Some(&req.migration_id)
+            || remote_task.metadata.get("_dataspool_federation_generation")
+                != Some(&req.generation.to_string())
+        {
             return Err(Status::failed_precondition(
-                "Completed target writes cannot be rolled back by the generic sink protocol",
+                "Target task is not tagged for this migration generation",
             ));
         }
         if !matches!(
             remote_task.state,
-            TaskState::Cancelled { .. } | TaskState::Failed { .. }
+            TaskState::Completed { .. } | TaskState::Cancelled { .. } | TaskState::Failed { .. }
         ) {
             let result = raft
                 .propose(crate::raft::Command::ControlTask {
@@ -839,7 +853,49 @@ impl task::task_service_server::TaskService for Arc<RwLock<TaskServiceImpl>> {
             if !result.success {
                 return Err(Status::failed_precondition(result.message));
             }
+            let (_, refreshed) = store
+                .get_task_with_aggregate_and_shards(&task_id)
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?
+                .ok_or_else(|| Status::not_found("Target task disappeared during compensation"))?;
+            shards = refreshed;
         }
+        if shards
+            .iter()
+            .any(|shard| matches!(shard.state, ShardState::Running { .. }))
+        {
+            return Err(Status::unavailable(
+                "Target workers are still draining; compensation will be retried",
+            ));
+        }
+
+        let sink_config: crate::drivers::SinkConfig =
+            serde_json::from_str(&remote_task.sink_config).map_err(|error| {
+                Status::failed_precondition(format!("Invalid target sink config: {error}"))
+            })?;
+        let mut sink = crate::drivers::factory::create_sink(&sink_config).map_err(|error| {
+            Status::failed_precondition(format!("Target sink cannot be compensated: {error}"))
+        })?;
+        sink.connect().await.map_err(|error| {
+            Status::unavailable(format!(
+                "Unable to connect target sink for compensation: {error}"
+            ))
+        })?;
+        let compensated = sink
+            .compensate_migration(&req.migration_id, req.generation)
+            .await
+            .map_err(|error| {
+                Status::failed_precondition(format!(
+                    "Sink compensation failed and remains recoverable: {error}"
+                ))
+            });
+        let close_result = sink.close().await;
+        let deleted = compensated?;
+        close_result.map_err(|error| {
+            Status::unavailable(format!(
+                "Compensation completed but sink close failed: {error}"
+            ))
+        })?;
         let operation = crate::federation::FederatedRemoteOperation {
             migration_id: req.migration_id,
             source_cluster: peer,
@@ -864,7 +920,10 @@ impl task::task_service_server::TaskService for Arc<RwLock<TaskServiceImpl>> {
             accepted: true,
             state: "compensated".into(),
             checkpoint_digest: String::new(),
-            message: result.message,
+            message: format!(
+                "{}; removed {} migration-owned documents",
+                result.message, deleted
+            ),
         }))
     }
 }
