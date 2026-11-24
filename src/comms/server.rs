@@ -5,9 +5,13 @@
 
 //! gRPC server implementation
 
+use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tonic::{Request, Response, Status, transport::Server};
+use tonic::{
+    Request, Response, Status,
+    transport::{Certificate, Identity, Server, ServerTlsConfig},
+};
 use tracing::{info, warn};
 
 use crate::raft::RaftNode;
@@ -24,6 +28,7 @@ pub struct GrpcServer {
     cluster_service: Arc<RwLock<ClusterServiceImpl>>,
     task_service: Arc<RwLock<TaskServiceImpl>>,
     log_service: Arc<RwLock<LogServiceImpl>>,
+    tls: Option<ServerTlsConfig>,
 }
 
 impl GrpcServer {
@@ -40,7 +45,32 @@ impl GrpcServer {
                 raft_node,
             })),
             log_service: Arc::new(RwLock::new(LogServiceImpl)),
+            tls: None,
         })
+    }
+
+    /// Require client certificates signed by the configured federation CA.
+    pub async fn with_mtls_files(
+        mut self,
+        certificate_file: &std::path::Path,
+        private_key_file: &std::path::Path,
+        client_ca_file: &std::path::Path,
+    ) -> Result<Self> {
+        let certificate = tokio::fs::read(certificate_file).await.map_err(|e| {
+            DatspoolError::Configuration(format!("Unable to read gRPC certificate: {e}"))
+        })?;
+        let private_key = tokio::fs::read(private_key_file).await.map_err(|e| {
+            DatspoolError::Configuration(format!("Unable to read gRPC private key: {e}"))
+        })?;
+        let client_ca = tokio::fs::read(client_ca_file).await.map_err(|e| {
+            DatspoolError::Configuration(format!("Unable to read gRPC client CA: {e}"))
+        })?;
+        self.tls = Some(
+            ServerTlsConfig::new()
+                .identity(Identity::from_pem(certificate, private_key))
+                .client_ca_root(Certificate::from_pem(client_ca)),
+        );
+        Ok(self)
     }
 
     /// Start the gRPC server until the process receives its shutdown signal.
@@ -60,7 +90,13 @@ impl GrpcServer {
 
         info!("Starting gRPC server on {}", addr);
 
-        Server::builder()
+        let mut builder = Server::builder();
+        if let Some(tls) = self.tls {
+            builder = builder.tls_config(tls).map_err(|e| {
+                DatspoolError::Configuration(format!("Invalid gRPC mTLS configuration: {e}"))
+            })?;
+        }
+        builder
             .add_service(cluster::cluster_service_server::ClusterServiceServer::new(
                 self.cluster_service.clone(),
             ))
@@ -90,6 +126,68 @@ fn request_actor<T>(request: &Request<T>) -> String {
 
 fn raft_status(error: impl std::fmt::Display) -> Status {
     Status::unavailable(format!("Raft command could not be committed: {error}"))
+}
+
+async fn verify_peer_identity<T>(
+    service: &Arc<RwLock<TaskServiceImpl>>,
+    request: &Request<T>,
+) -> std::result::Result<Option<String>, Status> {
+    let Some(peer) = request.metadata().get("x-dataspool-peer-cluster") else {
+        if request.peer_certs().is_some() {
+            return Err(Status::unauthenticated(
+                "mTLS task RPCs must identify a registered federation peer",
+            ));
+        }
+        return Ok(None);
+    };
+    let peer_cluster = peer
+        .to_str()
+        .map_err(|_| Status::unauthenticated("Invalid peer cluster identity"))?;
+    if peer_cluster.trim().is_empty() || peer_cluster.len() > 128 {
+        return Err(Status::unauthenticated("Invalid peer cluster identity"));
+    }
+    let certs = request.peer_certs().ok_or_else(|| {
+        Status::unauthenticated("Federated RPC requires an mTLS client certificate")
+    })?;
+    let cert = certs
+        .first()
+        .ok_or_else(|| Status::unauthenticated("mTLS client certificate is missing"))?;
+    let fingerprint = format!("{:x}", Sha256::digest(cert.as_ref()));
+    let (store, raft) = {
+        let service = service.read().await;
+        (service.task_store.clone(), service.raft_node.clone())
+    };
+    let raft = raft.ok_or_else(|| Status::unavailable("Federated RPC requires Raft"))?;
+    raft.ensure_linearizable().await.map_err(raft_status)?;
+    let registered = store
+        .get_federated_cluster(peer_cluster)
+        .await
+        .map_err(|error| Status::internal(error.to_string()))?
+        .ok_or_else(|| Status::unauthenticated("Peer cluster is not registered"))?;
+    if !registered
+        .identity_fingerprint
+        .eq_ignore_ascii_case(&fingerprint)
+    {
+        return Err(Status::unauthenticated(
+            "Peer certificate fingerprint does not match the pinned cluster identity",
+        ));
+    }
+    let now = chrono::Utc::now().timestamp_millis();
+    if registered.status != crate::federation::FederatedClusterStatus::Healthy
+        || now.saturating_sub(registered.last_seen_at_ms) >= 15_000
+    {
+        raft.propose(crate::raft::Command::HeartbeatFederatedCluster {
+            cluster_id: peer_cluster.to_string(),
+            identity_fingerprint: fingerprint,
+            status: crate::federation::FederatedClusterStatus::Healthy,
+            last_seen_at_ms: now,
+            request_id: format!("peer-heartbeat:{peer_cluster}:{}", now / 15_000),
+            actor: "authenticated-peer".into(),
+        })
+        .await
+        .map_err(raft_status)?;
+    }
+    Ok(Some(peer_cluster.to_string()))
 }
 
 // ==================== ClusterService Implementation ====================
@@ -193,7 +291,10 @@ impl task::task_service_server::TaskService for Arc<RwLock<TaskServiceImpl>> {
         &self,
         request: Request<task::CreateTaskRequest>,
     ) -> std::result::Result<Response<task::CreateTaskResponse>, Status> {
-        let actor = request_actor(&request);
+        let actor = verify_peer_identity(self, &request)
+            .await?
+            .map(|peer| format!("federation:{peer}"))
+            .unwrap_or_else(|| request_actor(&request));
         let req = request.into_inner();
         if req.name.trim().is_empty()
             || req.request_id.trim().is_empty()
@@ -258,28 +359,40 @@ impl task::task_service_server::TaskService for Arc<RwLock<TaskServiceImpl>> {
         &self,
         request: Request<task::TaskControlRequest>,
     ) -> std::result::Result<Response<task::TaskControlResponse>, Status> {
-        let actor = request_actor(&request);
+        let actor = verify_peer_identity(self, &request)
+            .await?
+            .map(|peer| format!("federation:{peer}"))
+            .unwrap_or_else(|| request_actor(&request));
         control_task(self, request.into_inner(), "pause", actor).await
     }
     async fn resume_task(
         &self,
         request: Request<task::TaskControlRequest>,
     ) -> std::result::Result<Response<task::TaskControlResponse>, Status> {
-        let actor = request_actor(&request);
+        let actor = verify_peer_identity(self, &request)
+            .await?
+            .map(|peer| format!("federation:{peer}"))
+            .unwrap_or_else(|| request_actor(&request));
         control_task(self, request.into_inner(), "resume", actor).await
     }
     async fn cancel_task(
         &self,
         request: Request<task::TaskControlRequest>,
     ) -> std::result::Result<Response<task::TaskControlResponse>, Status> {
-        let actor = request_actor(&request);
+        let actor = verify_peer_identity(self, &request)
+            .await?
+            .map(|peer| format!("federation:{peer}"))
+            .unwrap_or_else(|| request_actor(&request));
         control_task(self, request.into_inner(), "cancel", actor).await
     }
     async fn retry_task(
         &self,
         request: Request<task::TaskControlRequest>,
     ) -> std::result::Result<Response<task::TaskControlResponse>, Status> {
-        let actor = request_actor(&request);
+        let actor = verify_peer_identity(self, &request)
+            .await?
+            .map(|peer| format!("federation:{peer}"))
+            .unwrap_or_else(|| request_actor(&request));
         let req = request.into_inner();
         if req.request_id.trim().is_empty() {
             return Err(Status::invalid_argument("request_id is required"));
@@ -343,6 +456,7 @@ impl task::task_service_server::TaskService for Arc<RwLock<TaskServiceImpl>> {
         &self,
         request: Request<task::GetTaskRequest>,
     ) -> std::result::Result<Response<task::GetTaskResponse>, Status> {
+        let _peer = verify_peer_identity(self, &request).await?;
         let req = request.into_inner();
         let task_id = req.task_id.parse().map_err(|error| {
             Status::invalid_argument(format!("Invalid task_id '{}': {error}", req.task_id))
@@ -517,6 +631,240 @@ impl task::task_service_server::TaskService for Arc<RwLock<TaskServiceImpl>> {
 
         Ok(Response::new(task::FailShardResponse {
             should_retry: false,
+        }))
+    }
+
+    async fn prepare_federated_commit(
+        &self,
+        request: Request<task::FederatedOperationRequest>,
+    ) -> std::result::Result<Response<task::FederatedOperationResponse>, Status> {
+        let peer = verify_peer_identity(self, &request).await?.ok_or_else(|| {
+            Status::unauthenticated("Federated commit requires an authenticated peer")
+        })?;
+        let req = request.into_inner();
+        if req.migration_id.trim().is_empty()
+            || req.request_id.trim().is_empty()
+            || req.request_id.len() > 128
+        {
+            return Err(Status::invalid_argument(
+                "migration_id and request_id are required",
+            ));
+        }
+        let task_id: crate::types::TaskId = req
+            .task_id
+            .parse()
+            .map_err(|e| Status::invalid_argument(format!("Invalid task_id: {e}")))?;
+        let (store, raft) = {
+            let service = self.read().await;
+            (service.task_store.clone(), service.raft_node.clone())
+        };
+        let raft = raft.ok_or_else(|| Status::unavailable("Federated commit requires Raft"))?;
+        let (mut task_meta, shards) = store
+            .get_task_with_aggregate_and_shards(&task_id)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?
+            .ok_or_else(|| Status::not_found("Target task not found"))?;
+        task_meta.refresh_from_shards(&shards, chrono::Utc::now());
+        if !matches!(task_meta.state, TaskState::Completed { .. })
+            || shards.is_empty()
+            || shards
+                .iter()
+                .any(|shard| !matches!(shard.state, ShardState::Completed { .. }))
+        {
+            return Err(Status::failed_precondition(
+                "Target task must have every shard completed before commit preparation",
+            ));
+        }
+        let checkpoint_bytes = serde_json::to_vec(&task_meta.aggregate.checkpoints)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        let checkpoint_digest = format!("{:x}", Sha256::digest(checkpoint_bytes));
+        let operation = crate::federation::FederatedRemoteOperation {
+            migration_id: req.migration_id,
+            source_cluster: peer,
+            generation: req.generation,
+            task_id: task_id.to_string(),
+            state: crate::federation::FederatedRemoteOperationState::Prepared,
+            checkpoint_digest: Some(checkpoint_digest.clone()),
+            updated_at_ms: chrono::Utc::now().timestamp_millis(),
+        };
+        let result = raft
+            .propose(crate::raft::Command::RecordFederatedRemoteOperation {
+                operation: Box::new(operation),
+                request_id: req.request_id,
+                actor: "federation-peer".into(),
+            })
+            .await
+            .map_err(raft_status)?;
+        if !result.success {
+            return Err(Status::failed_precondition(result.message));
+        }
+        Ok(Response::new(task::FederatedOperationResponse {
+            accepted: true,
+            state: "prepared".into(),
+            checkpoint_digest,
+            message: result.message,
+        }))
+    }
+
+    async fn commit_federated_migration(
+        &self,
+        request: Request<task::FederatedOperationRequest>,
+    ) -> std::result::Result<Response<task::FederatedOperationResponse>, Status> {
+        let peer = verify_peer_identity(self, &request).await?.ok_or_else(|| {
+            Status::unauthenticated("Federated commit requires an authenticated peer")
+        })?;
+        let req = request.into_inner();
+        if req.migration_id.trim().is_empty()
+            || req.task_id.trim().is_empty()
+            || req.request_id.trim().is_empty()
+            || req.request_id.len() > 128
+        {
+            return Err(Status::invalid_argument(
+                "migration_id, task_id and request_id are required",
+            ));
+        }
+        let (store, raft) = {
+            let service = self.read().await;
+            (service.task_store.clone(), service.raft_node.clone())
+        };
+        let raft = raft.ok_or_else(|| Status::unavailable("Federated commit requires Raft"))?;
+        let mut operation = store
+            .get_federated_remote_operation(&req.migration_id, req.generation)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?
+            .ok_or_else(|| Status::failed_precondition("Remote migration was not prepared"))?;
+        if operation.source_cluster != peer || operation.task_id != req.task_id {
+            return Err(Status::unauthenticated(
+                "Federated operation identity does not match the authenticated peer",
+            ));
+        }
+        operation.state = crate::federation::FederatedRemoteOperationState::Committed;
+        operation.updated_at_ms = chrono::Utc::now().timestamp_millis();
+        let result = raft
+            .propose(crate::raft::Command::RecordFederatedRemoteOperation {
+                operation: Box::new(operation.clone()),
+                request_id: req.request_id,
+                actor: "federation-peer".into(),
+            })
+            .await
+            .map_err(raft_status)?;
+        if !result.success {
+            return Err(Status::failed_precondition(result.message));
+        }
+        Ok(Response::new(task::FederatedOperationResponse {
+            accepted: true,
+            state: "committed".into(),
+            checkpoint_digest: operation.checkpoint_digest.unwrap_or_default(),
+            message: result.message,
+        }))
+    }
+
+    async fn compensate_federated_migration(
+        &self,
+        request: Request<task::FederatedOperationRequest>,
+    ) -> std::result::Result<Response<task::FederatedOperationResponse>, Status> {
+        let peer = verify_peer_identity(self, &request).await?.ok_or_else(|| {
+            Status::unauthenticated("Federated compensation requires an authenticated peer")
+        })?;
+        let req = request.into_inner();
+        if req.migration_id.trim().is_empty()
+            || req.task_id.trim().is_empty()
+            || req.request_id.trim().is_empty()
+            || req.request_id.len() > 128
+        {
+            return Err(Status::invalid_argument(
+                "migration_id, task_id and request_id are required",
+            ));
+        }
+        let (store, raft) = {
+            let service = self.read().await;
+            (service.task_store.clone(), service.raft_node.clone())
+        };
+        let raft =
+            raft.ok_or_else(|| Status::unavailable("Federated compensation requires Raft"))?;
+        let task_id: crate::types::TaskId = req
+            .task_id
+            .parse()
+            .map_err(|e| Status::invalid_argument(format!("Invalid task_id: {e}")))?;
+        let existing = store
+            .get_federated_remote_operation(&req.migration_id, req.generation)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+        if let Some(operation) = existing.as_ref() {
+            if operation.source_cluster != peer || operation.task_id != task_id.to_string() {
+                return Err(Status::unauthenticated(
+                    "Federated operation identity does not match the authenticated peer",
+                ));
+            }
+            match operation.state {
+                crate::federation::FederatedRemoteOperationState::Committed => {
+                    return Err(Status::failed_precondition(
+                        "Committed migration cannot be compensated",
+                    ));
+                }
+                crate::federation::FederatedRemoteOperationState::Compensated => {
+                    return Ok(Response::new(task::FederatedOperationResponse {
+                        accepted: true,
+                        state: "compensated".into(),
+                        checkpoint_digest: operation.checkpoint_digest.clone().unwrap_or_default(),
+                        message: "Compensation already committed".into(),
+                    }));
+                }
+                crate::federation::FederatedRemoteOperationState::Prepared => {}
+            }
+        }
+        let remote_task = store
+            .get_task(&task_id)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?
+            .ok_or_else(|| Status::not_found("Target task not found"))?;
+        if matches!(remote_task.state, TaskState::Completed { .. }) {
+            return Err(Status::failed_precondition(
+                "Completed target writes cannot be rolled back by the generic sink protocol",
+            ));
+        }
+        if !matches!(
+            remote_task.state,
+            TaskState::Cancelled { .. } | TaskState::Failed { .. }
+        ) {
+            let result = raft
+                .propose(crate::raft::Command::ControlTask {
+                    task_id: task_id.to_string(),
+                    action: "cancel".into(),
+                    request_id: format!("{}:cancel", req.request_id),
+                    actor: "federation-compensation".into(),
+                })
+                .await
+                .map_err(raft_status)?;
+            if !result.success {
+                return Err(Status::failed_precondition(result.message));
+            }
+        }
+        let operation = crate::federation::FederatedRemoteOperation {
+            migration_id: req.migration_id,
+            source_cluster: peer,
+            generation: req.generation,
+            task_id: task_id.to_string(),
+            state: crate::federation::FederatedRemoteOperationState::Compensated,
+            checkpoint_digest: existing.and_then(|value| value.checkpoint_digest),
+            updated_at_ms: chrono::Utc::now().timestamp_millis(),
+        };
+        let result = raft
+            .propose(crate::raft::Command::RecordFederatedRemoteOperation {
+                operation: Box::new(operation),
+                request_id: req.request_id,
+                actor: "federation-peer".into(),
+            })
+            .await
+            .map_err(raft_status)?;
+        if !result.success {
+            return Err(Status::failed_precondition(result.message));
+        }
+        Ok(Response::new(task::FederatedOperationResponse {
+            accepted: true,
+            state: "compensated".into(),
+            checkpoint_digest: String::new(),
+            message: result.message,
         }))
     }
 }

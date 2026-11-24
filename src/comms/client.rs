@@ -5,7 +5,11 @@
 
 //! gRPC client for inter-node communication
 
-use tonic::transport::Channel;
+use tonic::{
+    Request,
+    metadata::MetadataValue,
+    transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity},
+};
 use tracing::info;
 
 use super::generated::{cluster, log, task};
@@ -40,11 +44,220 @@ impl GrpcClient {
         })
     }
 
+    /// Connect to a federated peer using mutual TLS. The endpoint must be an
+    /// HTTPS URL whose DNS name matches the peer certificate SAN.
+    pub async fn connect_mtls(
+        endpoint_url: &str,
+        ca_file: &std::path::Path,
+        certificate_file: &std::path::Path,
+        private_key_file: &std::path::Path,
+    ) -> Result<Self> {
+        let parsed = url::Url::parse(endpoint_url)
+            .map_err(|e| DatspoolError::Configuration(format!("Invalid peer endpoint: {e}")))?;
+        if parsed.scheme() != "https"
+            || parsed.host_str().is_none()
+            || !parsed.username().is_empty()
+            || parsed.password().is_some()
+            || parsed.query().is_some()
+            || parsed.fragment().is_some()
+        {
+            return Err(DatspoolError::Configuration(
+                "Federated peer endpoint must be an HTTPS origin URL".into(),
+            ));
+        }
+        let ca = tokio::fs::read(ca_file)
+            .await
+            .map_err(|e| DatspoolError::Configuration(format!("Unable to read peer CA: {e}")))?;
+        let cert = tokio::fs::read(certificate_file).await.map_err(|e| {
+            DatspoolError::Configuration(format!("Unable to read client certificate: {e}"))
+        })?;
+        let key = tokio::fs::read(private_key_file).await.map_err(|e| {
+            DatspoolError::Configuration(format!("Unable to read client private key: {e}"))
+        })?;
+        let tls = ClientTlsConfig::new()
+            .ca_certificate(Certificate::from_pem(ca))
+            .identity(Identity::from_pem(cert, key))
+            .domain_name(parsed.host_str().expect("validated host").to_string());
+        let endpoint = Endpoint::from_shared(endpoint_url.to_string())
+            .map_err(|e| DatspoolError::Configuration(format!("Invalid peer endpoint: {e}")))?
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .timeout(std::time::Duration::from_secs(30))
+            .tls_config(tls)
+            .map_err(|e| {
+                DatspoolError::Configuration(format!("Invalid peer TLS configuration: {e}"))
+            })?;
+        let channel = endpoint
+            .connect()
+            .await
+            .map_err(|e| DatspoolError::Internal(format!("mTLS peer connection failed: {e}")))?;
+        Ok(Self {
+            cluster_client: cluster::cluster_service_client::ClusterServiceClient::new(
+                channel.clone(),
+            ),
+            task_client: task::task_service_client::TaskServiceClient::new(channel.clone()),
+            log_client: log::log_service_client::LogServiceClient::new(channel),
+        })
+    }
+
+    /// Read a remote task over the authenticated federation channel.
+    pub async fn get_remote_task(
+        &mut self,
+        task_id: &str,
+        source_cluster_id: &str,
+    ) -> Result<Option<task::GetTaskResponse>> {
+        let mut request = Request::new(task::GetTaskRequest {
+            task_id: task_id.to_string(),
+        });
+        let peer = MetadataValue::try_from(source_cluster_id).map_err(|e| {
+            DatspoolError::Configuration(format!("Invalid source cluster metadata: {e}"))
+        })?;
+        request
+            .metadata_mut()
+            .insert("x-dataspool-peer-cluster", peer);
+        match self.task_client.get_task(request).await {
+            Ok(response) => Ok(Some(response.into_inner())),
+            Err(status) if status.code() == tonic::Code::NotFound => Ok(None),
+            Err(status) => Err(DatspoolError::Internal(format!(
+                "Remote task query failed: {status}"
+            ))),
+        }
+    }
+
+    /// Send an idempotent task control operation to a federated peer.
+    pub async fn control_remote_task(
+        &mut self,
+        task_id: &str,
+        request_id: &str,
+        source_cluster_id: &str,
+        action: &str,
+    ) -> Result<task::TaskControlResponse> {
+        let request = task::TaskControlRequest {
+            task_id: task_id.to_string(),
+            request_id: request_id.to_string(),
+        };
+        let mut request = Request::new(request);
+        let peer = MetadataValue::try_from(source_cluster_id).map_err(|e| {
+            DatspoolError::Configuration(format!("Invalid source cluster metadata: {e}"))
+        })?;
+        request
+            .metadata_mut()
+            .insert("x-dataspool-peer-cluster", peer);
+        let response = match action {
+            "pause" => self.task_client.pause_task(request).await,
+            "resume" => self.task_client.resume_task(request).await,
+            "cancel" => self.task_client.cancel_task(request).await,
+            "retry" => self.task_client.retry_task(request).await,
+            _ => {
+                return Err(DatspoolError::Configuration(format!(
+                    "Unsupported remote task action: {action}"
+                )));
+            }
+        };
+        response
+            .map(|value| value.into_inner())
+            .map_err(|e| DatspoolError::Internal(format!("Remote task control failed: {e}")))
+    }
+
+    /// Prepare the target-side durable commit record after validating all shard checkpoints.
+    pub async fn prepare_remote_commit(
+        &mut self,
+        migration_id: &str,
+        generation: u64,
+        task_id: &str,
+        request_id: &str,
+        source_cluster_id: &str,
+    ) -> Result<task::FederatedOperationResponse> {
+        let request = federated_operation_request(
+            migration_id,
+            generation,
+            task_id,
+            request_id,
+            source_cluster_id,
+        )?;
+        self.task_client
+            .prepare_federated_commit(request)
+            .await
+            .map(|response| response.into_inner())
+            .map_err(|e| DatspoolError::Internal(format!("Remote commit preparation failed: {e}")))
+    }
+
+    /// Commit the prepared target-side operation. Repeated calls are idempotent.
+    pub async fn commit_remote_migration(
+        &mut self,
+        migration_id: &str,
+        generation: u64,
+        task_id: &str,
+        request_id: &str,
+        source_cluster_id: &str,
+    ) -> Result<task::FederatedOperationResponse> {
+        let request = federated_operation_request(
+            migration_id,
+            generation,
+            task_id,
+            request_id,
+            source_cluster_id,
+        )?;
+        self.task_client
+            .commit_federated_migration(request)
+            .await
+            .map(|response| response.into_inner())
+            .map_err(|e| DatspoolError::Internal(format!("Remote distributed commit failed: {e}")))
+    }
+
+    /// Compensate a target operation that has not crossed the commit point.
+    pub async fn compensate_remote_migration(
+        &mut self,
+        migration_id: &str,
+        generation: u64,
+        task_id: &str,
+        request_id: &str,
+        source_cluster_id: &str,
+    ) -> Result<task::FederatedOperationResponse> {
+        let request = federated_operation_request(
+            migration_id,
+            generation,
+            task_id,
+            request_id,
+            source_cluster_id,
+        )?;
+        self.task_client
+            .compensate_federated_migration(request)
+            .await
+            .map(|response| response.into_inner())
+            .map_err(|e| DatspoolError::Internal(format!("Remote compensation failed: {e}")))
+    }
+
     /// Get cluster service client
     pub fn cluster(
         &mut self,
     ) -> &mut cluster::cluster_service_client::ClusterServiceClient<Channel> {
         &mut self.cluster_client
+    }
+
+    /// Provision a task from a registered federated peer. The server binds the
+    /// asserted cluster ID to the mTLS certificate fingerprint before accepting it.
+    pub async fn create_remote_task(
+        &mut self,
+        request: task::CreateTaskRequest,
+        source_cluster_id: &str,
+    ) -> Result<task::CreateTaskResponse> {
+        if source_cluster_id.trim().is_empty() || source_cluster_id.len() > 128 {
+            return Err(DatspoolError::Configuration(
+                "Invalid source cluster ID".into(),
+            ));
+        }
+        let mut request = Request::new(request);
+        let peer = MetadataValue::try_from(source_cluster_id).map_err(|e| {
+            DatspoolError::Configuration(format!("Invalid source cluster metadata: {e}"))
+        })?;
+        request
+            .metadata_mut()
+            .insert("x-dataspool-peer-cluster", peer);
+        self.task_client
+            .create_task(request)
+            .await
+            .map(|response| response.into_inner())
+            .map_err(|e| DatspoolError::Internal(format!("Remote task provisioning failed: {e}")))
     }
 
     /// Get task service client
@@ -56,4 +269,31 @@ impl GrpcClient {
     pub fn log(&mut self) -> &mut log::log_service_client::LogServiceClient<Channel> {
         &mut self.log_client
     }
+}
+
+fn federated_operation_request(
+    migration_id: &str,
+    generation: u64,
+    task_id: &str,
+    request_id: &str,
+    source_cluster_id: &str,
+) -> Result<Request<task::FederatedOperationRequest>> {
+    if migration_id.trim().is_empty() || task_id.trim().is_empty() || request_id.trim().is_empty() {
+        return Err(DatspoolError::Configuration(
+            "Federated operation identifiers are required".into(),
+        ));
+    }
+    let mut request = Request::new(task::FederatedOperationRequest {
+        migration_id: migration_id.to_string(),
+        generation,
+        task_id: task_id.to_string(),
+        request_id: request_id.to_string(),
+    });
+    let peer = MetadataValue::try_from(source_cluster_id).map_err(|e| {
+        DatspoolError::Configuration(format!("Invalid source cluster metadata: {e}"))
+    })?;
+    request
+        .metadata_mut()
+        .insert("x-dataspool-peer-cluster", peer);
+    Ok(request)
 }

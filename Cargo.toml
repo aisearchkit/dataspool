@@ -37,7 +37,7 @@ openraft = { version = "0.9", features = ["serde", "storage-v2"] }
 rocksdb = { version = "0.23", default-features = false, features = ["lz4"] }
 
 # Networking
-tonic = "0.12"
+tonic = { version = "0.12", features = ["tls"] }
 prost = "0.13"
 prost-types = "0.13"
 hyper = "1.0"

@@ -307,7 +307,7 @@ impl<S: KvStore + Clone> MetaStateMachine<S> {
                 request_id,
                 actor,
             } => {
-                self.apply_federated_migration(migration, request_id, actor)
+                self.apply_federated_migration(*migration, request_id, actor)
                     .await
             }
             Command::HeartbeatFederatedCluster {
@@ -347,6 +347,36 @@ impl<S: KvStore + Clone> MetaStateMachine<S> {
                     actor,
                 )
                 .await
+            }
+            Command::UpdateFederatedMigrationProgress {
+                migration_id,
+                expected_generation,
+                remote_task_id,
+                remote_task_state,
+                remote_checkpoint,
+                at_ms,
+                request_id,
+                actor,
+            } => {
+                self.apply_federated_progress(
+                    migration_id,
+                    expected_generation,
+                    remote_task_id,
+                    remote_task_state,
+                    remote_checkpoint,
+                    at_ms,
+                    request_id,
+                    actor,
+                )
+                .await
+            }
+            Command::RecordFederatedRemoteOperation {
+                operation,
+                request_id,
+                actor,
+            } => {
+                self.apply_federated_remote_operation(*operation, request_id, actor)
+                    .await
             }
             Command::UpdateTaskState { .. }
             | Command::DeleteTask { .. }
@@ -493,7 +523,16 @@ impl<S: KvStore + Clone> MetaStateMachine<S> {
         }
         let payload = format!(
             "federated-migration:{}",
-            serde_json::json!({"migration_id": migration.migration_id, "source_cluster": migration.source_cluster, "target_cluster": migration.target_cluster, "task_id": migration.task_id, "required_capabilities": migration.required_capabilities})
+            serde_json::json!({
+                "migration_id": migration.migration_id, "source_cluster": migration.source_cluster,
+                "target_cluster": migration.target_cluster, "task_id": migration.task_id,
+                "required_capabilities": migration.required_capabilities, "task_name": migration.task_name,
+                "source_config": migration.source_config, "sink_config": migration.sink_config,
+                "transform_config": migration.transform_config, "sharding_strategy": migration.sharding_strategy,
+                "priority": migration.priority, "tags": migration.tags,
+                "deadline_at_ms": migration.deadline_at_ms, "execution_budget_ms": migration.execution_budget_ms,
+                "retry_budget": migration.retry_budget, "timeout_policy": migration.timeout_policy
+            })
         );
         if let Some(existing) = self.task_store.get_control_request(&request_id).await? {
             return if existing == payload {
@@ -506,6 +545,19 @@ impl<S: KvStore + Clone> MetaStateMachine<S> {
                     "request_id was already used with a different payload",
                 ))
             };
+        }
+        if !(0..=3).contains(&migration.priority)
+            || migration.task_name.trim().is_empty()
+            || migration.source_config.len() > 1_048_576
+            || migration.sink_config.len() > 1_048_576
+            || !serde_json::from_str::<serde_json::Value>(&migration.source_config)
+                .is_ok_and(|value| value.is_object())
+            || !serde_json::from_str::<serde_json::Value>(&migration.sink_config)
+                .is_ok_and(|value| value.is_object())
+        {
+            return Ok(rejected(
+                "migration requires a task name, priority 0-3, and source/sink JSON objects no larger than 1 MiB",
+            ));
         }
         if migration.source_cluster == migration.target_cluster {
             return Ok(rejected("source and target clusters must differ"));
@@ -535,6 +587,15 @@ impl<S: KvStore + Clone> MetaStateMachine<S> {
                     "cluster '{cluster_id}' does not satisfy required migration capabilities"
                 )));
             }
+        }
+        if migration.execution_budget_ms == Some(0)
+            || migration
+                .deadline_at_ms
+                .is_some_and(|deadline| deadline <= migration.created_at_ms)
+        {
+            return Ok(rejected(
+                "SLA deadline must be after creation and execution budget must be greater than zero",
+            ));
         }
         if migration.state != crate::federation::MigrationState::Planned
             || migration.generation != 0
@@ -570,6 +631,249 @@ impl<S: KvStore + Clone> MetaStateMachine<S> {
             )
             .await?;
         Ok(accepted("Federated migration created", data))
+    }
+
+    async fn apply_federated_remote_operation(
+        &self,
+        operation: crate::federation::FederatedRemoteOperation,
+        request_id: String,
+        actor: String,
+    ) -> Result<CommandResponse> {
+        if request_id.trim().is_empty()
+            || request_id.len() > 128
+            || operation.migration_id.trim().is_empty()
+            || operation.source_cluster.trim().is_empty()
+            || operation.task_id.trim().is_empty()
+        {
+            return Ok(rejected(
+                "remote operation identity and request_id are required",
+            ));
+        }
+        let source = self
+            .task_store
+            .get_federated_cluster(&operation.source_cluster)
+            .await?;
+        if source.is_none_or(|cluster| {
+            cluster.status == crate::federation::FederatedClusterStatus::Offline
+        }) {
+            return Ok(rejected("source cluster is not registered or is offline"));
+        }
+        let key = format!(
+            "federated_remote_op:{}:{:020}",
+            operation.migration_id, operation.generation
+        );
+        let payload = format!(
+            "federated-remote-op:{}",
+            serde_json::to_string(&serde_json::json!({
+                "migration_id": operation.migration_id,
+                "source_cluster": operation.source_cluster,
+                "generation": operation.generation,
+                "task_id": operation.task_id,
+                "state": operation.state,
+                "checkpoint_digest": operation.checkpoint_digest,
+            }))?
+        );
+        if let Some(existing) = self.task_store.get_control_request(&request_id).await? {
+            return if existing == payload {
+                Ok(accepted(
+                    "Federated remote operation already applied",
+                    serde_json::to_value(operation)?,
+                ))
+            } else {
+                Ok(rejected(
+                    "request_id was already used with a different payload",
+                ))
+            };
+        }
+        let current = self
+            .task_store
+            .get_federated_remote_operation(&operation.migration_id, operation.generation)
+            .await?;
+        if let Some(current) = current {
+            if current.source_cluster != operation.source_cluster
+                || current.task_id != operation.task_id
+            {
+                return Ok(rejected(
+                    "remote operation identity cannot change within a generation",
+                ));
+            }
+            if current.checkpoint_digest != operation.checkpoint_digest {
+                return Ok(rejected(
+                    "remote checkpoint digest cannot change within a generation",
+                ));
+            }
+            let allowed = matches!(
+                (current.state, operation.state),
+                (
+                    crate::federation::FederatedRemoteOperationState::Prepared,
+                    crate::federation::FederatedRemoteOperationState::Committed
+                        | crate::federation::FederatedRemoteOperationState::Compensated
+                )
+            ) || current.state == operation.state;
+            if !allowed {
+                return Ok(rejected("invalid remote operation state transition"));
+            }
+            if current.state == crate::federation::FederatedRemoteOperationState::Committed
+                && operation.state != crate::federation::FederatedRemoteOperationState::Committed
+            {
+                return Ok(rejected("committed remote operation is immutable"));
+            }
+            if current.state == crate::federation::FederatedRemoteOperationState::Compensated
+                && operation.state != crate::federation::FederatedRemoteOperationState::Compensated
+            {
+                return Ok(rejected("compensated remote operation is immutable"));
+            }
+        } else if operation.state != crate::federation::FederatedRemoteOperationState::Prepared
+            && operation.state != crate::federation::FederatedRemoteOperationState::Compensated
+        {
+            return Ok(rejected("remote operation must be prepared before commit"));
+        }
+        let audit = self.audit_event(
+            &actor,
+            &request_id,
+            "federated_remote_operation.transition",
+            &operation.migration_id,
+            "remote_operation",
+            &format!("{:?}", operation.state).to_lowercase(),
+        );
+        let data = serde_json::to_value(&operation)?;
+        self.task_store
+            .save_federated_control(
+                &request_id,
+                &payload,
+                key,
+                serde_json::to_vec(&operation)?,
+                audit,
+            )
+            .await?;
+        Ok(accepted("Federated remote operation committed", data))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn apply_federated_progress(
+        &self,
+        migration_id: String,
+        expected_generation: u64,
+        remote_task_id: Option<String>,
+        remote_task_state: Option<String>,
+        remote_checkpoint: Option<serde_json::Value>,
+        at_ms: i64,
+        request_id: String,
+        actor: String,
+    ) -> Result<CommandResponse> {
+        if request_id.trim().is_empty() || request_id.len() > 128 {
+            return Ok(rejected("request_id must contain 1-128 characters"));
+        }
+        let mut migration = match self
+            .task_store
+            .get_federated_migration(&migration_id)
+            .await?
+        {
+            Some(value) => value,
+            None => return Ok(rejected("federated migration not found")),
+        };
+        if migration.generation != expected_generation {
+            return Ok(rejected("stale federated migration generation"));
+        }
+        if migration.state == crate::federation::MigrationState::Completed {
+            return Ok(rejected("completed migration progress cannot be changed"));
+        }
+        if migration
+            .last_reconciled_at_ms
+            .is_some_and(|previous| at_ms < previous)
+        {
+            return Ok(rejected("stale remote reconciliation timestamp"));
+        }
+        if migration.remote_task_state.as_deref() == Some("completed")
+            && remote_task_state
+                .as_deref()
+                .is_some_and(|state| state != "completed")
+        {
+            return Ok(rejected(
+                "completed remote task state cannot move backwards",
+            ));
+        }
+        if migration
+            .remote_task_state
+            .as_deref()
+            .is_some_and(|state| matches!(state, "failed" | "cancelled"))
+            && remote_task_state
+                .as_deref()
+                .is_some_and(|state| !matches!(state, "failed" | "cancelled"))
+        {
+            return Ok(rejected(
+                "terminal remote task state cannot move backwards within a generation",
+            ));
+        }
+        if migration
+            .remote_checkpoint
+            .as_ref()
+            .and_then(|checkpoint| checkpoint.get("federation_commit_state"))
+            .and_then(serde_json::Value::as_str)
+            == Some("committed")
+            && remote_checkpoint
+                .as_ref()
+                .and_then(|checkpoint| checkpoint.get("federation_commit_state"))
+                .and_then(serde_json::Value::as_str)
+                != Some("committed")
+        {
+            return Ok(rejected("committed checkpoint state is immutable"));
+        }
+        let payload = format!(
+            "federated-progress:{migration_id}:{expected_generation}:{}:{}",
+            remote_task_id.as_deref().unwrap_or(""),
+            serde_json::to_string(
+                &serde_json::json!({"state": remote_task_state, "checkpoint": remote_checkpoint})
+            )?
+        );
+        if let Some(existing) = self.task_store.get_control_request(&request_id).await? {
+            return if existing == payload {
+                Ok(accepted(
+                    "Federated migration progress already applied",
+                    serde_json::json!({"migration_id": migration_id}),
+                ))
+            } else {
+                Ok(rejected(
+                    "request_id was already used with a different payload",
+                ))
+            };
+        }
+        if let (Some(current), Some(incoming)) = (&migration.remote_task_id, &remote_task_id)
+            && current != incoming
+        {
+            return Ok(rejected(
+                "remote task ID cannot change within a migration generation",
+            ));
+        }
+        if let Some(remote_task_id) = remote_task_id {
+            migration.remote_task_id = Some(remote_task_id);
+        }
+        if remote_task_state.is_some() {
+            migration.remote_task_state = remote_task_state;
+        }
+        if remote_checkpoint.is_some() {
+            migration.remote_checkpoint = remote_checkpoint;
+        }
+        migration.last_reconciled_at_ms = Some(at_ms);
+        let audit = self.audit_event(
+            &actor,
+            &request_id,
+            "federated_migration.reconcile",
+            &migration_id,
+            "running",
+            "running",
+        );
+        let data = serde_json::to_value(&migration)?;
+        self.task_store
+            .save_federated_control(
+                &request_id,
+                &payload,
+                format!("federated_migration:{migration_id}"),
+                serde_json::to_vec(&migration)?,
+                audit,
+            )
+            .await?;
+        Ok(accepted("Federated migration progress reconciled", data))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -609,6 +913,55 @@ impl<S: KvStore + Clone> MetaStateMachine<S> {
                     "request_id was already used with a different payload",
                 ))
             };
+        }
+        if migration.remote_task_state.as_deref() == Some("completed")
+            && matches!(
+                next_state,
+                crate::federation::MigrationState::Failed
+                    | crate::federation::MigrationState::Cancelled
+            )
+        {
+            return Ok(rejected(
+                "Target data writes are complete; finish the distributed commit instead of cancelling or failing the migration",
+            ));
+        }
+        if next_state == crate::federation::MigrationState::Committing
+            && (migration.remote_task_state.as_deref() != Some("completed")
+                || migration
+                    .remote_checkpoint
+                    .as_ref()
+                    .and_then(|value| value.get("federation_commit_state"))
+                    .and_then(serde_json::Value::as_str)
+                    != Some("prepared"))
+        {
+            return Ok(rejected(
+                "target task must be completed and its durable commit must be prepared",
+            ));
+        }
+        if next_state == crate::federation::MigrationState::Completed
+            && (migration.remote_task_state.as_deref() != Some("completed")
+                || migration
+                    .remote_checkpoint
+                    .as_ref()
+                    .and_then(|value| value.get("federation_commit_state"))
+                    .and_then(serde_json::Value::as_str)
+                    != Some("committed"))
+        {
+            return Ok(rejected(
+                "target-side distributed commit acknowledgement is required",
+            ));
+        }
+        if next_state == crate::federation::MigrationState::Preparing
+            && matches!(
+                migration.state,
+                crate::federation::MigrationState::Failed
+                    | crate::federation::MigrationState::Paused
+            )
+            && migration
+                .retry_budget
+                .is_some_and(|budget| migration.generation >= u64::from(budget))
+        {
+            return Ok(rejected("Federated migration retry budget is exhausted"));
         }
         if let Err(message) = migration.transition(next_state, expected_generation, at_ms, error) {
             return Ok(rejected(&message));
@@ -725,6 +1078,18 @@ impl<S: KvStore + Clone> MetaStateMachine<S> {
                 crate::types::TaskState::Running { .. } => task.state.clone(),
                 _ => return Ok(rejected("Only paused tasks can be resumed")),
             },
+            "fail" => {
+                if matches!(
+                    task.state,
+                    crate::types::TaskState::Completed { .. }
+                        | crate::types::TaskState::Cancelled { .. }
+                        | crate::types::TaskState::Failed { .. }
+                ) {
+                    return Ok(rejected("Terminal tasks cannot be failed again"));
+                }
+                task.mark_failed("SLA execution budget exceeded".into());
+                task.state.clone()
+            }
             "cancel" => match &task.state {
                 crate::types::TaskState::Cancelled { .. } => task.state.clone(),
                 crate::types::TaskState::Completed { .. }
@@ -796,6 +1161,16 @@ impl<S: KvStore + Clone> MetaStateMachine<S> {
             return Ok(rejected("Cancelled or completed tasks cannot be retried"));
         }
         let mut shards = self.task_store.list_task_shards(&id).await?;
+        if let Some(limit) = task
+            .metadata
+            .get("sla.max_retries")
+            .and_then(|value| value.parse::<u64>().ok())
+        {
+            let retries: u64 = shards.iter().map(|shard| shard.retry_count).sum();
+            if retries >= limit {
+                return Ok(rejected("Task retry budget is exhausted"));
+            }
+        }
         let mut retried = 0usize;
         for shard in &mut shards {
             if matches!(shard.state, ShardState::Failed { .. }) {
@@ -1958,10 +2333,25 @@ mod tests {
             created_at_ms: 1,
             updated_at_ms: 1,
             last_error: None,
+            task_name: "migration-1".into(),
+            source_config: "{}".into(),
+            sink_config: "{}".into(),
+            transform_config: None,
+            sharding_strategy: None,
+            priority: 1,
+            tags: Default::default(),
+            remote_task_id: None,
+            remote_task_state: None,
+            remote_checkpoint: None,
+            last_reconciled_at_ms: None,
+            deadline_at_ms: None,
+            execution_budget_ms: None,
+            retry_budget: None,
+            timeout_policy: Default::default(),
         };
         assert!(
             sm.apply_command(Command::CreateFederatedMigration {
-                migration,
+                migration: Box::new(migration),
                 request_id: "create-migration-1".into(),
                 actor: "operator".into()
             })
@@ -2002,6 +2392,34 @@ mod tests {
             .unwrap()
             .success
         );
+        let premature_commit = sm
+            .apply_command(transition(
+                crate::federation::MigrationState::Committing,
+                0,
+                4,
+                "premature-commit",
+            ))
+            .await
+            .unwrap();
+        assert!(
+            !premature_commit.success,
+            "commit requires target-side completion proof"
+        );
+        assert!(
+            sm.apply_command(Command::UpdateFederatedMigrationProgress {
+                migration_id: "migration-1".into(),
+                expected_generation: 0,
+                remote_task_id: Some("remote-task-g0".into()),
+                remote_task_state: Some("failed".into()),
+                remote_checkpoint: Some(serde_json::json!({"shards": []})),
+                at_ms: 4,
+                request_id: "progress-g0".into(),
+                actor: "reconciler".into(),
+            })
+            .await
+            .unwrap()
+            .success
+        );
         assert!(
             sm.apply_command(transition(
                 crate::federation::MigrationState::Failed,
@@ -2025,6 +2443,64 @@ mod tests {
             .success
         );
         assert!(
+            !sm.apply_command(Command::UpdateFederatedMigrationProgress {
+                migration_id: "migration-1".into(),
+                expected_generation: 0,
+                remote_task_id: Some("stale-remote-task".into()),
+                remote_task_state: Some("completed".into()),
+                remote_checkpoint: None,
+                at_ms: 6,
+                request_id: "stale-progress".into(),
+                actor: "old-leader".into(),
+            })
+            .await
+            .unwrap()
+            .success
+        );
+        assert!(
+            sm.apply_command(Command::UpdateFederatedMigrationProgress {
+                migration_id: "migration-1".into(),
+                expected_generation: 1,
+                remote_task_id: Some("remote-task-g1".into()),
+                remote_task_state: Some("completed".into()),
+                remote_checkpoint: Some(serde_json::json!({"shards": [{"id": 1}], "federation_commit_state": "prepared"})),
+                at_ms: 7,
+                request_id: "progress-g1".into(),
+                actor: "reconciler".into(),
+            })
+            .await
+            .unwrap()
+            .success
+        );
+        assert!(
+            sm.apply_command(transition(
+                crate::federation::MigrationState::Committing,
+                1,
+                8,
+                "commit-g1"
+            ))
+            .await
+            .unwrap()
+            .success
+        );
+        assert!(sm.apply_command(Command::UpdateFederatedMigrationProgress {
+            migration_id: "migration-1".into(), expected_generation: 1,
+            remote_task_id: Some("remote-task-g1".into()), remote_task_state: Some("completed".into()),
+            remote_checkpoint: Some(serde_json::json!({"shards": [{"id": 1}], "federation_commit_state": "committed"})),
+            at_ms: 9, request_id: "progress-committed-g1".into(), actor: "reconciler".into(),
+        }).await.unwrap().success);
+        assert!(
+            sm.apply_command(transition(
+                crate::federation::MigrationState::Completed,
+                1,
+                9,
+                "complete-g1"
+            ))
+            .await
+            .unwrap()
+            .success
+        );
+        assert!(
             !sm.apply_command(transition(
                 crate::federation::MigrationState::Running,
                 0,
@@ -2036,23 +2512,91 @@ mod tests {
             .success
         );
         assert!(
-            sm.apply_command(transition(
+            !sm.apply_command(transition(
                 crate::federation::MigrationState::Running,
                 1,
-                7,
+                10,
                 "running-generation-1"
             ))
             .await
             .unwrap()
-            .success
+            .success,
+            "completed migrations are terminal"
         );
         let saved = store
             .get_federated_migration("migration-1")
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(saved.state, crate::federation::MigrationState::Running);
+        assert_eq!(saved.state, crate::federation::MigrationState::Completed);
         assert_eq!(saved.generation, 1);
+    }
+
+    #[tokio::test]
+    async fn federated_remote_commit_is_durable_idempotent_and_terminal() {
+        let dir = tempdir().unwrap();
+        let store = TaskStore::new(RocksDbStore::open(dir.path()).unwrap());
+        let mut sm = MetaStateMachine::new(store.kv_store().clone());
+        assert!(
+            sm.apply_command(Command::UpsertFederatedCluster {
+                cluster: federated_cluster("source"),
+                request_id: "register-source-remote-op".into(),
+                actor: "operator".into(),
+            })
+            .await
+            .unwrap()
+            .success
+        );
+        let operation = |state| crate::federation::FederatedRemoteOperation {
+            migration_id: "migration-remote-op".into(),
+            source_cluster: "source".into(),
+            generation: 3,
+            task_id: "remote-task".into(),
+            state,
+            checkpoint_digest: Some("abc123".into()),
+            updated_at_ms: 10,
+        };
+        let prepared = Command::RecordFederatedRemoteOperation {
+            operation: Box::new(operation(
+                crate::federation::FederatedRemoteOperationState::Prepared,
+            )),
+            request_id: "prepare-remote-op".into(),
+            actor: "peer".into(),
+        };
+        assert!(sm.apply_command(prepared.clone()).await.unwrap().success);
+        assert!(sm.apply_command(prepared).await.unwrap().success);
+        assert!(
+            sm.apply_command(Command::RecordFederatedRemoteOperation {
+                operation: Box::new(operation(
+                    crate::federation::FederatedRemoteOperationState::Committed
+                )),
+                request_id: "commit-remote-op".into(),
+                actor: "peer".into(),
+            })
+            .await
+            .unwrap()
+            .success
+        );
+        let rollback = sm
+            .apply_command(Command::RecordFederatedRemoteOperation {
+                operation: Box::new(operation(
+                    crate::federation::FederatedRemoteOperationState::Compensated,
+                )),
+                request_id: "rollback-remote-op".into(),
+                actor: "peer".into(),
+            })
+            .await
+            .unwrap();
+        assert!(!rollback.success);
+        let saved = store
+            .get_federated_remote_operation("migration-remote-op", 3)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            saved.state,
+            crate::federation::FederatedRemoteOperationState::Committed
+        );
     }
 
     #[tokio::test]

@@ -57,17 +57,12 @@ async fn main() -> Result<()> {
         .or_else(|| config.as_ref().map(|value| value.http_addr().to_string()))
         .unwrap_or_else(|| "127.0.0.1:8080".into());
 
-    if let Some(config) = config.as_ref() {
-        if config.storage.engine != dataspool::config::StorageEngine::RocksDb {
-            return Err(DatspoolError::Configuration(
-                "Only RocksDB storage is currently supported".into(),
-            ));
-        }
-        if config.server.tls.enabled {
-            return Err(DatspoolError::Configuration(
-                "Terminate TLS at a trusted reverse proxy; native TLS is not enabled".into(),
-            ));
-        }
+    if let Some(config) = config.as_ref()
+        && config.storage.engine != dataspool::config::StorageEngine::RocksDb
+    {
+        return Err(DatspoolError::Configuration(
+            "Only RocksDB storage is currently supported".into(),
+        ));
     }
 
     let store = dataspool::RocksDbStore::open(&db_path)?;
@@ -261,10 +256,66 @@ async fn main() -> Result<()> {
         .map(|value| value.task_api_addr().to_string())
         .unwrap_or_else(|| "127.0.0.1:50052".to_string());
     let grpc_raft = raft_node.as_ref().map(|raft| Arc::new(raft.clone()));
-    let grpc_api = GrpcServer::new(&grpc_api_addr, tasks.clone(), grpc_raft).await?;
+    let mut grpc_api = GrpcServer::new(&grpc_api_addr, tasks.clone(), grpc_raft).await?;
+    if let Some(config) = config.as_ref().filter(|value| value.server.tls.enabled) {
+        let ca_file = config.server.tls.ca_file.as_deref().ok_or_else(|| {
+            DatspoolError::Configuration("server.tls.ca_file is required for mutual TLS".into())
+        })?;
+        let cert_file = config.server.tls.cert_file.as_deref().ok_or_else(|| {
+            DatspoolError::Configuration(
+                "server.tls.cert_file is required when TLS is enabled".into(),
+            )
+        })?;
+        let key_file = config.server.tls.key_file.as_deref().ok_or_else(|| {
+            DatspoolError::Configuration(
+                "server.tls.key_file is required when TLS is enabled".into(),
+            )
+        })?;
+        grpc_api = grpc_api
+            .with_mtls_files(cert_file, key_file, ca_file)
+            .await?;
+        info!("Task API gRPC listener requires mutual TLS client certificates");
+    }
     let grpc_shutdown = shutdown.clone();
     let grpc_api_task =
         tokio::spawn(async move { grpc_api.serve_until_cancelled(grpc_shutdown).await });
+
+    let mut federation_task = None;
+    if let (Some(config), Some(raft), Ok(local_cluster_id)) = (
+        config.as_ref().filter(|value| value.server.tls.enabled),
+        raft_node.as_ref(),
+        std::env::var("DATASPOOL_FEDERATION_CLUSTER_ID"),
+    ) {
+        let ca_file = config.server.tls.ca_file.clone().ok_or_else(|| {
+            DatspoolError::Configuration("server.tls.ca_file is required for federation".into())
+        })?;
+        let certificate_file = config.server.tls.cert_file.clone().ok_or_else(|| {
+            DatspoolError::Configuration("server.tls.cert_file is required for federation".into())
+        })?;
+        let private_key_file = config.server.tls.key_file.clone().ok_or_else(|| {
+            DatspoolError::Configuration("server.tls.key_file is required for federation".into())
+        })?;
+        let reconciler = dataspool::federation::orchestrator::FederatedOrchestrator::new(
+            tasks.clone(),
+            Arc::new(raft.clone()),
+            local_cluster_id,
+            ca_file,
+            certificate_file,
+            private_key_file,
+        );
+        let federation_shutdown = shutdown.clone();
+        federation_task = Some(tokio::spawn(async move {
+            reconciler.run_until_cancelled(federation_shutdown).await
+        }));
+        info!("Federated migration reconciler enabled");
+    } else if config
+        .as_ref()
+        .is_some_and(|value| value.server.tls.enabled)
+    {
+        info!(
+            "Federated mTLS is enabled; set DATASPOOL_FEDERATION_CLUSTER_ID to enable migration reconciliation"
+        );
+    }
 
     info!(%bind, %db_path, "Starting Dataspool DLQ admin API");
     if !bind.starts_with("127.0.0.1:") && !bind.starts_with("[::1]:") {
@@ -287,6 +338,11 @@ async fn main() -> Result<()> {
     grpc_api_task
         .await
         .map_err(|e| DatspoolError::Internal(format!("Task API gRPC task failed: {e}")))??;
+    if let Some(federation) = federation_task {
+        federation.await.map_err(|e| {
+            DatspoolError::Internal(format!("Federation reconciler task failed: {e}"))
+        })?;
+    }
     if let Some(worker) = worker {
         worker
             .await

@@ -118,10 +118,101 @@ impl<S: KvStore + Clone + 'static> ShardClaimer<S> {
         self.raft.get_leader_id().await
     }
 
+    async fn enforce_task_sla(&self, task: &TaskMeta) -> Result<bool> {
+        if matches!(
+            task.state,
+            TaskState::Completed { .. } | TaskState::Cancelled { .. } | TaskState::Failed { .. }
+        ) {
+            return Ok(false);
+        }
+        let now = Utc::now();
+        let mut reasons = Vec::new();
+        if let Some(deadline) = task.metadata.get("sla.deadline_at")
+            && let Ok(deadline) = DateTime::parse_from_rfc3339(deadline)
+            && now >= deadline.with_timezone(&Utc)
+        {
+            reasons.push("deadline");
+        }
+        let started = task
+            .started_at
+            .unwrap_or_else(|| DateTime::<Utc>::from(task.created_at));
+        if let Some(limit) = task
+            .metadata
+            .get("sla.max_duration_seconds")
+            .and_then(|value| value.parse::<u64>().ok())
+            && limit > 0
+            && now.signed_duration_since(started).num_seconds().max(0) as u64 >= limit
+        {
+            reasons.push("duration");
+        }
+        if let Some(limit_ms) = task
+            .metadata
+            .get("sla.execution_budget_ms")
+            .and_then(|value| value.parse::<u64>().ok())
+            && limit_ms > 0
+            && now.signed_duration_since(started).num_milliseconds().max(0) as u64 >= limit_ms
+        {
+            reasons.push("execution_budget");
+        }
+        if let Some(limit) = task
+            .metadata
+            .get("sla.max_retries")
+            .and_then(|value| value.parse::<u64>().ok())
+        {
+            let retries: u64 = self
+                .task_store
+                .list_task_shards(&task.task_id)
+                .await?
+                .iter()
+                .map(|shard| shard.retry_count)
+                .sum();
+            if retries > limit {
+                reasons.push("retry_budget");
+            }
+        }
+        if reasons.is_empty() {
+            return Ok(false);
+        }
+        let policy = task
+            .metadata
+            .get("sla.timeout_policy")
+            .map(String::as_str)
+            .unwrap_or("pause");
+        let action = match policy {
+            "cancel" => "cancel",
+            "fail" => "fail",
+            _ => "pause",
+        };
+        let request_id = format!("sla:{}:{}", task.task_id, reasons.join("+"));
+        let response = self
+            .raft
+            .propose(Command::ControlTask {
+                task_id: task.task_id.to_string(),
+                action: action.into(),
+                request_id,
+                actor: "sla-enforcer".into(),
+            })
+            .await?;
+        if !response.success {
+            return Err(DatspoolError::Internal(format!(
+                "SLA enforcement rejected for task {}: {}",
+                task.task_id, response.message
+            )));
+        }
+        debug!(task_id = %task.task_id, ?reasons, action, "Task SLA policy enforced");
+        Ok(true)
+    }
+
     pub async fn try_claim(&self) -> Result<Option<ShardLease>> {
         let mut tasks = self.task_store.list_tasks().await?;
         // Priority is strict; creation time provides deterministic FIFO fairness within a tier.
         sort_task_candidates(&mut tasks);
+        let mut sla_blocked = std::collections::HashSet::new();
+        for task in &tasks {
+            if self.enforce_task_sla(task).await? {
+                sla_blocked.insert(task.task_id);
+            }
+        }
         let nodes = self.task_store.list_nodes().await?;
         let node = nodes.iter().find(|node| node.node_id == self.node_id);
         if node.is_some_and(|node| node.status != crate::types::NodeStatus::Healthy) {
@@ -158,7 +249,9 @@ impl<S: KvStore + Clone + 'static> ShardClaimer<S> {
         }
         let mut candidates = Vec::new();
         for task in &tasks {
-            if !matches!(task.state, TaskState::Pending | TaskState::Running { .. }) {
+            if sla_blocked.contains(&task.task_id)
+                || !matches!(task.state, TaskState::Pending | TaskState::Running { .. })
+            {
                 continue;
             }
             if !nodes.is_empty() {

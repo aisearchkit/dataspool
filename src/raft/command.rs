@@ -181,7 +181,7 @@ pub enum Command {
         actor: String,
     },
     CreateFederatedMigration {
-        migration: crate::federation::FederatedMigration,
+        migration: Box<crate::federation::FederatedMigration>,
         request_id: String,
         actor: String,
     },
@@ -199,6 +199,21 @@ pub enum Command {
         expected_generation: u64,
         at_ms: i64,
         error: Option<String>,
+        request_id: String,
+        actor: String,
+    },
+    UpdateFederatedMigrationProgress {
+        migration_id: String,
+        expected_generation: u64,
+        remote_task_id: Option<String>,
+        remote_task_state: Option<String>,
+        remote_checkpoint: Option<serde_json::Value>,
+        at_ms: i64,
+        request_id: String,
+        actor: String,
+    },
+    RecordFederatedRemoteOperation {
+        operation: Box<crate::federation::FederatedRemoteOperation>,
         request_id: String,
         actor: String,
     },
@@ -346,6 +361,15 @@ impl Command {
                 "TransitionFederatedMigration({}, {:?})",
                 migration_id, next_state
             ),
+            Command::UpdateFederatedMigrationProgress { migration_id, .. } => {
+                format!("UpdateFederatedMigrationProgress({})", migration_id)
+            }
+            Command::RecordFederatedRemoteOperation { operation, .. } => {
+                format!(
+                    "RecordFederatedRemoteOperation({}:{:?})",
+                    operation.migration_id, operation.state
+                )
+            }
         }
     }
 }

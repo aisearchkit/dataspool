@@ -151,10 +151,10 @@ impl<S: KvStore> TaskStore<S> {
             ) {
                 continue;
             }
-            let elapsed = task
+            let started = task
                 .started_at
-                .map(|started| (now - started).num_seconds().max(0) as u64)
-                .unwrap_or(0);
+                .unwrap_or_else(|| chrono::DateTime::<chrono::Utc>::from(task.created_at));
+            let elapsed = (now - started).num_seconds().max(0) as u64;
             let retries: u64 = self
                 .list_task_shards(&task.task_id)
                 .await?
@@ -183,6 +183,19 @@ impl<S: KvStore> TaskStore<S> {
                     breached = true;
                 } else if limit > elapsed && limit - elapsed <= 900 {
                     reasons.push("duration_at_risk".to_string());
+                }
+            }
+            if let Some(limit_ms) = task
+                .metadata
+                .get("sla.execution_budget_ms")
+                .and_then(|v| v.parse::<u64>().ok())
+            {
+                let elapsed_ms = (now - started).num_milliseconds().max(0) as u64;
+                if limit_ms > 0 && elapsed_ms >= limit_ms {
+                    reasons.push("execution_budget_exceeded".to_string());
+                    breached = true;
+                } else if limit_ms > elapsed_ms && limit_ms - elapsed_ms <= 900_000 {
+                    reasons.push("execution_budget_at_risk".to_string());
                 }
             }
             if let Some(limit) = task
@@ -367,6 +380,19 @@ impl<S: KvStore> TaskStore<S> {
             .into_iter()
             .map(|(_, v)| serde_json::from_slice(&v).map_err(Into::into))
             .collect()
+    }
+
+    pub async fn get_federated_remote_operation(
+        &self,
+        migration_id: &str,
+        generation: u64,
+    ) -> Result<Option<crate::federation::FederatedRemoteOperation>> {
+        let key = format!("federated_remote_op:{migration_id}:{generation:020}");
+        self.store
+            .get_cf(cf::META, key.as_bytes())
+            .await?
+            .map(|value| serde_json::from_slice(&value).map_err(Into::into))
+            .transpose()
     }
 
     pub async fn save_federated_control(

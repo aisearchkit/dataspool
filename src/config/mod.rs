@@ -321,6 +321,12 @@ impl DatspoolConfig {
             if self.server.tls.key_file.is_none() {
                 return Err(ConfigError::MissingField("server.tls.key_file".to_string()).into());
             }
+            if self.server.tls.ca_file.is_none() {
+                return Err(ConfigError::MissingField(
+                    "server.tls.ca_file (required for mTLS)".to_string(),
+                )
+                .into());
+            }
         }
 
         Ok(())

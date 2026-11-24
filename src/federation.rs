@@ -4,7 +4,7 @@
 //! Federated cluster registry and cross-cluster migration control-plane records.
 
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -33,10 +33,30 @@ pub enum MigrationState {
     Planned,
     Preparing,
     Running,
+    Paused,
     Committing,
     Completed,
     Failed,
     Cancelled,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FederatedRemoteOperationState {
+    Prepared,
+    Committed,
+    Compensated,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FederatedRemoteOperation {
+    pub migration_id: String,
+    pub source_cluster: String,
+    pub generation: u64,
+    pub task_id: String,
+    pub state: FederatedRemoteOperationState,
+    pub checkpoint_digest: Option<String>,
+    pub updated_at_ms: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -53,6 +73,45 @@ pub struct FederatedMigration {
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
     pub last_error: Option<String>,
+    #[serde(default)]
+    pub task_name: String,
+    #[serde(default)]
+    pub source_config: String,
+    #[serde(default)]
+    pub sink_config: String,
+    #[serde(default)]
+    pub transform_config: Option<String>,
+    #[serde(default)]
+    pub sharding_strategy: Option<String>,
+    #[serde(default)]
+    pub priority: i32,
+    #[serde(default)]
+    pub tags: HashMap<String, String>,
+    #[serde(default)]
+    pub remote_task_id: Option<String>,
+    #[serde(default)]
+    pub remote_task_state: Option<String>,
+    #[serde(default)]
+    pub remote_checkpoint: Option<serde_json::Value>,
+    #[serde(default)]
+    pub last_reconciled_at_ms: Option<i64>,
+    #[serde(default)]
+    pub deadline_at_ms: Option<i64>,
+    #[serde(default)]
+    pub execution_budget_ms: Option<u64>,
+    #[serde(default)]
+    pub retry_budget: Option<u32>,
+    #[serde(default)]
+    pub timeout_policy: MigrationTimeoutPolicy,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MigrationTimeoutPolicy {
+    #[default]
+    Pause,
+    Cancel,
+    Fail,
 }
 
 impl FederatedMigration {
@@ -73,13 +132,28 @@ impl FederatedMigration {
             (&self.state, &next),
             (
                 MigrationState::Planned,
-                MigrationState::Preparing | MigrationState::Cancelled
+                MigrationState::Preparing
+                    | MigrationState::Paused
+                    | MigrationState::Failed
+                    | MigrationState::Cancelled
             ) | (
                 MigrationState::Preparing,
-                MigrationState::Running | MigrationState::Failed | MigrationState::Cancelled
+                MigrationState::Running
+                    | MigrationState::Paused
+                    | MigrationState::Failed
+                    | MigrationState::Cancelled
             ) | (
                 MigrationState::Running,
-                MigrationState::Committing | MigrationState::Failed | MigrationState::Cancelled
+                MigrationState::Paused
+                    | MigrationState::Committing
+                    | MigrationState::Failed
+                    | MigrationState::Cancelled
+            ) | (
+                MigrationState::Paused,
+                MigrationState::Preparing
+                    | MigrationState::Committing
+                    | MigrationState::Cancelled
+                    | MigrationState::Failed
             ) | (
                 MigrationState::Committing,
                 MigrationState::Completed | MigrationState::Failed
@@ -94,8 +168,16 @@ impl FederatedMigration {
                 self.state, next
             ));
         }
-        if self.state == MigrationState::Failed && next == MigrationState::Preparing {
+        if matches!(self.state, MigrationState::Failed | MigrationState::Paused)
+            && next == MigrationState::Preparing
+        {
             self.generation = self.generation.saturating_add(1);
+            if self.state == MigrationState::Failed {
+                self.remote_task_id = None;
+                self.remote_task_state = None;
+                self.remote_checkpoint = None;
+                self.last_reconciled_at_ms = None;
+            }
         }
         self.state = next;
         self.updated_at_ms = at_ms;
@@ -126,6 +208,7 @@ pub fn validate_cluster(cluster: &FederatedCluster) -> Result<(), String> {
         || parsed.password().is_some()
         || parsed.query().is_some()
         || parsed.fragment().is_some()
+        || parsed.path() != "/"
     {
         return Err(
             "cluster endpoint must be an origin URL without credentials, query, or fragment".into(),
@@ -178,6 +261,47 @@ mod tests {
     }
 
     #[test]
+    fn paused_migration_retry_increments_generation_and_preserves_remote_progress() {
+        let mut migration = FederatedMigration {
+            migration_id: "m2".into(),
+            source_cluster: "a".into(),
+            target_cluster: "b".into(),
+            task_id: "t2".into(),
+            required_capabilities: BTreeSet::new(),
+            state: MigrationState::Planned,
+            generation: 0,
+            created_at_ms: 1,
+            updated_at_ms: 1,
+            last_error: None,
+            task_name: String::new(),
+            source_config: String::new(),
+            sink_config: String::new(),
+            transform_config: None,
+            sharding_strategy: None,
+            priority: 1,
+            tags: HashMap::new(),
+            remote_task_id: Some("remote-0".into()),
+            remote_task_state: Some("paused".into()),
+            remote_checkpoint: Some(serde_json::json!({"offset": 10})),
+            last_reconciled_at_ms: Some(2),
+            deadline_at_ms: None,
+            execution_budget_ms: None,
+            retry_budget: None,
+            timeout_policy: Default::default(),
+        };
+        migration.state = MigrationState::Paused;
+        assert!(
+            migration
+                .transition(MigrationState::Preparing, 0, 3, None)
+                .is_ok()
+        );
+        assert_eq!(migration.generation, 1);
+        assert_eq!(migration.remote_task_id.as_deref(), Some("remote-0"));
+        assert_eq!(migration.remote_task_state.as_deref(), Some("paused"));
+        assert_eq!(migration.remote_checkpoint.as_ref().unwrap()["offset"], 10);
+    }
+
+    #[test]
     fn migration_transition_graph_is_terminal_and_generation_fenced() {
         let mut migration = FederatedMigration {
             migration_id: "m1".into(),
@@ -190,6 +314,21 @@ mod tests {
             created_at_ms: 1,
             updated_at_ms: 1,
             last_error: None,
+            task_name: String::new(),
+            source_config: String::new(),
+            sink_config: String::new(),
+            transform_config: None,
+            sharding_strategy: None,
+            priority: 1,
+            tags: Default::default(),
+            remote_task_id: None,
+            remote_task_state: None,
+            remote_checkpoint: None,
+            last_reconciled_at_ms: None,
+            deadline_at_ms: None,
+            execution_budget_ms: None,
+            retry_budget: None,
+            timeout_policy: Default::default(),
         };
         assert!(
             migration
@@ -223,3 +362,6 @@ mod tests {
         );
     }
 }
+
+#[path = "federation/orchestrator.rs"]
+pub mod orchestrator;

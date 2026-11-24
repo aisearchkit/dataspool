@@ -643,6 +643,25 @@ impl<S: KvStore + Clone + 'static> ShardExecutor<S> {
             .ok_or_else(|| {
                 DatspoolError::Internal(format!("Shard {} not found", lease.shard_id))
             })?;
+        let task = self
+            .task_store
+            .get_task(&shard.task_id)
+            .await?
+            .ok_or_else(|| {
+                DatspoolError::Internal(format!(
+                    "Task {} not found for leased shard",
+                    shard.task_id
+                ))
+            })?;
+        if matches!(
+            task.state,
+            crate::types::TaskState::Cancelled { .. } | crate::types::TaskState::Failed { .. }
+        ) {
+            return Err(DatspoolError::Internal(format!(
+                "Task {} is terminal; stopping shard execution",
+                shard.task_id
+            )));
+        }
         let owner_matches = matches!(&shard.state, crate::types::ShardState::Running { node_id, .. } if node_id == &lease.node_id);
         if !owner_matches
             || shard.fencing_token != lease.fencing_token

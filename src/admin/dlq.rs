@@ -17,7 +17,10 @@ use subtle::ConstantTimeEq;
 
 use crate::{
     drivers::factory::{SinkConfig, create_sink},
-    federation::{FederatedCluster, FederatedClusterStatus, FederatedMigration, MigrationState},
+    federation::{
+        FederatedCluster, FederatedClusterStatus, FederatedMigration, MigrationState,
+        MigrationTimeoutPolicy,
+    },
     pipeline::{DeadLetterEntry, DeadLetterQueue},
     raft::{Command, RaftNode},
     storage::KvStore,
@@ -151,6 +154,28 @@ struct CreateFederatedMigrationRequest {
     #[serde(default)]
     required_capabilities: std::collections::BTreeSet<String>,
     request_id: String,
+    #[serde(default)]
+    task_name: Option<String>,
+    #[serde(default)]
+    source_config: Option<String>,
+    #[serde(default)]
+    sink_config: Option<String>,
+    #[serde(default)]
+    transform_config: Option<String>,
+    #[serde(default)]
+    sharding_strategy: Option<String>,
+    #[serde(default)]
+    priority: Option<i32>,
+    #[serde(default)]
+    tags: std::collections::HashMap<String, String>,
+    #[serde(default)]
+    deadline_at_ms: Option<i64>,
+    #[serde(default)]
+    execution_budget_ms: Option<u64>,
+    #[serde(default)]
+    retry_budget: Option<u32>,
+    #[serde(default)]
+    timeout_policy: Option<MigrationTimeoutPolicy>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -245,7 +270,59 @@ async fn create_federated_migration<S: KvStore + Clone>(
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
     let now = chrono::Utc::now().timestamp_millis();
+    let source_config = match request.source_config.as_deref() {
+        Some(value)
+            if !value.trim().is_empty()
+                && serde_json::from_str::<serde_json::Value>(value)
+                    .is_ok_and(|parsed| parsed.is_object()) =>
+        {
+            value.to_string()
+        }
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                "source_config must be a valid JSON object".to_string(),
+            )
+                .into_response();
+        }
+    };
+    let sink_config = match request.sink_config.as_deref() {
+        Some(value)
+            if !value.trim().is_empty()
+                && serde_json::from_str::<serde_json::Value>(value)
+                    .is_ok_and(|parsed| parsed.is_object()) =>
+        {
+            value.to_string()
+        }
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                "sink_config must be a valid JSON object".to_string(),
+            )
+                .into_response();
+        }
+    };
+    let priority = request.priority.unwrap_or(1);
+    if !(0..=3).contains(&priority) {
+        return (
+            StatusCode::BAD_REQUEST,
+            "priority must be between 0 and 3".to_string(),
+        )
+            .into_response();
+    }
+    let task_name = request
+        .task_name
+        .clone()
+        .unwrap_or_else(|| request.migration_id.clone());
+    if task_name.trim().is_empty() || task_name.len() > 256 {
+        return (
+            StatusCode::BAD_REQUEST,
+            "task_name must contain 1-256 characters".to_string(),
+        )
+            .into_response();
+    }
     let migration = FederatedMigration {
+        task_name,
         migration_id: request.migration_id,
         source_cluster: request.source_cluster,
         target_cluster: request.target_cluster,
@@ -256,10 +333,24 @@ async fn create_federated_migration<S: KvStore + Clone>(
         created_at_ms: now,
         updated_at_ms: now,
         last_error: None,
+        source_config,
+        sink_config,
+        transform_config: request.transform_config,
+        sharding_strategy: request.sharding_strategy,
+        priority,
+        tags: request.tags,
+        remote_task_id: None,
+        remote_task_state: None,
+        remote_checkpoint: None,
+        last_reconciled_at_ms: None,
+        deadline_at_ms: request.deadline_at_ms,
+        execution_budget_ms: request.execution_budget_ms,
+        retry_budget: request.retry_budget,
+        timeout_policy: request.timeout_policy.unwrap_or_default(),
     };
     match raft
         .propose(Command::CreateFederatedMigration {
-            migration,
+            migration: Box::new(migration),
             request_id: request.request_id,
             actor: request_actor(&headers),
         })

@@ -145,6 +145,19 @@ message FailShardResponse {
   bool should_retry = 1;
 }
 
+message FederatedOperationRequest {
+  string migration_id = 1;
+  uint64 generation = 2;
+  string task_id = 3;
+  string request_id = 4;
+}
+message FederatedOperationResponse {
+  bool accepted = 1;
+  string state = 2;
+  string checkpoint_digest = 3;
+  string message = 4;
+}
+
 message TaskControlRequest { string task_id = 1; string request_id = 2; }
 message TaskControlResponse { bool success = 1; string message = 2; }
 message NodeExecutionControlRequest { string node_id = 1; bool paused = 2; string request_id = 3; }
@@ -168,4 +181,9 @@ service TaskService {
   rpc ReportProgress(ReportProgressRequest) returns (ReportProgressResponse);
   rpc CompleteShard(CompleteShardRequest) returns (CompleteShardResponse);
   rpc FailShard(FailShardRequest) returns (FailShardResponse);
+
+  // Cross-cluster two-phase commit and compensation protocol.
+  rpc PrepareFederatedCommit(FederatedOperationRequest) returns (FederatedOperationResponse);
+  rpc CommitFederatedMigration(FederatedOperationRequest) returns (FederatedOperationResponse);
+  rpc CompensateFederatedMigration(FederatedOperationRequest) returns (FederatedOperationResponse);
 }

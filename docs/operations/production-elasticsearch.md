@@ -220,7 +220,7 @@ groups:
 
 ## Federated cluster registry and migration orchestration (Phase 2.8)
 
-The local Raft group is the authoritative control plane for federated records. Registry and migration records are stored in the replicated metadata column family and therefore included in the existing Raft application snapshot. Do not write these records directly to RocksDB.
+The local Raft group is authoritative for registry, migration, remote-operation and audit records. All state changes are Raft commands persisted atomically with their idempotency keys. Snapshot/restore includes these records. Only the current Raft leader runs the reconciliation loop and performs remote side effects; a replacement leader replays generation-scoped operations and reconciles target state before advancing a migration.
 
 ### Register a remote cluster
 
@@ -230,18 +230,20 @@ The local Raft group is the authoritative control plane for federated records. R
 {
   "cluster_id": "west-prod",
   "endpoint": "https://west-control.example.com:9443",
-  "identity_fingerprint": "<64-character SHA-256 certificate fingerprint>",
+  "identity_fingerprint": "<64-character SHA-256 fingerprint of the leaf client certificate DER>",
   "version": "0.1.0",
   "capabilities": ["elasticsearch-source", "elasticsearch-sink"],
   "request_id": "register-west-prod-001"
 }
 ```
 
-Remote endpoints must use HTTPS; HTTP is accepted only for loopback development. A cluster ID is permanently bound to its first identity fingerprint. Heartbeats use `POST /api/v1/federation/clusters/{cluster_id}/heartbeat` with `identity_fingerprint`, `status` (`healthy`, `degraded`, or `offline`) and a unique `request_id`. The fingerprint is currently a pinned registry attribute, not a substitute for mutual TLS or signed peer authentication. Before exposing federation endpoints across trust boundaries, enforce mTLS at the trusted ingress and authorize each peer against its registered fingerprint.
+Federation peer endpoints must be HTTPS origins. HTTP is accepted only for loopback development. The first registration pins the cluster ID to its SHA-256 certificate fingerprint; changing the fingerprint requires an explicit out-of-band trust rotation procedure (the current API deliberately rejects silent identity replacement). Each cluster must register the other cluster's certificate fingerprint, because both outbound and inbound peer authentication are mutual. Configure `server.tls.enabled`, `server.tls.cert_file`, `server.tls.key_file`, and `server.tls.ca_file` on each cluster. The CA file is used to require and validate client certificates. Set `DATASPOOL_FEDERATION_CLUSTER_ID` to enable the leader-driven orchestrator. The remote endpoint hostname must match the peer server certificate SAN.
 
-Read endpoints: `GET /api/v1/federation/clusters`, `GET /api/v1/federation/migrations`, and `GET /api/v1/federation/migrations/{migration_id}`.
+Authenticated TaskService peer RPCs require both a verified mTLS client certificate and `x-dataspool-peer-cluster`. The server hashes the presented leaf certificate DER, checks the pinned fingerprint against the replicated registry, and refreshes the peer heartbeat. A caller cannot establish identity merely by supplying a cluster ID header. The Admin REST registry and migration endpoints remain protected by the administrator bearer token; the actor header is audit metadata, not authentication.
 
-### Create and advance a migration
+`POST /api/v1/federation/clusters/{cluster_id}/heartbeat` accepts `identity_fingerprint`, `status` (`healthy`, `degraded`, or `offline`) and a unique `request_id`. Read endpoints are `GET /api/v1/federation/clusters`, `GET /api/v1/federation/migrations`, and `GET /api/v1/federation/migrations/{migration_id}`.
+
+### Create and execute a migration
 
 `POST /api/v1/federation/migrations`:
 
@@ -250,14 +252,28 @@ Read endpoints: `GET /api/v1/federation/clusters`, `GET /api/v1/federation/migra
   "migration_id": "migration-2026-001",
   "source_cluster": "west-prod",
   "target_cluster": "east-prod",
-  "task_id": "<local-task-id>",
+  "task_id": "source-task-reference",
+  "task_name": "orders-copy",
+  "source_config": "{\"type\":\"elasticsearch\",\"addresses\":[\"https://source-es.example.com:9200\"]}",
+  "sink_config": "{\"type\":\"elasticsearch\",\"addresses\":[\"https://target-es.example.com:9200\"]}",
   "required_capabilities": ["elasticsearch-source", "elasticsearch-sink"],
+  "priority": 2,
+  "deadline_at_ms": 1790000000000,
+  "execution_budget_ms": 7200000,
+  "retry_budget": 2,
+  "timeout_policy": "pause",
   "request_id": "migration-create-2026-001"
 }
 ```
 
-Both clusters must be registered and not offline, and both must advertise every required capability. New plans start at `planned`, generation `0`. Advance a plan with `POST /api/v1/federation/migrations/{migration_id}/transition`, passing `next_state`, `expected_generation`, `request_id`, and optional `error`.
+`source_config` and `sink_config` must be JSON objects. Both clusters must be registered, not offline, and advertise every required capability. Plans start at `planned`, generation `0`; the elected leader advances them automatically through `preparing`, `running`, `committing`, and `completed`. Operators can request a transition with `POST /api/v1/federation/migrations/{migration_id}/transition`, passing `next_state`, `expected_generation`, `request_id`, and optional `error`. A failed migration can be retried to `preparing`; a paused migration can be resumed to `preparing`. Both retries increment the generation, fencing delayed reports from earlier attempts. A paused retry resumes the existing remote task; a failed retry provisions a new generation-scoped task.
 
-Allowed transitions are `planned -> preparing -> running -> committing -> completed`; `preparing` and `running` may fail or be cancelled, `committing` may fail, and a failed plan may retry to `preparing`. A retry increments the generation. Every transition checks the expected generation, so delayed reports from a previous attempt cannot advance a retried migration. All writes are Raft commands with idempotency keys and audit records.
+The orchestrator provisions the target task using a deterministic task request ID derived from migration ID and generation. Repeated requests therefore return the same target task instead of creating duplicates. It exchanges the target task state, aggregate counters and per-shard checkpoints/fencing tokens over mTLS, and persists the observed checkpoint on the source Raft group. The target refuses commit preparation until the task and every shard are completed. It then writes a durable `prepared` operation record through its own Raft group. The source advances to `committing` only after that acknowledgement, requests target commit, and advances to `completed` only after the target's durable `committed` acknowledgement. Request IDs and migration generation make prepare/commit replay safe after leader replacement.
 
-This increment delivers the replicated registry, migration lifecycle state machine, heartbeat updates, authenticated operator REST endpoints, and recovery fencing. It does not yet perform remote data-plane work: preparing/running/committing transitions are control-plane state only. The next increment must add authenticated peer RPC, remote task creation, checkpoint exchange, and commit/rollback coordination before describing a migration as end-to-end executable.
+Before the target task has completed, cancellation/timeout compensation cancels the target task and records a durable `compensated` operation. A completed target write cannot be generically rolled back by the current Elasticsearch sink adapter; the protocol refuses to report a successful compensation after that commit point. A migration that has crossed target completion must finish distributed commit or require a sink-specific compensating action. This is not a transactional rollback guarantee for arbitrary Elasticsearch pipelines.
+
+### SLA and recovery behavior
+
+`deadline_at_ms`, `execution_budget_ms`, `retry_budget`, and `timeout_policy` are persisted with the migration. The timeout policy is `pause` (pause the target and retain its checkpoint), `cancel` (cancel and compensate before marking cancelled), or `fail` (cancel and compensate before marking failed). Commit is treated as a short critical section: after target prepare succeeds, the orchestrator completes commit reconciliation rather than timing out between prepare and commit. Target RPCs have bounded connect/request timeouts; a failed RPC leaves the migration in its current durable stage for retry by the next reconciliation pass. The scheduler is leader-only, and remote task IDs, checkpoints, operation state and generation are persisted rather than held only in memory.
+
+The task SLA alert endpoint remains `GET /api/v1/alerts/sla`; task metadata supports `sla.deadline_at`, `sla.max_duration_seconds`, `sla.execution_budget_ms`, and `sla.max_retries`. The federated migration fields above enforce actions in the orchestrator, while task-level SLA metadata produces operational alerts and retry-budget rejection.
