@@ -660,6 +660,20 @@ mod cluster_tests {
         }
 
         let now = chrono::Utc::now().timestamp_millis();
+        let delivered = worker_node
+            .propose(Command::RecordBatchDelivery {
+                shard_id: shard_id.to_string(),
+                node_id: "worker-a".into(),
+                fencing_token: first_token,
+                issued_at_ms: now,
+                batch_id: batch_id.clone(),
+                success_count: 1,
+                failed_count: 0,
+                bytes_written: 128,
+            })
+            .await
+            .unwrap();
+        assert!(delivered.success, "{}", delivered.message);
         let progress = worker_node
             .propose(Command::UpdateShardProgress {
                 shard_id: shard_id.to_string(),
@@ -669,7 +683,7 @@ mod cluster_tests {
                 processed_records: 1,
                 processed_bytes: 128,
                 offset: serde_json::to_string(&OffsetValue::DocumentCount(1)).unwrap(),
-                batch_id: None,
+                batch_id: Some(batch_id.clone()),
             })
             .await
             .unwrap();
