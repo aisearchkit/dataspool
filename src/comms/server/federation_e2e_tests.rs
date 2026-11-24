@@ -1218,8 +1218,12 @@ async fn federation_mtls_recovery_survives_two_source_and_target_leader_changes(
     // scenario in the recovery window until the schedule has been exhausted.
     let config = ChaosConfig::default();
     let mut chaos = ChaosScheduler::new(0xDADA_2026_1124, config);
-    let source_follower = (source_leader_2 + 1) % 3;
-    let target_follower = (target_leader_2 + 1) % 3;
+    let source_follower = (0..3)
+        .find(|index| *index != source_leader && *index != source_leader_2)
+        .expect("source group has one non-leader member");
+    let target_follower = (0..3)
+        .find(|index| *index != target_leader && *index != target_leader_2)
+        .expect("target group has one non-leader member");
     let mut partitioned = true;
     let mut source_follower_running = true;
     let mut target_follower_running = true;
