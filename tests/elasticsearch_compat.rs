@@ -527,6 +527,28 @@ async fn elasticsearch_pit_search_after_and_bulk_item_errors() {
             first_fenced.success_count, 1,
             "{label}: initial fenced write"
         );
+        let exact_replay = sink
+            .write_batch_fenced(
+                RecordBatch::from(vec![Record::with_id(
+                    "fenced-replay",
+                    "compat",
+                    json!({"number":111}),
+                )]),
+                fence_version + 1,
+                &fence_shard,
+                fence_batch,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            exact_replay.success_count, 1,
+            "{label}: exact replay after lost bulk ACK"
+        );
+        assert_eq!(
+            exact_replay.failed_count, 0,
+            "{label}: exact replay must be idempotent"
+        );
+
         let stale_fenced = sink
             .write_batch_fenced(
                 RecordBatch::from(vec![Record::with_id(

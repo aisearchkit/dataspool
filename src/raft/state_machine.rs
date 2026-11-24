@@ -3131,6 +3131,262 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn batch_recovers_after_target_commit_before_delivery_ack_without_double_checkpoint() {
+        use crate::pipeline::{OffsetValue, Record};
+        use crate::storage::kv::{KvStore, cf};
+        use serde_json::json;
+
+        let source_dir = tempdir().unwrap();
+        let target_dir = tempdir().unwrap();
+        let store = TaskStore::new(RocksDbStore::open(source_dir.path()).unwrap());
+        let target = RocksDbStore::open(target_dir.path()).unwrap();
+        let task = TaskMeta::new("batch-ack-loss-recovery".into(), "{}".into(), "{}".into());
+        let shard = ShardMeta::new(task.task_id, 0, "{}".into());
+        let shard_id = shard.shard_id;
+        let mut sm = MetaStateMachine::new(store.kv_store().clone());
+        assert!(
+            sm.apply_command(Command::CreateTask {
+                task: Box::new(task),
+                shards: vec![shard],
+                request_id: "create-ack-loss".into(),
+                actor: "test".into(),
+            })
+            .await
+            .unwrap()
+            .success
+        );
+
+        let first_claim_at = chrono::Utc::now().timestamp_millis();
+        assert!(
+            sm.apply_command(Command::ClaimShard {
+                shard_id: shard_id.to_string(),
+                node_id: "worker-a".into(),
+                claim_id: "claim-a".into(),
+                issued_at_ms: first_claim_at,
+                lease_expires_at_ms: first_claim_at + 30_000,
+            })
+            .await
+            .unwrap()
+            .success
+        );
+        let first_fence = store
+            .get_shard(&shard_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .fencing_token;
+        let batch_id = format!("{first_fence:016x}-000000");
+        let records = vec![Record::with_id(
+            "doc-1",
+            "elasticsearch",
+            json!({"value": 42}),
+        )];
+        let next_offset = OffsetValue::DocumentCount(1);
+        assert!(
+            sm.apply_command(Command::CacheBatch {
+                shard_id: shard_id.to_string(),
+                node_id: "worker-a".into(),
+                fencing_token: first_fence,
+                issued_at_ms: first_claim_at + 1,
+                batch_id: batch_id.clone(),
+                records: records.clone(),
+                next_offset: Some(next_offset.clone()),
+                source_count: 1,
+            })
+            .await
+            .unwrap()
+            .success
+        );
+
+        // Simulate Elasticsearch committing the document while the response is lost.
+        // The Worker dies before RecordBatchDelivery reaches the source Raft cluster.
+        let digest = format!(
+            "{:x}",
+            sha2::Sha256::digest(serde_json::to_vec(&records).unwrap())
+        );
+        let target_key = b"doc:doc-1";
+        target
+            .put_cf(
+                cf::META,
+                target_key,
+                &serde_json::to_vec(&json!({
+                    "batch_id": batch_id, "payload_digest": digest, "document": records[0].payload,
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let before_restart = store.get_shard(&shard_id).await.unwrap().unwrap();
+        assert_eq!(before_restart.records_processed, 0);
+        assert_eq!(before_restart.offset, OffsetValue::initial());
+        let manifest_key =
+            crate::pipeline::cache::BatchManifest::key(&shard_id.to_string(), &batch_id);
+        let before_manifest = store
+            .kv_store()
+            .get_cf(cf::META, &manifest_key)
+            .await
+            .unwrap()
+            .unwrap();
+        let before_manifest: crate::pipeline::cache::BatchManifest =
+            serde_json::from_slice(&before_manifest).unwrap();
+        assert_eq!(
+            before_manifest.status,
+            crate::pipeline::cache::BatchManifestStatus::Prepared
+        );
+        drop(sm);
+
+        // A replacement Worker claims the expired lease and replays the same durable batch.
+        let mut recovered = MetaStateMachine::new(store.kv_store().clone());
+        let second_claim_at = first_claim_at + 30_001;
+        assert!(
+            recovered
+                .apply_command(Command::ClaimShard {
+                    shard_id: shard_id.to_string(),
+                    node_id: "worker-b".into(),
+                    claim_id: "claim-b".into(),
+                    issued_at_ms: second_claim_at,
+                    lease_expires_at_ms: second_claim_at + 30_000,
+                })
+                .await
+                .unwrap()
+                .success
+        );
+        let second_fence = store
+            .get_shard(&shard_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .fencing_token;
+        assert!(second_fence > first_fence);
+        let cached = store
+            .kv_store()
+            .get_cf(
+                cf::CACHE,
+                &crate::pipeline::cache::LocalBatchCache::<RocksDbStore>::key_for_shard(
+                    &shard_id.to_string(),
+                    &batch_id,
+                ),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let cached: crate::pipeline::cache::CacheEntry = serde_json::from_slice(&cached).unwrap();
+        assert_eq!(cached.batch_id, batch_id);
+        assert_eq!(cached.records, records);
+
+        // The target's deterministic document identity proves the replay is already applied.
+        let target_document = target.get_cf(cf::META, target_key).await.unwrap().unwrap();
+        let target_document: serde_json::Value = serde_json::from_slice(&target_document).unwrap();
+        assert_eq!(target_document["document"]["value"], 42);
+        assert_eq!(target.count_prefix_cf(cf::META, b"doc:").await.unwrap(), 1);
+
+        let delivery = recovered
+            .apply_command(Command::RecordBatchDelivery {
+                shard_id: shard_id.to_string(),
+                node_id: "worker-b".into(),
+                fencing_token: second_fence,
+                issued_at_ms: second_claim_at + 1,
+                batch_id: batch_id.clone(),
+                success_count: 1,
+                failed_count: 0,
+                bytes_written: 64,
+            })
+            .await
+            .unwrap();
+        assert!(delivery.success, "{}", delivery.message);
+        let progress = Command::UpdateShardProgress {
+            shard_id: shard_id.to_string(),
+            node_id: "worker-b".into(),
+            fencing_token: second_fence,
+            issued_at_ms: second_claim_at + 2,
+            processed_records: 1,
+            processed_bytes: 64,
+            offset: serde_json::to_string(&next_offset).unwrap(),
+            batch_id: Some(batch_id.clone()),
+        };
+        assert!(
+            recovered
+                .apply_command(progress.clone())
+                .await
+                .unwrap()
+                .success
+        );
+        assert!(recovered.apply_command(progress).await.unwrap().success);
+        let checkpointed = store.get_shard(&shard_id).await.unwrap().unwrap();
+        assert_eq!(
+            checkpointed.records_processed, 1,
+            "replayed checkpoint counted the batch twice"
+        );
+        assert_eq!(checkpointed.offset, next_offset);
+
+        let cache_key = String::from_utf8(
+            crate::pipeline::cache::LocalBatchCache::<RocksDbStore>::key_for_shard(
+                &shard_id.to_string(),
+                &batch_id,
+            ),
+        )
+        .unwrap();
+        let ack = recovered
+            .apply_command(Command::AckCacheBatch {
+                shard_id: shard_id.to_string(),
+                node_id: "worker-b".into(),
+                fencing_token: second_fence,
+                issued_at_ms: second_claim_at + 3,
+                cache_key,
+            })
+            .await
+            .unwrap();
+        assert!(ack.success, "{}", ack.message);
+        assert_eq!(
+            store
+                .cache_batch_count(&shard_id.to_string())
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            store
+                .get_shard(&shard_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .records_processed,
+            1
+        );
+        let manifest_key =
+            crate::pipeline::cache::BatchManifest::key(&shard_id.to_string(), &batch_id);
+        let manifest = store
+            .kv_store()
+            .get_cf(cf::META, &manifest_key)
+            .await
+            .unwrap()
+            .unwrap();
+        let manifest: crate::pipeline::cache::BatchManifest =
+            serde_json::from_slice(&manifest).unwrap();
+        assert_eq!(
+            manifest.status,
+            crate::pipeline::cache::BatchManifestStatus::Acknowledged
+        );
+        assert_eq!(manifest.fencing_token, second_fence);
+
+        let stale = recovered
+            .apply_command(Command::RecordBatchDelivery {
+                shard_id: shard_id.to_string(),
+                node_id: "worker-a".into(),
+                fencing_token: first_fence,
+                issued_at_ms: first_claim_at + 4,
+                batch_id,
+                success_count: 1,
+                failed_count: 0,
+                bytes_written: 64,
+            })
+            .await
+            .unwrap();
+        assert!(!stale.success, "old lease must not record a replay result");
+        assert_eq!(target.count_prefix_cf(cf::META, b"doc:").await.unwrap(), 1);
+    }
+
+    #[tokio::test]
     async fn legacy_cache_import_is_idempotent_and_closed_after_bootstrap() {
         use crate::pipeline::{OffsetValue, Record};
         use serde_json::json;
