@@ -1085,6 +1085,96 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn partial_bulk_success_retries_only_transient_documents_and_preserves_dlq_items() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        async fn read_request(stream: &mut tokio::net::TcpStream) -> String {
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 4096];
+            loop {
+                let read = stream.read(&mut chunk).await.unwrap();
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..read]);
+                if let Some(header_end) = request.windows(4).position(|w| w == b"\\r\\n\\r\\n") {
+                    let headers =
+                        String::from_utf8_lossy(&request[..header_end]).to_ascii_lowercase();
+                    let content_length = headers
+                        .lines()
+                        .find_map(|line| line.strip_prefix("content-length:"))
+                        .and_then(|value| value.trim().parse::<usize>().ok())
+                        .unwrap_or(0);
+                    if request.len() >= header_end + 4 + content_length {
+                        break;
+                    }
+                }
+            }
+            String::from_utf8_lossy(&request).into_owned()
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut request_sizes = Vec::new();
+            for attempt in 0..2 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let request = read_request(&mut stream).await;
+                let header_end = request.find("\\r\\n\\r\\n").unwrap() + 4;
+                let action_lines = request[header_end..].lines().step_by(2).count();
+                request_sizes.push(action_lines);
+                let body = if attempt == 0 {
+                    r#"{"errors":true,"items":[{"index":{"status":201}},{"index":{"status":400,"error":{"type":"mapper_parsing_exception","reason":"invalid field"}}},{"index":{"status":429,"error":{"type":"es_rejected_execution_exception","reason":"queue full"}}}]}"#
+                } else {
+                    r#"{"errors":false,"items":[{"index":{"status":201}}]}"#
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\\r\\nContent-Type: application/json\\r\\nContent-Length: {}\\r\\nConnection: close\\r\\n\\r\\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+                stream.shutdown().await.unwrap();
+            }
+            request_sizes
+        });
+
+        let records = vec![
+            Record::with_id("success", "test", json!({"v": 1})),
+            Record::with_id("permanent-failure", "test", json!({"v": 2})),
+            Record::with_id("transient-failure", "test", json!({"v": 3})),
+        ];
+        let (result, _) = DocumentSink::write_worker(
+            Client::new(),
+            format!("http://{address}/_bulk"),
+            "target".into(),
+            records,
+        )
+        .await
+        .unwrap();
+        let request_sizes = server.await.unwrap();
+        assert_eq!(
+            request_sizes,
+            vec![3, 1],
+            "only the transiently rejected document may be retried"
+        );
+        assert_eq!(result.success_count, 2);
+        assert_eq!(result.failed_count, 1);
+        assert_eq!(result.retried_count, 1);
+        assert_eq!(result.rejected_count, 0);
+        assert_eq!(result.failed_records.len(), 1);
+        assert_eq!(
+            result.failed_records[0].record.id.as_deref(),
+            Some("permanent-failure")
+        );
+        assert_eq!(result.failed_records[0].status, 400);
+        assert_eq!(
+            result.failed_records[0].error_type,
+            "mapper_parsing_exception"
+        );
+    }
+
+    #[tokio::test]
     async fn compensatable_create_conflict_with_unowned_document_is_fatal_not_dlq() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::TcpListener;
