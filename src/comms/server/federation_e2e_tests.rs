@@ -29,7 +29,10 @@ use std::{
     time::Duration,
 };
 use tempfile::TempDir;
-use tokio::{net::TcpListener, task::JoinHandle};
+use tokio::{
+    net::{TcpListener, TcpSocket},
+    task::JoinHandle,
+};
 use tokio_util::sync::CancellationToken as ShutdownToken;
 use tonic::transport::{Certificate, Identity, Server, ServerTlsConfig};
 use tower::{Layer, Service};
@@ -880,7 +883,13 @@ impl TestRaftGroup {
     }
 
     async fn restart(&mut self, index: usize) {
-        let listener = TcpListener::bind(&self.addresses[index]).await.unwrap();
+        // Repeated fault cycles can leave accepted connections in TIME_WAIT.
+        // Reuse the stable Raft address without making the test depend on the
+        // kernel's ephemeral TCP teardown timing.
+        let socket = TcpSocket::new_v4().unwrap();
+        socket.set_reuseaddr(true).unwrap();
+        socket.bind(self.addresses[index].parse().unwrap()).unwrap();
+        let listener = socket.listen(1024).unwrap();
         let node = RaftNode::new(
             self.ids[index],
             self.directories[index].path().join("raft"),
