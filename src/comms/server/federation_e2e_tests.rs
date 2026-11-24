@@ -23,7 +23,7 @@ use std::{
     pin::Pin,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     task::{Context, Poll},
     time::Duration,
@@ -263,9 +263,125 @@ where
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ChaosEvent {
+    Delay(u64),
+    Partition,
+    Heal,
+    DropCommitAck,
+    CrashSourceFollower,
+    RestartSourceFollower,
+    CrashTargetFollower,
+    RestartTargetFollower,
+    DuplicateReconcile,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ChaosConfig {
+    rounds: usize,
+    max_delay_ms: u64,
+    partition_weight: u32,
+    ack_loss_weight: u32,
+    crash_restart_weight: u32,
+    duplicate_reconcile_weight: u32,
+}
+
+impl Default for ChaosConfig {
+    fn default() -> Self {
+        Self {
+            rounds: 32,
+            max_delay_ms: 20,
+            partition_weight: 2,
+            ack_loss_weight: 2,
+            crash_restart_weight: 2,
+            duplicate_reconcile_weight: 2,
+        }
+    }
+}
+
+/// Small deterministic PRNG so a failing chaos sequence can be replayed by seed.
+struct ChaosScheduler {
+    seed: u64,
+    state: u64,
+    config: ChaosConfig,
+    emitted: usize,
+}
+
+impl ChaosScheduler {
+    fn new(seed: u64, config: ChaosConfig) -> Self {
+        assert!(
+            config.partition_weight
+                + config.ack_loss_weight
+                + config.crash_restart_weight
+                + config.duplicate_reconcile_weight
+                <= 10,
+            "chaos event weights must sum to at most 10"
+        );
+        Self {
+            seed,
+            state: if seed == 0 {
+                0x9e37_79b9_7f4a_7c15
+            } else {
+                seed
+            },
+            config,
+            emitted: 0,
+        }
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        // xorshift64*: deterministic across platforms and Rust versions.
+        let mut value = self.state;
+        value ^= value >> 12;
+        value ^= value << 25;
+        value ^= value >> 27;
+        self.state = value;
+        value.wrapping_mul(0x2545_f491_4f6c_dd1d)
+    }
+
+    fn next_event(&mut self) -> Option<ChaosEvent> {
+        if self.emitted >= self.config.rounds {
+            return None;
+        }
+        self.emitted += 1;
+        let bucket = self.next_u64() % 100;
+        let partition_end = self.config.partition_weight as u64 * 10;
+        let ack_end = partition_end + self.config.ack_loss_weight as u64 * 10;
+        let restart_end = ack_end + self.config.crash_restart_weight as u64 * 10;
+        let duplicate_end = restart_end + self.config.duplicate_reconcile_weight as u64 * 10;
+        let event = if bucket < partition_end {
+            if self.next_u64() & 1 == 0 {
+                ChaosEvent::Partition
+            } else {
+                ChaosEvent::Heal
+            }
+        } else if bucket < ack_end {
+            ChaosEvent::DropCommitAck
+        } else if bucket < restart_end {
+            match self.next_u64() % 4 {
+                0 => ChaosEvent::CrashSourceFollower,
+                1 => ChaosEvent::RestartSourceFollower,
+                2 => ChaosEvent::CrashTargetFollower,
+                _ => ChaosEvent::RestartTargetFollower,
+            }
+        } else if bucket < duplicate_end {
+            ChaosEvent::DuplicateReconcile
+        } else {
+            ChaosEvent::Delay(self.next_u64() % (self.config.max_delay_ms + 1))
+        };
+        Some(event)
+    }
+
+    fn seed(&self) -> u64 {
+        self.seed
+    }
+}
+
 struct TcpFaultProxy {
     endpoint: String,
     blocked: Arc<AtomicBool>,
+    delay_ms: Arc<AtomicU64>,
+    connections: Arc<Mutex<Vec<JoinHandle<()>>>>,
     task: JoinHandle<()>,
 }
 
@@ -277,34 +393,58 @@ impl TcpFaultProxy {
             listener.local_addr().unwrap().port()
         );
         let blocked = Arc::new(AtomicBool::new(false));
+        let delay_ms = Arc::new(AtomicU64::new(0));
+        let connections = Arc::new(Mutex::new(Vec::<JoinHandle<()>>::new()));
         let gate = blocked.clone();
+        let delay_gate = delay_ms.clone();
+        let active_connections = connections.clone();
         let task = tokio::spawn(async move {
             loop {
                 let Ok((mut inbound, _)) = listener.accept().await else {
                     break;
                 };
                 if gate.load(Ordering::SeqCst) {
-                    // A partition drops the full TCP stream in both directions.
                     drop(inbound);
                     continue;
                 }
                 let backend = backend.clone();
-                tokio::spawn(async move {
+                let delay_gate = delay_gate.clone();
+                let connection = tokio::spawn(async move {
+                    let delay = delay_gate.load(Ordering::SeqCst);
+                    if delay > 0 {
+                        tokio::time::sleep(Duration::from_millis(delay)).await;
+                    }
                     if let Ok(mut outbound) = tokio::net::TcpStream::connect(&backend).await {
                         let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
                     }
                 });
+                active_connections.lock().unwrap().push(connection);
             }
         });
         Self {
             endpoint,
             blocked,
+            delay_ms,
+            connections,
             task,
         }
     }
 
     fn set_partitioned(&self, partitioned: bool) {
         self.blocked.store(partitioned, Ordering::SeqCst);
+        if partitioned {
+            // Abort already-established bidirectional streams as well as
+            // rejecting new accepts: this models a real link break, not only
+            // a connection-establishment failure.
+            for connection in self.connections.lock().unwrap().drain(..) {
+                connection.abort();
+            }
+        }
+    }
+
+    fn set_delay(&self, delay: Duration) {
+        self.delay_ms
+            .store(delay.as_millis() as u64, Ordering::SeqCst);
     }
 }
 
@@ -382,6 +522,47 @@ async fn complete_remote_task(target: &TestRaftCluster, task_id: &str) {
         .await
         .unwrap();
     assert!(complete.success, "{}", complete.message);
+}
+
+#[test]
+fn federation_chaos_schedule_is_reproducible_and_bounded() {
+    let config = ChaosConfig {
+        rounds: 256,
+        max_delay_ms: 17,
+        ..ChaosConfig::default()
+    };
+    let mut first = ChaosScheduler::new(0xCAFE_BABE_2026, config);
+    let mut replay = ChaosScheduler::new(0xCAFE_BABE_2026, config);
+    let mut alternate_seed = ChaosScheduler::new(0xCAFE_BABE_2027, config);
+    let first_events = std::iter::from_fn(|| first.next_event()).collect::<Vec<_>>();
+    let replay_events = std::iter::from_fn(|| replay.next_event()).collect::<Vec<_>>();
+    let alternate_events = std::iter::from_fn(|| alternate_seed.next_event()).collect::<Vec<_>>();
+    assert_eq!(
+        first_events, replay_events,
+        "same seed must replay exact event order"
+    );
+    assert_eq!(first_events.len(), config.rounds);
+    assert_ne!(
+        first_events, alternate_events,
+        "different seeds should vary the schedule"
+    );
+    assert!(
+        first_events
+            .iter()
+            .any(|event| matches!(event, ChaosEvent::Delay(ms) if *ms <= config.max_delay_ms))
+    );
+    assert!(first_events.contains(&ChaosEvent::Partition));
+    assert!(first_events.contains(&ChaosEvent::Heal));
+    assert!(first_events.contains(&ChaosEvent::DropCommitAck));
+    assert!(first_events.contains(&ChaosEvent::CrashSourceFollower));
+    assert!(first_events.contains(&ChaosEvent::RestartSourceFollower));
+    assert!(first_events.contains(&ChaosEvent::CrashTargetFollower));
+    assert!(first_events.contains(&ChaosEvent::RestartTargetFollower));
+    assert!(first_events.contains(&ChaosEvent::DuplicateReconcile));
+    assert!(
+        first.next_event().is_none(),
+        "scheduler must stop at configured round count"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1031,16 +1212,94 @@ async fn federation_mtls_recovery_survives_two_source_and_target_leader_changes(
         .unwrap();
     assert_eq!(isolated.state, MigrationState::Committing);
 
-    // Repeatedly reconnect and repartition while the distributed commit is
-    // in-doubt. Every reconciliation under partition must remain retryable and
-    // must not create another target task or advance source state prematurely.
-    for cycle in 0..12 {
-        proxy.set_partitioned(false);
-        tokio::time::sleep(Duration::from_millis(15)).await;
-        proxy.set_partitioned(true);
-        second.reconcile_once().await.unwrap();
+    // Deterministic chaos schedule: every emitted event is reproducible from
+    // its seed. While the commit is in-doubt, an open link always loses its ACK;
+    // a partitioned link fails before reaching the target. This keeps the
+    // scenario in the recovery window until the schedule has been exhausted.
+    let config = ChaosConfig::default();
+    let mut chaos = ChaosScheduler::new(0xDADA_2026_1124, config);
+    let source_follower = (source_leader_2 + 1) % 3;
+    let target_follower = (target_leader_2 + 1) % 3;
+    let mut partitioned = true;
+    let mut source_follower_running = true;
+    let mut target_follower_running = true;
+    let mut event_log = Vec::new();
+    while let Some(event) = chaos.next_event() {
+        event_log.push(format!("{event:?}"));
+        match event {
+            ChaosEvent::Delay(milliseconds) => {
+                proxy.set_delay(Duration::from_millis(milliseconds));
+            }
+            ChaosEvent::Partition => {
+                partitioned = true;
+                proxy.set_partitioned(true);
+            }
+            ChaosEvent::Heal => {
+                partitioned = false;
+                proxy.set_partitioned(false);
+            }
+            ChaosEvent::DropCommitAck => {
+                faults.commit.store(true, Ordering::SeqCst);
+            }
+            ChaosEvent::CrashSourceFollower => {
+                if source_follower_running {
+                    source.stop(source_follower).await;
+                    source_follower_running = false;
+                }
+            }
+            ChaosEvent::RestartSourceFollower => {
+                if !source_follower_running {
+                    source.restart(source_follower).await;
+                    source_follower_running = true;
+                    source
+                        .wait_replicated_migration(
+                            "ha-leader-change-migration",
+                            MigrationState::Committing,
+                        )
+                        .await;
+                }
+            }
+            ChaosEvent::CrashTargetFollower => {
+                if target_follower_running {
+                    target.stop(target_follower).await;
+                    target_follower_running = false;
+                }
+            }
+            ChaosEvent::RestartTargetFollower => {
+                if !target_follower_running {
+                    target.restart(target_follower).await;
+                    target_follower_running = true;
+                    target
+                        .wait_replicated_remote_operation(
+                            "ha-leader-change-migration",
+                            0,
+                            FederatedRemoteOperationState::Committed,
+                        )
+                        .await;
+                }
+            }
+            ChaosEvent::DuplicateReconcile => {
+                // Duplicate retries are exercised while isolated so neither
+                // call can accidentally close the in-doubt commit window.
+                partitioned = true;
+                proxy.set_partitioned(true);
+                let leader = source.wait_for_leader(None).await;
+                let replay = orchestrator(leader, &source);
+                replay.reconcile_once().await.unwrap();
+                replay.reconcile_once().await.unwrap();
+            }
+        }
+
+        let leader = source.wait_for_leader(None).await;
+        let current_orchestrator = orchestrator(leader, &source);
+        if !partitioned {
+            // Force one durable target commit with a lost response. A duplicate
+            // Commit is idempotent and must not create another remote task.
+            faults.commit.store(true, Ordering::SeqCst);
+        }
+        current_orchestrator.reconcile_once().await.unwrap();
         let current = source
-            .task_store(source_leader_2)
+            .task_store(leader)
             .get_federated_migration("ha-leader-change-migration")
             .await
             .unwrap()
@@ -1048,7 +1307,9 @@ async fn federation_mtls_recovery_survives_two_source_and_target_leader_changes(
         assert_eq!(
             current.state,
             MigrationState::Committing,
-            "partition cycle {cycle} must not falsely complete migration"
+            "seed {} event {} ({event:?}) must remain in-doubt; log={event_log:?}",
+            chaos.seed(),
+            event_log.len()
         );
         assert_eq!(
             target
@@ -1057,11 +1318,35 @@ async fn federation_mtls_recovery_survives_two_source_and_target_leader_changes(
                 .await
                 .unwrap()
                 .len(),
-            1
+            1,
+            "seed {} event {} duplicated remote task; log={event_log:?}",
+            chaos.seed(),
+            event_log.len()
         );
+        proxy.set_delay(Duration::ZERO);
+    }
+    if !source_follower_running {
+        source.restart(source_follower).await;
+    }
+    if !target_follower_running {
+        target.restart(target_follower).await;
     }
     proxy.set_partitioned(false);
     second.reconcile_once().await.unwrap();
+    target
+        .wait_replicated_remote_operation(
+            "ha-leader-change-migration",
+            0,
+            FederatedRemoteOperationState::Committed,
+        )
+        .await;
+    for member in 0..3 {
+        assert_eq!(
+            target.task_store(member).list_tasks().await.unwrap().len(),
+            1,
+            "target member {member} must converge to exactly one provisioned task"
+        );
+    }
     source
         .wait_replicated_migration("ha-leader-change-migration", MigrationState::Completed)
         .await;
@@ -1238,6 +1523,7 @@ async fn federation_mtls_recovery_survives_two_source_and_target_leader_changes(
         "stale fencing token changed committed shard data"
     );
 
+    proxy.set_partitioned(true);
     proxy.task.abort();
     shutdown.cancel();
     let _ = server.await;
