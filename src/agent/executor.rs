@@ -51,6 +51,8 @@ pub struct ShardExecutor<S: KvStore> {
     index_store: Arc<RwLock<TieredIndexStore<S>>>,
     batch_size: usize,
     raft: Option<Arc<RaftNode>>,
+    #[cfg(test)]
+    crash_after_sink_before_delivery: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl<S: KvStore + Clone + 'static> Clone for ShardExecutor<S> {
@@ -60,6 +62,8 @@ impl<S: KvStore + Clone + 'static> Clone for ShardExecutor<S> {
             index_store: self.index_store.clone(),
             batch_size: self.batch_size,
             raft: self.raft.clone(),
+            #[cfg(test)]
+            crash_after_sink_before_delivery: self.crash_after_sink_before_delivery.clone(),
         }
     }
 }
@@ -74,6 +78,8 @@ impl<S: KvStore + Clone + 'static> ShardExecutor<S> {
             index_store,
             batch_size: 1000, // Default batch size
             raft: None,
+            #[cfg(test)]
+            crash_after_sink_before_delivery: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -85,6 +91,26 @@ impl<S: KvStore + Clone + 'static> ShardExecutor<S> {
         let mut executor = Self::new(task_store, index_store);
         executor.raft = Some(raft);
         executor
+    }
+
+    #[cfg(test)]
+    fn inject_crash_after_sink_before_delivery_once(&self) {
+        self.crash_after_sink_before_delivery
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn maybe_inject_crash_after_sink_before_delivery(&self) -> Result<()> {
+        #[cfg(test)]
+        if self
+            .crash_after_sink_before_delivery
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(DatspoolError::Internal(
+                "injected worker crash after destination commit and before Raft delivery record"
+                    .into(),
+            ));
+        }
+        Ok(())
     }
 
     pub fn with_batch_size(mut self, batch_size: usize) -> Self {
@@ -385,6 +411,7 @@ impl<S: KvStore + Clone + 'static> ShardExecutor<S> {
                             None => sink_ref.write_batch(batch).await?,
                         }
                     };
+                    executor.maybe_inject_crash_after_sink_before_delivery()?;
                     if write.rejected_count > 0 || write.failed_count > write.failed_records.len() {
                         return Err(crate::error::DatspoolError::Internal(format!(
                             "cached batch delivery still has retryable/unclassified failures: {} failed, {} rejected: {}",
@@ -582,6 +609,7 @@ impl<S: KvStore + Clone + 'static> ShardExecutor<S> {
                                 None => sink_ref.write_batch(cached_batch).await?,
                             }
                         };
+                        executor.maybe_inject_crash_after_sink_before_delivery()?;
                         if write.rejected_count > 0
                             || write.failed_count > write.failed_records.len()
                         {
@@ -986,6 +1014,259 @@ mod tests {
         fn sink_type(&self) -> &str {
             "close-tracking-test"
         }
+    }
+
+    struct OneBatchSource {
+        emitted: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl Source for OneBatchSource {
+        async fn connect(&mut self) -> Result<()> {
+            Ok(())
+        }
+        async fn read_batch(
+            &mut self,
+            _offset: &OffsetValue,
+            _batch_size: usize,
+        ) -> Result<(RecordBatch, OffsetValue)> {
+            if self.emitted {
+                return Ok((RecordBatch::new(), OffsetValue::DocumentCount(1)));
+            }
+            self.emitted = true;
+            let mut batch = RecordBatch::new();
+            batch.push(crate::pipeline::Record::with_id(
+                "doc-1",
+                "crash-test",
+                serde_json::json!({"v": 1}),
+            ));
+            Ok((batch, OffsetValue::DocumentCount(1)))
+        }
+        async fn estimate_count(&self) -> Result<Option<u64>> {
+            Ok(Some(1))
+        }
+        async fn close(&mut self) -> Result<()> {
+            Ok(())
+        }
+        fn source_type(&self) -> &str {
+            "crash-test"
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct DurableTarget(
+        Arc<std::sync::Mutex<std::collections::HashMap<String, serde_json::Value>>>,
+    );
+
+    #[async_trait::async_trait]
+    impl Sink for DurableTarget {
+        async fn connect(&mut self) -> Result<()> {
+            Ok(())
+        }
+        async fn write_batch(&mut self, batch: RecordBatch) -> Result<WriteResult> {
+            let mut docs = self.0.lock().unwrap();
+            for record in batch.into_records() {
+                docs.entry(record.id.unwrap()).or_insert(record.payload);
+            }
+            let count = docs.len();
+            Ok(WriteResult::success(count, 16))
+        }
+        async fn flush(&mut self) -> Result<()> {
+            Ok(())
+        }
+        async fn close(&mut self) -> Result<()> {
+            Ok(())
+        }
+        fn sink_type(&self) -> &str {
+            "durable-target-test"
+        }
+    }
+
+    #[tokio::test]
+    async fn shard_executor_recovers_after_destination_commit_before_raft_delivery_ack() {
+        use crate::agent::ShardClaimer;
+        use crate::raft::{Command, RaftNode, default_raft_config};
+        use crate::task::{ShardMeta, TaskMeta};
+        use chrono::Utc;
+        use openraft::BasicNode;
+        use std::collections::BTreeMap;
+
+        let dir = tempdir().unwrap();
+        let db = RocksDbStore::open(dir.path().join("app")).unwrap();
+        let store = Arc::new(TaskStore::new(db.clone()));
+        let token = "executor-crash-test-token-0123456789".to_string();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let raft_path = dir.path().join("raft");
+        let raft = RaftNode::new(
+            1,
+            &raft_path,
+            (*store).clone(),
+            default_raft_config(),
+            token.clone(),
+        )
+        .await
+        .unwrap();
+        let router = crate::raft_router(raft.handle(), token.clone());
+        let rpc = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        raft.initialize(BTreeMap::from([(1, BasicNode::new(address.to_string()))]))
+            .await
+            .unwrap();
+        raft.wait_for_leader(std::time::Duration::from_secs(10))
+            .await
+            .unwrap();
+
+        let task = TaskMeta::new("executor-crash-recovery".into(), "{}".into(), "{}".into());
+        let shard = ShardMeta::new(task.task_id, 0, "{}".into());
+        let shard_id = shard.shard_id;
+        let created = raft
+            .propose(Command::CreateTask {
+                request_id: format!("create:{}", task.task_id),
+                actor: "test".into(),
+                task: Box::new(task),
+                shards: vec![shard.clone()],
+            })
+            .await
+            .unwrap();
+        assert!(created.success, "{}", created.message);
+
+        let claimer = ShardClaimer::new("worker-a".into(), store.clone(), Arc::new(raft.clone()))
+            .with_lease_seconds(3)
+            .unwrap();
+        let first_lease = claimer.try_claim().await.unwrap().unwrap();
+        let index_store = Arc::new(RwLock::new(TieredIndexStore::new(
+            TieredConfig::default(),
+            Arc::new(db.clone()),
+        )));
+        let first_executor = ShardExecutor::new_with_raft(
+            store.clone(),
+            index_store.clone(),
+            Arc::new(raft.clone()),
+        );
+        first_executor.inject_crash_after_sink_before_delivery_once();
+        let target = DurableTarget::default();
+        let mut source = OneBatchSource { emitted: false };
+        let mut sink = target.clone();
+        let first_result = first_executor
+            .execute_pipeline_with_lease(
+                &shard,
+                &mut source,
+                &mut sink,
+                Some(first_lease.clone()),
+                CancellationToken::new(),
+                None,
+            )
+            .await;
+        assert!(
+            first_result.is_err(),
+            "fault injection must stop the worker before RecordBatchDelivery"
+        );
+        assert_eq!(
+            target.0.lock().unwrap().len(),
+            1,
+            "destination commit must survive worker failure"
+        );
+        let before = store.get_shard(&shard_id).await.unwrap().unwrap();
+        assert_eq!(
+            before.records_processed, 0,
+            "checkpoint must not advance before Raft delivery record"
+        );
+        let batch_id = format!("{:016x}-{:06x}", first_lease.fencing_token, 0);
+        let manifest_key =
+            crate::pipeline::cache::BatchManifest::key(&shard_id.to_string(), &batch_id);
+        let manifest_bytes = store
+            .kv_store()
+            .get_cf(crate::storage::cf::META, &manifest_key)
+            .await
+            .unwrap()
+            .unwrap();
+        let manifest: crate::pipeline::cache::BatchManifest =
+            serde_json::from_slice(&manifest_bytes).unwrap();
+        assert_eq!(
+            manifest.status,
+            crate::pipeline::cache::BatchManifestStatus::Prepared
+        );
+
+        // Restart the Raft node and construct a fresh executor, preserving only durable storage + target data.
+        drop(first_executor);
+        rpc.abort();
+        let _ = rpc.await;
+        raft.shutdown().await.unwrap();
+        drop(raft);
+        let wait = (first_lease.expires_at - Utc::now())
+            .to_std()
+            .unwrap_or_default()
+            + std::time::Duration::from_millis(100);
+        tokio::time::sleep(wait).await;
+        let listener = tokio::net::TcpListener::bind(address).await.unwrap();
+        let restarted = RaftNode::new(
+            1,
+            &raft_path,
+            (*store).clone(),
+            default_raft_config(),
+            token.clone(),
+        )
+        .await
+        .unwrap();
+        let router = crate::raft_router(restarted.handle(), token);
+        let restarted_rpc = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        restarted
+            .wait_for_leader(std::time::Duration::from_secs(10))
+            .await
+            .unwrap();
+        let next_claimer = ShardClaimer::new(
+            "worker-b".into(),
+            store.clone(),
+            Arc::new(restarted.clone()),
+        )
+        .with_lease_seconds(3)
+        .unwrap();
+        let next_lease = next_claimer.try_claim().await.unwrap().unwrap();
+        assert!(next_lease.fencing_token > first_lease.fencing_token);
+
+        let recovered_executor =
+            ShardExecutor::new_with_raft(store.clone(), index_store, Arc::new(restarted.clone()));
+        let mut resumed_source = OneBatchSource { emitted: true };
+        let mut resumed_sink = target.clone();
+        recovered_executor
+            .execute_pipeline_with_lease(
+                &store.get_shard(&shard_id).await.unwrap().unwrap(),
+                &mut resumed_source,
+                &mut resumed_sink,
+                Some(next_lease),
+                CancellationToken::new(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            target.0.lock().unwrap().len(),
+            1,
+            "replaying the committed batch must be idempotent"
+        );
+        let after = store.get_shard(&shard_id).await.unwrap().unwrap();
+        assert_eq!(after.records_processed, 1);
+        assert_eq!(after.offset, OffsetValue::DocumentCount(1));
+        let manifest_bytes = store
+            .kv_store()
+            .get_cf(crate::storage::cf::META, &manifest_key)
+            .await
+            .unwrap()
+            .unwrap();
+        let manifest: crate::pipeline::cache::BatchManifest =
+            serde_json::from_slice(&manifest_bytes).unwrap();
+        assert_eq!(
+            manifest.status,
+            crate::pipeline::cache::BatchManifestStatus::Acknowledged
+        );
+
+        restarted_rpc.abort();
+        let _ = restarted_rpc.await;
+        restarted.shutdown().await.unwrap();
     }
 
     #[tokio::test]
