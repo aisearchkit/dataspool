@@ -273,7 +273,11 @@ async fn main() -> Result<()> {
         );
     }
 
-    let server = axum::serve(listener, api.router())
+    let api_router = match raft_node.as_ref() {
+        Some(raft) => api.with_raft(Arc::new(raft.clone())).router(),
+        None => api.router(),
+    };
+    let server = axum::serve(listener, api_router)
         .with_graceful_shutdown(wait_for_shutdown(shutdown.clone()));
     let server_result = server
         .await

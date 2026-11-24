@@ -17,7 +17,9 @@ use subtle::ConstantTimeEq;
 
 use crate::{
     drivers::factory::{SinkConfig, create_sink},
+    federation::{FederatedCluster, FederatedClusterStatus, FederatedMigration, MigrationState},
     pipeline::{DeadLetterEntry, DeadLetterQueue},
+    raft::{Command, RaftNode},
     storage::KvStore,
     task::TaskStore,
     types::{ShardId, TaskId},
@@ -32,6 +34,7 @@ struct ApiState<S: KvStore + Clone> {
     tasks: Arc<TaskStore<S>>,
     token: Arc<[u8]>,
     operation_lock: Arc<tokio::sync::Mutex<()>>,
+    raft: Option<Arc<RaftNode>>,
 }
 
 /// DLQ REST API. The UI shell is public; every data endpoint requires a bearer token.
@@ -53,8 +56,14 @@ impl<S: KvStore + Clone + 'static> DlqApi<S> {
                 tasks,
                 token: Arc::from(token.into_bytes()),
                 operation_lock: Arc::new(tokio::sync::Mutex::new(())),
+                raft: None,
             },
         })
+    }
+
+    pub fn with_raft(mut self, raft: Arc<RaftNode>) -> Self {
+        self.state.raft = Some(raft);
+        self
     }
 
     pub fn router(self) -> Router {
@@ -74,6 +83,26 @@ impl<S: KvStore + Clone + 'static> DlqApi<S> {
             .route("/metrics", get(metrics))
             .route("/api/v1/audit", get(list_audit_events))
             .route("/api/v1/alerts/sla", get(list_sla_alerts))
+            .route(
+                "/api/v1/federation/clusters",
+                get(list_federated_clusters).post(register_federated_cluster),
+            )
+            .route(
+                "/api/v1/federation/clusters/{cluster_id}/heartbeat",
+                post(heartbeat_federated_cluster),
+            )
+            .route(
+                "/api/v1/federation/migrations",
+                get(list_federated_migrations).post(create_federated_migration),
+            )
+            .route(
+                "/api/v1/federation/migrations/{migration_id}",
+                get(get_federated_migration),
+            )
+            .route(
+                "/api/v1/federation/migrations/{migration_id}/transition",
+                post(transition_federated_migration),
+            )
             .route_layer(middleware::from_fn_with_state(
                 self.state.clone(),
                 authorize::<S>,
@@ -98,6 +127,205 @@ async fn list_audit_events<S: KvStore + Clone>(
         .await
     {
         Ok(events) => Json(events).into_response(),
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct RegisterFederatedClusterRequest {
+    cluster_id: String,
+    endpoint: String,
+    identity_fingerprint: String,
+    version: String,
+    #[serde(default)]
+    capabilities: std::collections::BTreeSet<String>,
+    request_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateFederatedMigrationRequest {
+    migration_id: String,
+    source_cluster: String,
+    target_cluster: String,
+    task_id: String,
+    #[serde(default)]
+    required_capabilities: std::collections::BTreeSet<String>,
+    request_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct TransitionFederatedMigrationRequest {
+    next_state: MigrationState,
+    expected_generation: u64,
+    request_id: String,
+    error: Option<String>,
+}
+
+fn request_actor(headers: &axum::http::HeaderMap) -> String {
+    headers
+        .get("x-dataspool-actor")
+        .and_then(|v| v.to_str().ok())
+        .filter(|v| !v.trim().is_empty() && v.len() <= 128)
+        .unwrap_or("anonymous")
+        .to_string()
+}
+
+async fn register_federated_cluster<S: KvStore + Clone>(
+    State(state): State<ApiState<S>>,
+    headers: axum::http::HeaderMap,
+    Json(request): Json<RegisterFederatedClusterRequest>,
+) -> Response {
+    let Some(raft) = state.raft else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let now = chrono::Utc::now().timestamp_millis();
+    let cluster = FederatedCluster {
+        cluster_id: request.cluster_id,
+        endpoint: request.endpoint,
+        identity_fingerprint: request.identity_fingerprint,
+        version: request.version,
+        capabilities: request.capabilities,
+        status: FederatedClusterStatus::Healthy,
+        last_seen_at_ms: now,
+        updated_at_ms: now,
+    };
+    match raft
+        .propose(Command::UpsertFederatedCluster {
+            cluster,
+            request_id: request.request_id,
+            actor: request_actor(&headers),
+        })
+        .await
+    {
+        Ok(response) if response.success => Json(response).into_response(),
+        Ok(response) => (StatusCode::CONFLICT, Json(response)).into_response(),
+        Err(error) => (StatusCode::BAD_GATEWAY, error.to_string()).into_response(),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct FederatedHeartbeatRequest {
+    identity_fingerprint: String,
+    status: FederatedClusterStatus,
+    request_id: String,
+}
+
+async fn heartbeat_federated_cluster<S: KvStore + Clone>(
+    State(state): State<ApiState<S>>,
+    Path(cluster_id): Path<String>,
+    headers: axum::http::HeaderMap,
+    Json(request): Json<FederatedHeartbeatRequest>,
+) -> Response {
+    let Some(raft) = state.raft else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match raft
+        .propose(Command::HeartbeatFederatedCluster {
+            cluster_id,
+            identity_fingerprint: request.identity_fingerprint,
+            status: request.status,
+            last_seen_at_ms: chrono::Utc::now().timestamp_millis(),
+            request_id: request.request_id,
+            actor: request_actor(&headers),
+        })
+        .await
+    {
+        Ok(response) if response.success => Json(response).into_response(),
+        Ok(response) => (StatusCode::CONFLICT, Json(response)).into_response(),
+        Err(error) => (StatusCode::BAD_GATEWAY, error.to_string()).into_response(),
+    }
+}
+
+async fn create_federated_migration<S: KvStore + Clone>(
+    State(state): State<ApiState<S>>,
+    headers: axum::http::HeaderMap,
+    Json(request): Json<CreateFederatedMigrationRequest>,
+) -> Response {
+    let Some(raft) = state.raft else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let now = chrono::Utc::now().timestamp_millis();
+    let migration = FederatedMigration {
+        migration_id: request.migration_id,
+        source_cluster: request.source_cluster,
+        target_cluster: request.target_cluster,
+        task_id: request.task_id,
+        required_capabilities: request.required_capabilities,
+        state: MigrationState::Planned,
+        generation: 0,
+        created_at_ms: now,
+        updated_at_ms: now,
+        last_error: None,
+    };
+    match raft
+        .propose(Command::CreateFederatedMigration {
+            migration,
+            request_id: request.request_id,
+            actor: request_actor(&headers),
+        })
+        .await
+    {
+        Ok(response) if response.success => Json(response).into_response(),
+        Ok(response) => (StatusCode::CONFLICT, Json(response)).into_response(),
+        Err(error) => (StatusCode::BAD_GATEWAY, error.to_string()).into_response(),
+    }
+}
+
+async fn transition_federated_migration<S: KvStore + Clone>(
+    State(state): State<ApiState<S>>,
+    Path(migration_id): Path<String>,
+    headers: axum::http::HeaderMap,
+    Json(request): Json<TransitionFederatedMigrationRequest>,
+) -> Response {
+    let Some(raft) = state.raft else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match raft
+        .propose(Command::TransitionFederatedMigration {
+            migration_id,
+            next_state: request.next_state,
+            expected_generation: request.expected_generation,
+            at_ms: chrono::Utc::now().timestamp_millis(),
+            error: request.error,
+            request_id: request.request_id,
+            actor: request_actor(&headers),
+        })
+        .await
+    {
+        Ok(response) if response.success => Json(response).into_response(),
+        Ok(response) => (StatusCode::CONFLICT, Json(response)).into_response(),
+        Err(error) => (StatusCode::BAD_GATEWAY, error.to_string()).into_response(),
+    }
+}
+
+async fn list_federated_clusters<S: KvStore + Clone>(State(state): State<ApiState<S>>) -> Response {
+    match state.tasks.list_federated_clusters().await {
+        Ok(clusters) => {
+            Json(serde_json::json!({"clusters": clusters, "total": clusters.len()})).into_response()
+        }
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+    }
+}
+
+async fn list_federated_migrations<S: KvStore + Clone>(
+    State(state): State<ApiState<S>>,
+) -> Response {
+    match state.tasks.list_federated_migrations().await {
+        Ok(migrations) => {
+            Json(serde_json::json!({"migrations": migrations, "total": migrations.len()}))
+                .into_response()
+        }
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+    }
+}
+
+async fn get_federated_migration<S: KvStore + Clone>(
+    State(state): State<ApiState<S>>,
+    Path(migration_id): Path<String>,
+) -> Response {
+    match state.tasks.get_federated_migration(&migration_id).await {
+        Ok(Some(migration)) => Json(migration).into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
     }
 }

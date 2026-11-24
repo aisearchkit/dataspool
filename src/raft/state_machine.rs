@@ -294,10 +294,345 @@ impl<S: KvStore + Clone> MetaStateMachine<S> {
                 self.apply_control_node(node_id, paused, request_id, actor)
                     .await
             }
+            Command::UpsertFederatedCluster {
+                cluster,
+                request_id,
+                actor,
+            } => {
+                self.apply_federated_cluster(cluster, request_id, actor)
+                    .await
+            }
+            Command::CreateFederatedMigration {
+                migration,
+                request_id,
+                actor,
+            } => {
+                self.apply_federated_migration(migration, request_id, actor)
+                    .await
+            }
+            Command::HeartbeatFederatedCluster {
+                cluster_id,
+                identity_fingerprint,
+                status,
+                last_seen_at_ms,
+                request_id,
+                actor,
+            } => {
+                self.apply_federated_heartbeat(
+                    cluster_id,
+                    identity_fingerprint,
+                    status,
+                    last_seen_at_ms,
+                    request_id,
+                    actor,
+                )
+                .await
+            }
+            Command::TransitionFederatedMigration {
+                migration_id,
+                next_state,
+                expected_generation,
+                at_ms,
+                error,
+                request_id,
+                actor,
+            } => {
+                self.apply_federated_transition(
+                    migration_id,
+                    next_state,
+                    expected_generation,
+                    at_ms,
+                    error,
+                    request_id,
+                    actor,
+                )
+                .await
+            }
             Command::UpdateTaskState { .. }
             | Command::DeleteTask { .. }
             | Command::UpdateConfig { .. } => Ok(rejected("Command is not implemented")),
         }
+    }
+
+    async fn apply_federated_cluster(
+        &self,
+        cluster: crate::federation::FederatedCluster,
+        request_id: String,
+        actor: String,
+    ) -> Result<CommandResponse> {
+        use crate::federation::validate_cluster;
+        if request_id.trim().is_empty() || request_id.len() > 128 {
+            return Ok(rejected("request_id must contain 1-128 characters"));
+        }
+        if let Err(message) = validate_cluster(&cluster) {
+            return Ok(rejected(&message));
+        }
+        let payload = format!(
+            "federated-cluster:{}",
+            serde_json::json!({"cluster_id": cluster.cluster_id, "endpoint": cluster.endpoint, "identity_fingerprint": cluster.identity_fingerprint, "version": cluster.version, "capabilities": cluster.capabilities})
+        );
+        if let Some(existing) = self.task_store.get_control_request(&request_id).await? {
+            return if existing == payload {
+                Ok(accepted(
+                    "Federated cluster registration already applied",
+                    serde_json::json!({"cluster_id": cluster.cluster_id}),
+                ))
+            } else {
+                Ok(rejected(
+                    "request_id was already used with a different payload",
+                ))
+            };
+        }
+        if let Some(existing) = self
+            .task_store
+            .get_federated_cluster(&cluster.cluster_id)
+            .await?
+            && existing.identity_fingerprint != cluster.identity_fingerprint
+        {
+            return Ok(rejected(
+                "cluster identity fingerprint is immutable; use a new cluster_id for a new identity",
+            ));
+        }
+        let key = format!("federated_cluster:{}", cluster.cluster_id);
+        let data = serde_json::to_value(&cluster)?;
+        let audit = self.audit_event(
+            &actor,
+            &request_id,
+            "federated_cluster.upsert",
+            &cluster.cluster_id,
+            "registered",
+            "registered",
+        );
+        self.task_store
+            .save_federated_control(
+                &request_id,
+                &payload,
+                key,
+                serde_json::to_vec(&cluster)?,
+                audit,
+            )
+            .await?;
+        Ok(accepted("Federated cluster registered", data))
+    }
+
+    async fn apply_federated_heartbeat(
+        &self,
+        cluster_id: String,
+        identity_fingerprint: String,
+        status: crate::federation::FederatedClusterStatus,
+        last_seen_at_ms: i64,
+        request_id: String,
+        actor: String,
+    ) -> Result<CommandResponse> {
+        if request_id.trim().is_empty() || request_id.len() > 128 {
+            return Ok(rejected("request_id must contain 1-128 characters"));
+        }
+        let mut cluster = match self.task_store.get_federated_cluster(&cluster_id).await? {
+            Some(value) => value,
+            None => return Ok(rejected("federated cluster not found")),
+        };
+        if cluster.identity_fingerprint != identity_fingerprint {
+            return Ok(rejected("federated cluster identity fingerprint mismatch"));
+        }
+        let payload = format!("federated-heartbeat:{cluster_id}:{identity_fingerprint}:{status:?}");
+        if let Some(existing) = self.task_store.get_control_request(&request_id).await? {
+            return if existing == payload {
+                Ok(accepted(
+                    "Federated cluster heartbeat already applied",
+                    serde_json::json!({"cluster_id": cluster_id, "status": cluster.status}),
+                ))
+            } else {
+                Ok(rejected(
+                    "request_id was already used with a different payload",
+                ))
+            };
+        }
+        if last_seen_at_ms < cluster.last_seen_at_ms {
+            return Ok(rejected("stale federated cluster heartbeat"));
+        }
+        let from = format!("{:?}", cluster.status).to_lowercase();
+        cluster.status = status;
+        cluster.last_seen_at_ms = last_seen_at_ms;
+        cluster.updated_at_ms = last_seen_at_ms;
+        let to = format!("{:?}", cluster.status).to_lowercase();
+        let audit = self.audit_event(
+            &actor,
+            &request_id,
+            "federated_cluster.heartbeat",
+            &cluster_id,
+            &from,
+            &to,
+        );
+        let data = serde_json::to_value(&cluster)?;
+        self.task_store
+            .save_federated_control(
+                &request_id,
+                &payload,
+                format!("federated_cluster:{cluster_id}"),
+                serde_json::to_vec(&cluster)?,
+                audit,
+            )
+            .await?;
+        Ok(accepted("Federated cluster heartbeat accepted", data))
+    }
+
+    async fn apply_federated_migration(
+        &self,
+        migration: crate::federation::FederatedMigration,
+        request_id: String,
+        actor: String,
+    ) -> Result<CommandResponse> {
+        if request_id.trim().is_empty()
+            || request_id.len() > 128
+            || migration.migration_id.trim().is_empty()
+            || migration.task_id.trim().is_empty()
+        {
+            return Ok(rejected(
+                "migration_id, task_id and request_id are required",
+            ));
+        }
+        let payload = format!(
+            "federated-migration:{}",
+            serde_json::json!({"migration_id": migration.migration_id, "source_cluster": migration.source_cluster, "target_cluster": migration.target_cluster, "task_id": migration.task_id, "required_capabilities": migration.required_capabilities})
+        );
+        if let Some(existing) = self.task_store.get_control_request(&request_id).await? {
+            return if existing == payload {
+                Ok(accepted(
+                    "Federated migration already created",
+                    serde_json::json!({"migration_id": migration.migration_id}),
+                ))
+            } else {
+                Ok(rejected(
+                    "request_id was already used with a different payload",
+                ))
+            };
+        }
+        if migration.source_cluster == migration.target_cluster {
+            return Ok(rejected("source and target clusters must differ"));
+        }
+        for cluster_id in [&migration.source_cluster, &migration.target_cluster] {
+            match self.task_store.get_federated_cluster(cluster_id).await? {
+                Some(cluster)
+                    if cluster.status != crate::federation::FederatedClusterStatus::Offline => {}
+                _ => {
+                    return Ok(rejected(&format!(
+                        "cluster '{cluster_id}' is not registered or is offline"
+                    )));
+                }
+            }
+        }
+        for cluster_id in [&migration.source_cluster, &migration.target_cluster] {
+            let cluster = self
+                .task_store
+                .get_federated_cluster(cluster_id)
+                .await?
+                .expect("cluster was validated above");
+            if !migration
+                .required_capabilities
+                .is_subset(&cluster.capabilities)
+            {
+                return Ok(rejected(&format!(
+                    "cluster '{cluster_id}' does not satisfy required migration capabilities"
+                )));
+            }
+        }
+        if migration.state != crate::federation::MigrationState::Planned
+            || migration.generation != 0
+        {
+            return Ok(rejected(
+                "new migrations must start in planned state at generation 0",
+            ));
+        }
+        if self
+            .task_store
+            .get_federated_migration(&migration.migration_id)
+            .await?
+            .is_some()
+        {
+            return Ok(rejected("migration_id already exists"));
+        }
+        let audit = self.audit_event(
+            &actor,
+            &request_id,
+            "federated_migration.create",
+            &migration.migration_id,
+            "none",
+            "planned",
+        );
+        let data = serde_json::to_value(&migration)?;
+        self.task_store
+            .save_federated_control(
+                &request_id,
+                &payload,
+                format!("federated_migration:{}", migration.migration_id),
+                serde_json::to_vec(&migration)?,
+                audit,
+            )
+            .await?;
+        Ok(accepted("Federated migration created", data))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn apply_federated_transition(
+        &self,
+        migration_id: String,
+        next_state: crate::federation::MigrationState,
+        expected_generation: u64,
+        at_ms: i64,
+        error: Option<String>,
+        request_id: String,
+        actor: String,
+    ) -> Result<CommandResponse> {
+        if request_id.trim().is_empty() || request_id.len() > 128 {
+            return Ok(rejected("request_id must contain 1-128 characters"));
+        }
+        let mut migration = match self
+            .task_store
+            .get_federated_migration(&migration_id)
+            .await?
+        {
+            Some(value) => value,
+            None => return Ok(rejected("federated migration not found")),
+        };
+        let from = format!("{:?}", migration.state).to_lowercase();
+        let payload = format!(
+            "federated-transition:{migration_id}:{next_state:?}:{expected_generation}:{error:?}"
+        );
+        if let Some(existing) = self.task_store.get_control_request(&request_id).await? {
+            return if existing == payload {
+                Ok(accepted(
+                    "Federated migration transition already applied",
+                    serde_json::json!({"migration_id": migration_id, "state": migration.state, "generation": migration.generation}),
+                ))
+            } else {
+                Ok(rejected(
+                    "request_id was already used with a different payload",
+                ))
+            };
+        }
+        if let Err(message) = migration.transition(next_state, expected_generation, at_ms, error) {
+            return Ok(rejected(&message));
+        }
+        let to = format!("{:?}", migration.state).to_lowercase();
+        let audit = self.audit_event(
+            &actor,
+            &request_id,
+            "federated_migration.transition",
+            &migration_id,
+            &from,
+            &to,
+        );
+        let data = serde_json::to_value(&migration)?;
+        self.task_store
+            .save_federated_control(
+                &request_id,
+                &payload,
+                format!("federated_migration:{migration_id}"),
+                serde_json::to_vec(&migration)?,
+                audit,
+            )
+            .await?;
+        Ok(accepted("Federated migration state advanced", data))
     }
 
     fn audit_event(
@@ -1505,6 +1840,220 @@ mod tests {
     use crate::storage::RocksDbStore;
     use crate::task::{ShardMeta, TaskMeta};
     use tempfile::tempdir;
+
+    fn federated_cluster(id: &str) -> crate::federation::FederatedCluster {
+        crate::federation::FederatedCluster {
+            cluster_id: id.into(),
+            endpoint: format!("https://{id}.example.com:9443"),
+            identity_fingerprint: "a".repeat(64),
+            version: "0.1.0".into(),
+            capabilities: [
+                "elasticsearch-source".to_string(),
+                "elasticsearch-sink".to_string(),
+            ]
+            .into_iter()
+            .collect(),
+            status: crate::federation::FederatedClusterStatus::Healthy,
+            last_seen_at_ms: 100,
+            updated_at_ms: 100,
+        }
+    }
+
+    #[tokio::test]
+    async fn federated_registry_is_replicated_idempotent_and_identity_pinned() {
+        let dir = tempdir().unwrap();
+        let db = RocksDbStore::open(dir.path()).unwrap();
+        let store = TaskStore::new(db);
+        let mut sm = MetaStateMachine::new(store.kv_store().clone());
+        let command = Command::UpsertFederatedCluster {
+            cluster: federated_cluster("west"),
+            request_id: "register-west".into(),
+            actor: "operator".into(),
+        };
+        assert!(
+            sm.apply_command_at(command.clone(), 41)
+                .await
+                .unwrap()
+                .success
+        );
+        assert!(sm.apply_command_at(command, 42).await.unwrap().success);
+        assert_eq!(store.list_federated_clusters().await.unwrap().len(), 1);
+        let mut changed = federated_cluster("west");
+        changed.identity_fingerprint = "b".repeat(64);
+        let response = sm
+            .apply_command(Command::UpsertFederatedCluster {
+                cluster: changed,
+                request_id: "rotate-west".into(),
+                actor: "operator".into(),
+            })
+            .await
+            .unwrap();
+        assert!(!response.success);
+        let heartbeat = Command::HeartbeatFederatedCluster {
+            cluster_id: "west".into(),
+            identity_fingerprint: "a".repeat(64),
+            status: crate::federation::FederatedClusterStatus::Degraded,
+            last_seen_at_ms: 101,
+            request_id: "west-heartbeat-1".into(),
+            actor: "peer".into(),
+        };
+        assert!(
+            sm.apply_command_at(heartbeat.clone(), 43)
+                .await
+                .unwrap()
+                .success
+        );
+        assert!(sm.apply_command_at(heartbeat, 44).await.unwrap().success);
+        let saved = store.get_federated_cluster("west").await.unwrap().unwrap();
+        assert_eq!(
+            saved.status,
+            crate::federation::FederatedClusterStatus::Degraded
+        );
+        let stale = Command::HeartbeatFederatedCluster {
+            cluster_id: "west".into(),
+            identity_fingerprint: "a".repeat(64),
+            status: crate::federation::FederatedClusterStatus::Healthy,
+            last_seen_at_ms: 100,
+            request_id: "west-heartbeat-stale".into(),
+            actor: "peer".into(),
+        };
+        assert!(!sm.apply_command(stale).await.unwrap().success);
+        assert_eq!(store.list_audit_events(10).await.unwrap().len(), 2);
+        let snapshot = store.export_snapshot().await.unwrap();
+        let restored_dir = tempdir().unwrap();
+        let restored = TaskStore::new(RocksDbStore::open(restored_dir.path()).unwrap());
+        restored.replace_snapshot(snapshot).await.unwrap();
+        assert_eq!(
+            restored.list_federated_clusters().await.unwrap(),
+            store.list_federated_clusters().await.unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn federated_migration_state_machine_fences_stale_reports_and_retries() {
+        let dir = tempdir().unwrap();
+        let db = RocksDbStore::open(dir.path()).unwrap();
+        let store = TaskStore::new(db);
+        let mut sm = MetaStateMachine::new(store.kv_store().clone());
+        for id in ["source", "target"] {
+            assert!(
+                sm.apply_command(Command::UpsertFederatedCluster {
+                    cluster: federated_cluster(id),
+                    request_id: format!("register-{id}"),
+                    actor: "operator".into()
+                })
+                .await
+                .unwrap()
+                .success
+            );
+        }
+        let migration = crate::federation::FederatedMigration {
+            migration_id: "migration-1".into(),
+            source_cluster: "source".into(),
+            target_cluster: "target".into(),
+            task_id: "task-1".into(),
+            required_capabilities: ["elasticsearch-source".to_string()].into_iter().collect(),
+            state: crate::federation::MigrationState::Planned,
+            generation: 0,
+            created_at_ms: 1,
+            updated_at_ms: 1,
+            last_error: None,
+        };
+        assert!(
+            sm.apply_command(Command::CreateFederatedMigration {
+                migration,
+                request_id: "create-migration-1".into(),
+                actor: "operator".into()
+            })
+            .await
+            .unwrap()
+            .success
+        );
+        let transition = |next_state, expected_generation, at_ms, request_id: &str| {
+            Command::TransitionFederatedMigration {
+                migration_id: "migration-1".into(),
+                next_state,
+                expected_generation,
+                at_ms,
+                error: None,
+                request_id: request_id.into(),
+                actor: "operator".into(),
+            }
+        };
+        assert!(
+            sm.apply_command(transition(
+                crate::federation::MigrationState::Preparing,
+                0,
+                2,
+                "stage-prepare"
+            ))
+            .await
+            .unwrap()
+            .success
+        );
+        assert!(
+            sm.apply_command(transition(
+                crate::federation::MigrationState::Running,
+                0,
+                3,
+                "stage-running"
+            ))
+            .await
+            .unwrap()
+            .success
+        );
+        assert!(
+            sm.apply_command(transition(
+                crate::federation::MigrationState::Failed,
+                0,
+                4,
+                "stage-failed"
+            ))
+            .await
+            .unwrap()
+            .success
+        );
+        assert!(
+            sm.apply_command(transition(
+                crate::federation::MigrationState::Preparing,
+                0,
+                5,
+                "retry-migration"
+            ))
+            .await
+            .unwrap()
+            .success
+        );
+        assert!(
+            !sm.apply_command(transition(
+                crate::federation::MigrationState::Running,
+                0,
+                6,
+                "stale-running-report"
+            ))
+            .await
+            .unwrap()
+            .success
+        );
+        assert!(
+            sm.apply_command(transition(
+                crate::federation::MigrationState::Running,
+                1,
+                7,
+                "running-generation-1"
+            ))
+            .await
+            .unwrap()
+            .success
+        );
+        let saved = store
+            .get_federated_migration("migration-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved.state, crate::federation::MigrationState::Running);
+        assert_eq!(saved.generation, 1);
+    }
 
     #[tokio::test]
     async fn legacy_cache_import_is_idempotent_and_closed_after_bootstrap() {

@@ -30,6 +30,7 @@ pub mod comms;
 pub mod config;
 pub mod drivers;
 pub mod error;
+pub mod federation;
 pub mod license;
 pub mod pipeline;
 pub mod raft;
@@ -42,6 +43,9 @@ pub use agent::{NodeLifecycle, ShardClaimer, ShardExecutor, WorkerPool};
 pub use comms::{GrpcClient, GrpcServer};
 pub use config::DatspoolConfig;
 pub use error::{ConfigError, DatspoolError, DriverError, RaftError, Result, StorageError};
+pub use federation::{
+    FederatedCluster, FederatedClusterStatus, FederatedMigration, MigrationState,
+};
 pub use pipeline::{
     AdaptiveBackpressure, BackpressureConfig, ClusterPressure, FlowWindow, LocalBatchCache,
     Pipeline, PipelineConfig, PipelineStats, Record, RecordBatch, Sink, Source, Transform,

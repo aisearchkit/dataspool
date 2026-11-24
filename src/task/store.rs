@@ -323,6 +323,80 @@ impl<S: KvStore> TaskStore<S> {
         Ok(metrics)
     }
 
+    pub async fn get_federated_cluster(
+        &self,
+        cluster_id: &str,
+    ) -> Result<Option<crate::federation::FederatedCluster>> {
+        let key = format!("federated_cluster:{cluster_id}");
+        self.store
+            .get_cf(cf::META, key.as_bytes())
+            .await?
+            .map(|v| serde_json::from_slice(&v).map_err(Into::into))
+            .transpose()
+    }
+
+    pub async fn list_federated_clusters(
+        &self,
+    ) -> Result<Vec<crate::federation::FederatedCluster>> {
+        self.store
+            .prefix_scan_cf(cf::META, b"federated_cluster:")
+            .await?
+            .into_iter()
+            .map(|(_, v)| serde_json::from_slice(&v).map_err(Into::into))
+            .collect()
+    }
+
+    pub async fn get_federated_migration(
+        &self,
+        migration_id: &str,
+    ) -> Result<Option<crate::federation::FederatedMigration>> {
+        let key = format!("federated_migration:{migration_id}");
+        self.store
+            .get_cf(cf::META, key.as_bytes())
+            .await?
+            .map(|v| serde_json::from_slice(&v).map_err(Into::into))
+            .transpose()
+    }
+
+    pub async fn list_federated_migrations(
+        &self,
+    ) -> Result<Vec<crate::federation::FederatedMigration>> {
+        self.store
+            .prefix_scan_cf(cf::META, b"federated_migration:")
+            .await?
+            .into_iter()
+            .map(|(_, v)| serde_json::from_slice(&v).map_err(Into::into))
+            .collect()
+    }
+
+    pub async fn save_federated_control(
+        &self,
+        request_id: &str,
+        payload: &str,
+        key: String,
+        value: Vec<u8>,
+        audit: Option<AuditEvent>,
+    ) -> Result<()> {
+        let mut records = vec![(key, value)];
+        let event_key = audit
+            .as_ref()
+            .map(|event| format!("audit:{:020}", event.log_index));
+        let mut batch = crate::storage::WriteBatch::new();
+        batch.put_cf(
+            cf::META,
+            format!("control_request:{request_id}"),
+            payload.as_bytes().to_vec(),
+        );
+        for (record_key, record_value) in records.drain(..) {
+            batch.put_cf(cf::META, record_key, record_value);
+        }
+        if let (Some(event), Some(key)) = (audit, event_key) {
+            batch.put_cf(cf::META, key, serde_json::to_vec(&event)?);
+        }
+        self.store.write_batch(batch).await?;
+        Ok(())
+    }
+
     /// Read the committed payload associated with a control-plane idempotency key.
     pub async fn get_control_request(&self, request_id: &str) -> Result<Option<String>> {
         let key = format!("control_request:{request_id}");

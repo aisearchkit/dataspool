@@ -217,3 +217,47 @@ groups:
         labels:
           severity: warning
 ```
+
+## Federated cluster registry and migration orchestration (Phase 2.8)
+
+The local Raft group is the authoritative control plane for federated records. Registry and migration records are stored in the replicated metadata column family and therefore included in the existing Raft application snapshot. Do not write these records directly to RocksDB.
+
+### Register a remote cluster
+
+`POST /api/v1/federation/clusters` (administrator bearer token):
+
+```json
+{
+  "cluster_id": "west-prod",
+  "endpoint": "https://west-control.example.com:9443",
+  "identity_fingerprint": "<64-character SHA-256 certificate fingerprint>",
+  "version": "0.1.0",
+  "capabilities": ["elasticsearch-source", "elasticsearch-sink"],
+  "request_id": "register-west-prod-001"
+}
+```
+
+Remote endpoints must use HTTPS; HTTP is accepted only for loopback development. A cluster ID is permanently bound to its first identity fingerprint. Heartbeats use `POST /api/v1/federation/clusters/{cluster_id}/heartbeat` with `identity_fingerprint`, `status` (`healthy`, `degraded`, or `offline`) and a unique `request_id`. The fingerprint is currently a pinned registry attribute, not a substitute for mutual TLS or signed peer authentication. Before exposing federation endpoints across trust boundaries, enforce mTLS at the trusted ingress and authorize each peer against its registered fingerprint.
+
+Read endpoints: `GET /api/v1/federation/clusters`, `GET /api/v1/federation/migrations`, and `GET /api/v1/federation/migrations/{migration_id}`.
+
+### Create and advance a migration
+
+`POST /api/v1/federation/migrations`:
+
+```json
+{
+  "migration_id": "migration-2026-001",
+  "source_cluster": "west-prod",
+  "target_cluster": "east-prod",
+  "task_id": "<local-task-id>",
+  "required_capabilities": ["elasticsearch-source", "elasticsearch-sink"],
+  "request_id": "migration-create-2026-001"
+}
+```
+
+Both clusters must be registered and not offline, and both must advertise every required capability. New plans start at `planned`, generation `0`. Advance a plan with `POST /api/v1/federation/migrations/{migration_id}/transition`, passing `next_state`, `expected_generation`, `request_id`, and optional `error`.
+
+Allowed transitions are `planned -> preparing -> running -> committing -> completed`; `preparing` and `running` may fail or be cancelled, `committing` may fail, and a failed plan may retry to `preparing`. A retry increments the generation. Every transition checks the expected generation, so delayed reports from a previous attempt cannot advance a retried migration. All writes are Raft commands with idempotency keys and audit records.
+
+This increment delivers the replicated registry, migration lifecycle state machine, heartbeat updates, authenticated operator REST endpoints, and recovery fencing. It does not yet perform remote data-plane work: preparing/running/committing transitions are control-plane state only. The next increment must add authenticated peer RPC, remote task creation, checkpoint exchange, and commit/rollback coordination before describing a migration as end-to-end executable.

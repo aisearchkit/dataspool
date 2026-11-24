@@ -174,6 +174,35 @@ pub enum Command {
         heartbeat_timeout_ms: i64,
     },
 
+    // ==================== Federated Operations ====================
+    UpsertFederatedCluster {
+        cluster: crate::federation::FederatedCluster,
+        request_id: String,
+        actor: String,
+    },
+    CreateFederatedMigration {
+        migration: crate::federation::FederatedMigration,
+        request_id: String,
+        actor: String,
+    },
+    HeartbeatFederatedCluster {
+        cluster_id: String,
+        identity_fingerprint: String,
+        status: crate::federation::FederatedClusterStatus,
+        last_seen_at_ms: i64,
+        request_id: String,
+        actor: String,
+    },
+    TransitionFederatedMigration {
+        migration_id: String,
+        next_state: crate::federation::MigrationState,
+        expected_generation: u64,
+        at_ms: i64,
+        error: Option<String>,
+        request_id: String,
+        actor: String,
+    },
+
     // ==================== Configuration ====================
     /// Update cluster configuration
     UpdateConfig {
@@ -299,9 +328,24 @@ impl Command {
             Command::MarkNodeOffline { node_id, .. } => {
                 format!("MarkNodeOffline({})", node_id)
             }
-            Command::UpdateConfig { key, .. } => {
-                format!("UpdateConfig({})", key)
+            Command::UpdateConfig { key, .. } => format!("UpdateConfig({})", key),
+            Command::UpsertFederatedCluster { cluster, .. } => {
+                format!("UpsertFederatedCluster({})", cluster.cluster_id)
             }
+            Command::CreateFederatedMigration { migration, .. } => {
+                format!("CreateFederatedMigration({})", migration.migration_id)
+            }
+            Command::HeartbeatFederatedCluster {
+                cluster_id, status, ..
+            } => format!("HeartbeatFederatedCluster({}, {:?})", cluster_id, status),
+            Command::TransitionFederatedMigration {
+                migration_id,
+                next_state,
+                ..
+            } => format!(
+                "TransitionFederatedMigration({}, {:?})",
+                migration_id, next_state
+            ),
         }
     }
 }
