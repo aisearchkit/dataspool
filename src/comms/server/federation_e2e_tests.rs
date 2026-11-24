@@ -1204,6 +1204,10 @@ async fn federation_mtls_recovery_survives_two_source_and_target_leader_changes(
             FederatedRemoteOperationState::Committed,
         )
         .await;
+    source.restart(source_leader).await;
+    source
+        .wait_replicated_migration("ha-leader-change-migration", MigrationState::Committing)
+        .await;
 
     // Source leader #1 crashes after target commit. Replacement leader recovers
     // the source state machine and completes the migration via the target's
@@ -1227,14 +1231,17 @@ async fn federation_mtls_recovery_survives_two_source_and_target_leader_changes(
     // scenario in the recovery window until the schedule has been exhausted.
     let config = ChaosConfig::default();
     let mut chaos = ChaosScheduler::new(0xDADA_2026_1124, config);
-    // Reuse the former source leader as the chaos member: it is already down,
-    // while the replacement leader and the third member retain quorum. The
-    // former target leader has already restarted and can be independently flapped.
-    let source_follower = source_leader;
-    let target_follower = target_leader;
+    let source_follower = (0..3)
+        .find(|index| *index != source_leader && *index != source_leader_2)
+        .expect("source group has one non-leader member");
+    let target_follower = (0..3)
+        .find(|index| *index != target_leader && *index != target_leader_2)
+        .expect("target group has one non-leader member");
     let mut partitioned = true;
-    let mut source_follower_running = false;
+    let mut source_follower_running = true;
     let mut target_follower_running = true;
+    let mut source_crash_used = false;
+    let mut target_crash_used = false;
     let mut event_log = Vec::new();
     while let Some(event) = chaos.next_event() {
         event_log.push(format!("{event:?}"));
@@ -1254,13 +1261,14 @@ async fn federation_mtls_recovery_survives_two_source_and_target_leader_changes(
                 faults.commit.store(true, Ordering::SeqCst);
             }
             ChaosEvent::CrashSourceFollower => {
-                if source_follower_running {
+                if source_follower_running && !source_crash_used {
                     source.stop(source_follower).await;
                     source_follower_running = false;
+                    source_crash_used = true;
                 }
             }
             ChaosEvent::RestartSourceFollower => {
-                if !source_follower_running {
+                if !source_follower_running && source_crash_used {
                     source.restart(source_follower).await;
                     source_follower_running = true;
                     source
@@ -1272,13 +1280,14 @@ async fn federation_mtls_recovery_survives_two_source_and_target_leader_changes(
                 }
             }
             ChaosEvent::CrashTargetFollower => {
-                if target_follower_running {
+                if target_follower_running && !target_crash_used {
                     target.stop(target_follower).await;
                     target_follower_running = false;
+                    target_crash_used = true;
                 }
             }
             ChaosEvent::RestartTargetFollower => {
-                if !target_follower_running {
+                if !target_follower_running && target_crash_used {
                     target.restart(target_follower).await;
                     target_follower_running = true;
                     target
