@@ -131,6 +131,24 @@ grpcurl -plaintext -d '{"task_id":"<task-uuid>"}' \
 
 Clients can also use the existing GrpcClient::task() generated client accessor. The gRPC server is started and gracefully stopped by the main Dataspool process alongside the HTTP and Raft listeners.
 
+## Scheduler and Operational Control (Phase 2.7)
+
+The worker-side scheduler evaluates replicated node metadata before proposing a claim. It excludes paused/offline nodes, enforces `capacity.max_concurrent` and `capacity.memory_mb`, matches task placement constraints expressed as `requires.<tag>=<value>` in task tags, reserves `requires.memory_mb` against active leases, and selects the least-utilized eligible node using a deterministic concurrency-plus-memory utilization score. Task candidates are ordered by priority (Critical, High, Normal, Low), then FIFO by creation time. Configure node labels with `agent.tags` (for example `region=us-west`, `storage=ssd`; a bare tag is stored as `tag=true`); Dataspool adds the two capacity tags from `agent.resources` at registration. If no node records exist (standalone compatibility mode), the local worker retains the legacy claim behavior.
+
+`TaskService.ListTasks` provides leader-only linearizable listing with 1-based pagination, state and tag filters, and `created_at`, `priority`, or `name` ordering. Page sizes default to 20 and are capped at 100.
+
+Example:
+
+```bash
+grpcurl -plaintext -d '{"page":1,"page_size":20,"state":"running","tag_key":"environment","tag_value":"prod","sort_by":"priority","descending":true}' \
+  127.0.0.1:50052 dataspool.task.TaskService/ListTasks
+```
+
+
+Control operations write audit events in the same RocksDB batch as their state changes and idempotency keys. Events include the committed Raft log index, actor, request ID, operation, resource, previous/new state, and timestamp. gRPC clients may supply `x-dataspool-actor`; absent metadata is recorded as `anonymous`. Only trust this value when the Task API is behind an authenticated proxy that strips caller-supplied copies and injects the verified identity. Audit events are available from the authenticated HTTP endpoint `GET /api/v1/audit?limit=100` (maximum 1000), newest Raft index first.
+
+The authenticated Prometheus text endpoint is `GET /metrics`. It exposes task/shard/node state gauges, oldest pending shard age (`dataspool_scheduler_delay_seconds`), per-node active shard and configured capacity gauges, reserved versus configured memory, and cumulative committed retry counts. Scrapers must send the DLQ admin bearer token configured as `DATASPOOL_ADMIN_TOKEN`.
+
 ## Distributed Task Control Plane
 
 Task mutations are submitted as OpenRaft client writes. The gRPC handlers do not mutate RocksDB directly: CreateTask, PauseTask, ResumeTask, CancelTask, RetryTask, and ControlNodeExecution all call `RaftNode::propose`; the deterministic state machine applies the committed command to replicated metadata. Mutations are unavailable when Raft is not configured, rather than silently falling back to a local write.
@@ -138,8 +156,8 @@ Task mutations are submitted as OpenRaft client writes. The gRPC handlers do not
 The TaskService exposes these operations:
 
 - `CreateTask`: requires a non-empty `request_id`; its task UUID is deterministically derived from that key, so client retries address the same task. Reusing the key with a different task payload is rejected.
-- `PauseTask` / `ResumeTask`: pause prevents new shard claims while allowing already leased shards to finish their in-flight batch; resume reopens claims.
-- `CancelTask`: marks the task terminal and rejects subsequent claims, progress checkpoints, completion, and failure updates. A destination write already in flight at cancellation time may finish; cancellation is cooperative at the batch boundary.
+- `PauseTask` / `ResumeTask`: pause transitions to `Pausing` while live leases drain. Workers receive the replicated state change, finish the in-flight sink write plus checkpoint/ack sequence, release their lease, and only then does the task become `Paused`. New source batches are rejected during draining; existing leases continue to renew until the in-flight batch is checkpointed and the worker releases its lease. Resume reopens claims.
+- `CancelTask`: marks the task terminal and propagates through worker polling. New claims and source batches stop. Existing leases continue to renew while workers finish an already committed batch. A source batch already committed to the replicated cache may finish its destination write and checkpoint/ack sequence before the worker releases its lease; this preserves the restart checkpoint while preventing additional work.
 - `RetryTask`: requeues failed shards and preserves their durable offsets and processed counters. Completed shards are not rerun.
 - `ControlNodeExecution`: `paused=true` prevents that node from claiming new shards. Existing leases may finish or expire; heartbeat traffic does not implicitly resume a manually paused node. `paused=false` resumes claims.
 

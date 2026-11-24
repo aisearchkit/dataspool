@@ -191,12 +191,25 @@ async fn main() -> Result<()> {
                 .await?;
         }
 
-        let node_tags = config
+        let mut node_tags: std::collections::HashMap<String, String> = config
             .agent
             .tags
             .iter()
-            .map(|tag| (tag.clone(), "true".to_string()))
+            .map(|tag| match tag.split_once('=') {
+                Some((key, value)) if !key.trim().is_empty() => {
+                    (key.trim().to_string(), value.trim().to_string())
+                }
+                _ => (tag.clone(), "true".to_string()),
+            })
             .collect();
+        node_tags.insert(
+            "capacity.max_concurrent".into(),
+            config.agent.resources.max_concurrent_tasks.to_string(),
+        );
+        node_tags.insert(
+            "capacity.memory_mb".into(),
+            config.agent.resources.memory_limit_mb.to_string(),
+        );
         let failure_timeout = config
             .cluster
             .election_timeout

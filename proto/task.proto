@@ -30,6 +30,23 @@ message GetTaskRequest {
   string task_id = 1;
 }
 
+message ListTasksRequest {
+  uint32 page = 1; // 1-based page number
+  uint32 page_size = 2; // 1-100, default 20
+  string state = 3;
+  string tag_key = 4;
+  string tag_value = 5;
+  string sort_by = 6; // created_at, priority, name
+  bool descending = 7;
+}
+
+message ListTasksResponse {
+  repeated TaskInfo tasks = 1;
+  uint64 total = 2;
+  uint32 page = 3;
+  uint32 page_size = 4;
+}
+
 message GetTaskResponse {
   TaskInfo task = 1;
   repeated ShardInfo shards = 2;
@@ -139,6 +156,7 @@ service TaskService {
   // Task CRUD
   rpc CreateTask(CreateTaskRequest) returns (CreateTaskResponse);
   rpc GetTask(GetTaskRequest) returns (GetTaskResponse);
+  rpc ListTasks(ListTasksRequest) returns (ListTasksResponse);
   rpc PauseTask(TaskControlRequest) returns (TaskControlResponse);
   rpc ResumeTask(TaskControlRequest) returns (TaskControlResponse);
   rpc CancelTask(TaskControlRequest) returns (TaskControlResponse);

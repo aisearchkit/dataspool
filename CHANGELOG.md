@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Added a deterministic dynamic shard scheduler that orders tasks by priority/FIFO age, places work on the least-utilized healthy eligible node, enforces per-node concurrency and memory capacity, and honors `requires.*` task tag constraints.
+- Added graceful task pause with a Pausing drain phase, worker-side cancellation propagation, in-flight sink/checkpoint/ack completion, and lease release before the Paused state is committed. Cancellation stops new source batches and lease renewals while allowing an already replicated batch to checkpoint safely.
+- Added TaskService.ListTasks with leader-linearizable pagination, state/tag filtering, and deterministic sorting.
+- Added replicated audit events with actor, request ID, operation, state transition, timestamp, and applied Raft log index; exposed them through the authenticated `/api/v1/audit` endpoint.
+- Added an authenticated Prometheus `/metrics` endpoint for task/shard/node counts, scheduler queue age, node load/capacity, memory capacity, and durable retry totals.
 - Added the Raft-committed Distributed Task Control Plane: CreateTask, PauseTask, ResumeTask, CancelTask, RetryTask, and per-node execution pause/resume commands. Task creation uses deterministic request-key-derived IDs; control request IDs are replicated for idempotency and conflicting reuse is rejected.
 - Added task lifecycle states and claim gating: paused tasks/nodes stop accepting new shard claims, cancellation blocks subsequent progress/terminal mutations, and retry requeues failed shards while preserving checkpoints.
 - Implemented TaskService.GetTask over gRPC with live Task/shard aggregation, per-node throughput, checkpoint offsets, fencing generations, lease deadlines, timestamps, and a Raft linearizable read barrier on the leader.

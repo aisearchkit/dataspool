@@ -13,7 +13,9 @@ use tracing::{debug, info, warn};
 use crate::error::{DatspoolError, Result};
 use crate::raft::{Command, RaftNode};
 use crate::storage::kv::KvStore;
+use crate::task::TaskMeta;
 use crate::task::store::TaskStore;
+use crate::types::TaskState;
 use crate::types::{NodeId, ShardId, ShardState};
 
 const DEFAULT_LEASE_SECONDS: i64 = 30;
@@ -112,10 +114,65 @@ impl<S: KvStore + Clone + 'static> ShardClaimer<S> {
     }
 
     pub async fn try_claim(&self) -> Result<Option<ShardLease>> {
-        let tasks = self.task_store.list_tasks().await?;
-        let mut candidates = Vec::new();
+        let mut tasks = self.task_store.list_tasks().await?;
+        // Priority is strict; creation time provides deterministic FIFO fairness within a tier.
+        sort_task_candidates(&mut tasks);
+        let nodes = self.task_store.list_nodes().await?;
+        let node = nodes.iter().find(|node| node.node_id == self.node_id);
+        if node.is_some_and(|node| node.status != crate::types::NodeStatus::Healthy) {
+            return Ok(None);
+        }
+        let max_concurrent = node
+            .and_then(|node| node.tags.get("capacity.max_concurrent"))
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(usize::MAX);
         let now = Utc::now();
+        let mut active_by_node = std::collections::HashMap::<String, usize>::new();
+        let mut active_memory_by_node = std::collections::HashMap::<String, u64>::new();
         for task in &tasks {
+            for shard in self.task_store.list_task_shards(&task.task_id).await? {
+                if let ShardState::Running { node_id, .. } = &shard.state
+                    && shard
+                        .lease_expires_at
+                        .as_ref()
+                        .is_some_and(|expiry| expiry > &now)
+                {
+                    *active_by_node.entry(node_id.to_string()).or_default() += 1;
+                    let reserved_memory = task
+                        .metadata
+                        .get("requires.memory_mb")
+                        .and_then(|value| value.parse::<u64>().ok())
+                        .unwrap_or_default();
+                    let active_memory = active_memory_by_node
+                        .entry(node_id.to_string())
+                        .or_default();
+                    *active_memory = active_memory.saturating_add(reserved_memory);
+                }
+            }
+        }
+        let mut candidates = Vec::new();
+        for task in &tasks {
+            if !matches!(task.state, TaskState::Pending | TaskState::Running { .. }) {
+                continue;
+            }
+            if !nodes.is_empty() {
+                let Some(selected_node) = select_node_for_task(
+                    &task.metadata,
+                    &nodes,
+                    &active_by_node,
+                    &active_memory_by_node,
+                ) else {
+                    continue;
+                };
+                if selected_node != self.node_id {
+                    continue;
+                }
+            } else if node
+                .is_some_and(|node| !node_satisfies_task_requirements(&task.metadata, &node.tags))
+            {
+                continue;
+            }
             for shard in self.task_store.list_task_shards(&task.task_id).await? {
                 let available = match &shard.state {
                     ShardState::Pending => true,
@@ -132,10 +189,24 @@ impl<S: KvStore + Clone + 'static> ShardClaimer<S> {
                     _ => false,
                 };
                 if available {
-                    candidates.push(shard.shard_id);
+                    candidates.push((task.priority, task.created_at, shard.shard_id));
                 }
             }
         }
+        if node.is_some_and(|_| {
+            active_by_node
+                .get(self.node_id.as_str())
+                .copied()
+                .unwrap_or_default()
+                >= max_concurrent
+        }) {
+            return Ok(None);
+        }
+        candidates.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+        let candidates: Vec<ShardId> = candidates
+            .into_iter()
+            .map(|(_, _, shard_id)| shard_id)
+            .collect();
         if candidates.is_empty() {
             debug!("No pending or expired-lease shards available");
             return Ok(None);
@@ -269,11 +340,248 @@ impl<S: KvStore + Clone + 'static> ShardClaimer<S> {
     }
 }
 
+/// Higher task priority wins; creation time is FIFO within each priority tier.
+fn sort_task_candidates(tasks: &mut [TaskMeta]) {
+    tasks.sort_by(|a, b| {
+        b.priority
+            .cmp(&a.priority)
+            .then_with(|| a.created_at.cmp(&b.created_at))
+    });
+}
+
+/// Select the least-loaded eligible healthy node. Integer ratio comparison keeps placement deterministic.
+fn select_node_for_task(
+    task_metadata: &std::collections::HashMap<String, String>,
+    nodes: &[crate::types::NodeMeta],
+    active_by_node: &std::collections::HashMap<String, usize>,
+    active_memory_by_node: &std::collections::HashMap<String, u64>,
+) -> Option<NodeId> {
+    let required_memory = task_metadata
+        .get("requires.memory_mb")
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or_default();
+    let mut eligible: Vec<_> = nodes
+        .iter()
+        .filter(|node| {
+            let capacity = node
+                .tags
+                .get("capacity.max_concurrent")
+                .and_then(|value| value.parse::<usize>().ok())
+                .filter(|value| *value > 0)
+                .unwrap_or(1);
+            let active = active_by_node
+                .get(node.node_id.as_str())
+                .copied()
+                .unwrap_or_default();
+            let memory_capacity = node
+                .tags
+                .get("capacity.memory_mb")
+                .and_then(|value| value.parse::<u64>().ok());
+            let active_memory = active_memory_by_node
+                .get(node.node_id.as_str())
+                .copied()
+                .unwrap_or_default();
+            let memory_available = match memory_capacity {
+                Some(capacity_mb) => active_memory.saturating_add(required_memory) <= capacity_mb,
+                None => required_memory == 0,
+            };
+            node.status == crate::types::NodeStatus::Healthy
+                && node_satisfies_task_requirements(task_metadata, &node.tags)
+                && active < capacity
+                && memory_available
+        })
+        .collect();
+    let load_score = |node: &crate::types::NodeMeta| {
+        let active = active_by_node
+            .get(node.node_id.as_str())
+            .copied()
+            .unwrap_or_default() as u128;
+        let capacity = node
+            .tags
+            .get("capacity.max_concurrent")
+            .and_then(|value| value.parse::<u128>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(1);
+        let memory_active = active_memory_by_node
+            .get(node.node_id.as_str())
+            .copied()
+            .unwrap_or_default() as u128;
+        let memory_capacity = node
+            .tags
+            .get("capacity.memory_mb")
+            .and_then(|value| value.parse::<u128>().ok())
+            .unwrap_or(0);
+        let concurrency_load = active.saturating_mul(1_000_000) / capacity;
+        let memory_load = memory_active
+            .saturating_mul(1_000_000)
+            .checked_div(memory_capacity)
+            .unwrap_or_default();
+        concurrency_load.saturating_add(memory_load)
+    };
+    eligible.sort_by(|left, right| {
+        load_score(left)
+            .cmp(&load_score(right))
+            .then_with(|| {
+                let left_memory = left
+                    .tags
+                    .get("capacity.memory_mb")
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .unwrap_or_default();
+                let right_memory = right
+                    .tags
+                    .get("capacity.memory_mb")
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .unwrap_or_default();
+                right_memory.cmp(&left_memory)
+            })
+            .then_with(|| left.node_id.cmp(&right.node_id))
+    });
+    eligible.first().map(|node| node.node_id.clone())
+}
+
+/// Task metadata keys prefixed with `requires.` are hard node-placement constraints.
+fn node_satisfies_task_requirements(
+    task_metadata: &std::collections::HashMap<String, String>,
+    node_tags: &std::collections::HashMap<String, String>,
+) -> bool {
+    task_metadata
+        .iter()
+        .filter_map(|(key, value)| key.strip_prefix("requires.").map(|tag| (tag, value)))
+        .all(|(tag, value)| {
+            if tag == "memory_mb" {
+                return node_tags
+                    .get("capacity.memory_mb")
+                    .and_then(|capacity| capacity.parse::<u64>().ok())
+                    .zip(value.parse::<u64>().ok())
+                    .is_some_and(|(capacity, required)| capacity >= required);
+            }
+            node_tags.get(tag).is_some_and(|actual| actual == value)
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::storage::rocksdb::RocksDbStore;
     use tempfile::tempdir;
+
+    #[test]
+    fn scheduler_orders_priority_then_fifo() {
+        let mut old_normal = TaskMeta::new("old-normal".into(), "{}".into(), "{}".into());
+        old_normal.priority = crate::task::TaskPriority::Normal;
+        old_normal.created_at = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1);
+        let mut new_normal = TaskMeta::new("new-normal".into(), "{}".into(), "{}".into());
+        new_normal.priority = crate::task::TaskPriority::Normal;
+        new_normal.created_at = std::time::UNIX_EPOCH + std::time::Duration::from_secs(2);
+        let mut critical = TaskMeta::new("critical".into(), "{}".into(), "{}".into());
+        critical.priority = crate::task::TaskPriority::Critical;
+        critical.created_at = std::time::UNIX_EPOCH;
+        let mut tasks = vec![new_normal, critical, old_normal];
+        sort_task_candidates(&mut tasks);
+        assert_eq!(
+            tasks
+                .iter()
+                .map(|task| task.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["critical", "old-normal", "new-normal"]
+        );
+    }
+
+    #[test]
+    fn scheduler_selects_least_loaded_eligible_node_with_capacity_and_health() {
+        let node = |id: &str, capacity: usize, status| crate::types::NodeMeta {
+            node_id: NodeId::new(id),
+            address: "127.0.0.1:1".into(),
+            tags: std::collections::HashMap::from([
+                ("region".into(), "west".into()),
+                ("capacity.max_concurrent".into(), capacity.to_string()),
+                ("capacity.memory_mb".into(), "8192".into()),
+            ]),
+            registered_at_ms: 1,
+            last_heartbeat_ms: 1,
+            status,
+        };
+        let nodes = vec![
+            node("node-a", 4, crate::types::NodeStatus::Healthy),
+            node("node-b", 4, crate::types::NodeStatus::Healthy),
+            node("node-c", 8, crate::types::NodeStatus::Paused),
+        ];
+        let active = std::collections::HashMap::from([("node-a".into(), 2), ("node-b".into(), 1)]);
+        let active_memory = std::collections::HashMap::new();
+        assert_eq!(
+            select_node_for_task(
+                &std::collections::HashMap::new(),
+                &nodes,
+                &active,
+                &active_memory
+            )
+            .unwrap()
+            .as_str(),
+            "node-b"
+        );
+        let full = std::collections::HashMap::from([("node-a".into(), 4), ("node-b".into(), 4)]);
+        assert!(
+            select_node_for_task(
+                &std::collections::HashMap::new(),
+                &nodes,
+                &full,
+                &active_memory
+            )
+            .is_none()
+        );
+        let balanced =
+            std::collections::HashMap::from([("node-a".into(), 1), ("node-b".into(), 1)]);
+        let memory_load =
+            std::collections::HashMap::from([("node-a".into(), 7000), ("node-b".into(), 1000)]);
+        assert_eq!(
+            select_node_for_task(
+                &std::collections::HashMap::new(),
+                &nodes,
+                &balanced,
+                &memory_load
+            )
+            .unwrap()
+            .as_str(),
+            "node-b"
+        );
+    }
+
+    #[test]
+    fn scheduler_enforces_required_node_tags() {
+        let requirements = std::collections::HashMap::from([
+            ("requires.region".to_string(), "us-west".to_string()),
+            ("requires.storage".to_string(), "ssd".to_string()),
+        ]);
+        let matching = std::collections::HashMap::from([
+            ("region".to_string(), "us-west".to_string()),
+            ("storage".to_string(), "ssd".to_string()),
+            ("capacity.max_concurrent".to_string(), "8".to_string()),
+            ("capacity.memory_mb".to_string(), "16384".to_string()),
+        ]);
+        let wrong_region = std::collections::HashMap::from([
+            ("region".to_string(), "eu-central".to_string()),
+            ("storage".to_string(), "ssd".to_string()),
+        ]);
+        assert!(node_satisfies_task_requirements(&requirements, &matching));
+        assert!(!node_satisfies_task_requirements(
+            &requirements,
+            &wrong_region
+        ));
+        assert!(node_satisfies_task_requirements(
+            &std::collections::HashMap::new(),
+            &wrong_region
+        ));
+        let memory_requirement =
+            std::collections::HashMap::from([("requires.memory_mb".into(), "8192".into())]);
+        assert!(node_satisfies_task_requirements(
+            &memory_requirement,
+            &matching
+        ));
+        assert!(!node_satisfies_task_requirements(
+            &memory_requirement,
+            &wrong_region
+        ));
+    }
 
     #[test]
     fn sink_versions_increase_within_and_across_lease_generations() {
@@ -390,6 +698,8 @@ mod tests {
         let shard_id = shard.shard_id;
         let created = raft
             .propose(Command::CreateTask {
+                request_id: format!("create:{}", task.task_id),
+                actor: "system".into(),
                 task: Box::new(task),
                 shards: vec![shard],
             })

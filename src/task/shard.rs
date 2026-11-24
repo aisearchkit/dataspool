@@ -83,6 +83,10 @@ pub struct ShardMeta {
     /// Number of bytes processed
     pub bytes_processed: u64,
 
+    /// Number of committed retries, retained across requeues.
+    #[serde(default)]
+    pub retry_count: u64,
+
     /// Shard creation timestamp
     pub created_at: SystemTime,
 
@@ -107,6 +111,7 @@ impl ShardMeta {
             offset: OffsetValue::initial(),
             records_processed: 0,
             bytes_processed: 0,
+            retry_count: 0,
             created_at: now,
             updated_at: now,
         }

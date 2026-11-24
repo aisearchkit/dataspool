@@ -173,13 +173,28 @@ impl<S: KvStore + Clone + 'static> ShardExecutor<S> {
                 cancellation.clone(),
             )
             .await;
-        let should_requeue = match &execution {
-            Ok(stats) => stats.cancelled,
-            Err(_) => cancellation.is_cancelled(),
-        };
+        let control_stop = self
+            .task_store
+            .get_task(&shard.task_id)
+            .await?
+            .is_some_and(|task| {
+                matches!(
+                    task.state,
+                    crate::types::TaskState::Pausing | crate::types::TaskState::Cancelled { .. }
+                )
+            });
+        let should_requeue = matches!(&execution, Ok(stats) if stats.cancelled)
+            || cancellation.is_cancelled()
+            || control_stop;
         if should_requeue {
             self.release_lease(lease.as_ref()).await;
-            return execution;
+            return match execution {
+                Ok(stats) => Ok(stats),
+                Err(_) => Ok(ExecutionStats {
+                    cancelled: true,
+                    ..Default::default()
+                }),
+            };
         }
         let stats = execution?;
         if !stats.is_continuous {

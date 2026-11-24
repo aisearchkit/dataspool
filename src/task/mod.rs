@@ -13,4 +13,4 @@ pub mod store;
 
 pub use meta::{NodeTaskAggregate, ShardCheckpoint, TaskAggregate, TaskMeta, TaskPriority};
 pub use shard::{ShardGenerator, ShardMeta, ShardingStrategy};
-pub use store::{TaskStore, TaskStoreSnapshot};
+pub use store::{AuditEvent, NodeLoadMetric, OperationalMetrics, TaskStore, TaskStoreSnapshot};

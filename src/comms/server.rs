@@ -78,6 +78,16 @@ impl GrpcServer {
     }
 }
 
+fn request_actor<T>(request: &Request<T>) -> String {
+    request
+        .metadata()
+        .get("x-dataspool-actor")
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.trim().is_empty() && value.len() <= 128)
+        .unwrap_or("anonymous")
+        .to_string()
+}
+
 fn raft_status(error: impl std::fmt::Display) -> Status {
     Status::unavailable(format!("Raft command could not be committed: {error}"))
 }
@@ -147,6 +157,7 @@ async fn control_task(
     service: &Arc<RwLock<TaskServiceImpl>>,
     req: task::TaskControlRequest,
     action: &str,
+    actor: String,
 ) -> std::result::Result<Response<task::TaskControlResponse>, Status> {
     if req.request_id.trim().is_empty() {
         return Err(Status::invalid_argument("request_id is required"));
@@ -166,6 +177,7 @@ async fn control_task(
             task_id: task_id.to_string(),
             action: action.to_string(),
             request_id: req.request_id,
+            actor,
         })
         .await
         .map_err(raft_status)?;
@@ -181,6 +193,7 @@ impl task::task_service_server::TaskService for Arc<RwLock<TaskServiceImpl>> {
         &self,
         request: Request<task::CreateTaskRequest>,
     ) -> std::result::Result<Response<task::CreateTaskResponse>, Status> {
+        let actor = request_actor(&request);
         let req = request.into_inner();
         if req.name.trim().is_empty()
             || req.request_id.trim().is_empty()
@@ -223,6 +236,8 @@ impl task::task_service_server::TaskService for Arc<RwLock<TaskServiceImpl>> {
         let task_id = task_meta.task_id.to_string();
         let response = raft
             .propose(crate::raft::Command::CreateTask {
+                request_id: req.request_id,
+                actor,
                 task: Box::new(task_meta),
                 shards,
             })
@@ -243,24 +258,28 @@ impl task::task_service_server::TaskService for Arc<RwLock<TaskServiceImpl>> {
         &self,
         request: Request<task::TaskControlRequest>,
     ) -> std::result::Result<Response<task::TaskControlResponse>, Status> {
-        control_task(self, request.into_inner(), "pause").await
+        let actor = request_actor(&request);
+        control_task(self, request.into_inner(), "pause", actor).await
     }
     async fn resume_task(
         &self,
         request: Request<task::TaskControlRequest>,
     ) -> std::result::Result<Response<task::TaskControlResponse>, Status> {
-        control_task(self, request.into_inner(), "resume").await
+        let actor = request_actor(&request);
+        control_task(self, request.into_inner(), "resume", actor).await
     }
     async fn cancel_task(
         &self,
         request: Request<task::TaskControlRequest>,
     ) -> std::result::Result<Response<task::TaskControlResponse>, Status> {
-        control_task(self, request.into_inner(), "cancel").await
+        let actor = request_actor(&request);
+        control_task(self, request.into_inner(), "cancel", actor).await
     }
     async fn retry_task(
         &self,
         request: Request<task::TaskControlRequest>,
     ) -> std::result::Result<Response<task::TaskControlResponse>, Status> {
+        let actor = request_actor(&request);
         let req = request.into_inner();
         if req.request_id.trim().is_empty() {
             return Err(Status::invalid_argument("request_id is required"));
@@ -279,6 +298,7 @@ impl task::task_service_server::TaskService for Arc<RwLock<TaskServiceImpl>> {
             .propose(crate::raft::Command::RetryTask {
                 task_id: task_id.to_string(),
                 request_id: req.request_id,
+                actor,
             })
             .await
             .map_err(raft_status)?;
@@ -291,6 +311,7 @@ impl task::task_service_server::TaskService for Arc<RwLock<TaskServiceImpl>> {
         &self,
         request: Request<task::NodeExecutionControlRequest>,
     ) -> std::result::Result<Response<task::NodeExecutionControlResponse>, Status> {
+        let actor = request_actor(&request);
         let req = request.into_inner();
         if req.node_id.trim().is_empty() || req.request_id.trim().is_empty() {
             return Err(Status::invalid_argument(
@@ -308,6 +329,7 @@ impl task::task_service_server::TaskService for Arc<RwLock<TaskServiceImpl>> {
                 node_id: req.node_id,
                 paused: req.paused,
                 request_id: req.request_id,
+                actor,
             })
             .await
             .map_err(raft_status)?;
@@ -356,6 +378,82 @@ impl task::task_service_server::TaskService for Arc<RwLock<TaskServiceImpl>> {
             )));
         };
         Ok(Response::new(task_to_response(task, shards)))
+    }
+
+    async fn list_tasks(
+        &self,
+        request: Request<task::ListTasksRequest>,
+    ) -> std::result::Result<Response<task::ListTasksResponse>, Status> {
+        let req = request.into_inner();
+        let service = self.read().await;
+        let task_store = service.task_store.clone();
+        let raft_node = service.raft_node.clone();
+        drop(service);
+        if let Some(raft) = raft_node {
+            if raft.current_leader().await != Some(raft.node_id()) {
+                return Err(Status::failed_precondition(
+                    "ListTasks requires the current Raft leader",
+                ));
+            }
+            raft.ensure_linearizable().await.map_err(|error| {
+                Status::unavailable(format!("Raft read barrier failed: {error}"))
+            })?;
+        }
+        let mut tasks = task_store
+            .list_tasks()
+            .await
+            .map_err(|error| Status::internal(error.to_string()))?;
+        if !req.state.trim().is_empty() {
+            let expected = req.state.to_ascii_lowercase();
+            tasks.retain(|task| task_state_name(&task.state).eq_ignore_ascii_case(&expected));
+        }
+        if !req.tag_key.is_empty() {
+            tasks.retain(|task| {
+                task.metadata
+                    .get(&req.tag_key)
+                    .is_some_and(|value| req.tag_value.is_empty() || value == &req.tag_value)
+            });
+        }
+        match req.sort_by.as_str() {
+            "priority" => tasks.sort_by_key(|task| task.priority),
+            "name" => tasks.sort_by(|a, b| a.name.cmp(&b.name)),
+            "" | "created_at" => tasks.sort_by_key(|task| task.created_at),
+            other => {
+                return Err(Status::invalid_argument(format!(
+                    "Unsupported sort_by '{other}'"
+                )));
+            }
+        }
+        if req.descending {
+            tasks.reverse();
+        }
+        let total = tasks.len() as u64;
+        let page = req.page.max(1);
+        let page_size = if req.page_size == 0 {
+            20
+        } else {
+            req.page_size.clamp(1, 100)
+        };
+        let start = (page as usize - 1).saturating_mul(page_size as usize);
+        let mut summaries = Vec::new();
+        for mut task_meta in tasks.into_iter().skip(start).take(page_size as usize) {
+            let shards = task_store
+                .list_task_shards(&task_meta.task_id)
+                .await
+                .map_err(|error| Status::internal(error.to_string()))?;
+            task_meta.refresh_from_shards(&shards, chrono::Utc::now());
+            summaries.push(
+                task_to_response(task_meta, Vec::new())
+                    .task
+                    .expect("task summary"),
+            );
+        }
+        Ok(Response::new(task::ListTasksResponse {
+            tasks: summaries,
+            total,
+            page,
+            page_size,
+        }))
     }
 
     async fn assign_shard(
@@ -647,6 +745,45 @@ mod task_query_tests {
             .await
             .unwrap_err();
         assert_eq!(missing.code(), tonic::Code::NotFound);
+    }
+    #[tokio::test]
+    async fn list_tasks_filters_tags_sorts_priority_and_paginates() {
+        let dir = tempdir().unwrap();
+        let db = RocksDbStore::open(dir.path()).unwrap();
+        let store = Arc::new(TaskStore::new(db));
+        let mut low = TaskMeta::new("low-priority".into(), "{}".into(), "{}".into());
+        low.priority = TaskPriority::Low;
+        low.metadata.insert("environment".into(), "prod".into());
+        let mut high = TaskMeta::new("high-priority".into(), "{}".into(), "{}".into());
+        high.priority = TaskPriority::Critical;
+        high.metadata.insert("environment".into(), "prod".into());
+        let mut other = TaskMeta::new("other-environment".into(), "{}".into(), "{}".into());
+        other.metadata.insert("environment".into(), "test".into());
+        for task_meta in [&low, &high, &other] {
+            store.save_task(task_meta).await.unwrap();
+        }
+        let service = Arc::new(RwLock::new(TaskServiceImpl {
+            task_store: store,
+            raft_node: None,
+        }));
+        let response = service
+            .list_tasks(Request::new(task::ListTasksRequest {
+                page: 1,
+                page_size: 1,
+                state: "pending".into(),
+                tag_key: "environment".into(),
+                tag_value: "prod".into(),
+                sort_by: "priority".into(),
+                descending: true,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(response.total, 2);
+        assert_eq!(response.page, 1);
+        assert_eq!(response.page_size, 1);
+        assert_eq!(response.tasks.len(), 1);
+        assert_eq!(response.tasks[0].name, "high-priority");
     }
 }
 

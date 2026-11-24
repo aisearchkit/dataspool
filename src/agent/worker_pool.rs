@@ -32,6 +32,7 @@ pub struct WorkerPool<S: KvStore> {
     limits: ResourceLimits,
     semaphore: Arc<Semaphore>,
     active_shards: Arc<RwLock<Vec<String>>>,
+    task_store: Arc<TaskStore<S>>,
     claimer: ShardClaimer<S>,
     executor: ShardExecutor<S>,
 }
@@ -53,6 +54,7 @@ impl<S: KvStore + Clone + 'static> WorkerPool<S> {
             },
             semaphore: Arc::new(Semaphore::new(max_concurrent_tasks)),
             active_shards: Arc::new(RwLock::new(Vec::new())),
+            task_store: task_store.clone(),
             claimer: ShardClaimer::new(node_id.clone(), task_store.clone(), raft),
             executor: ShardExecutor::new_with_raft(task_store, index_store, executor_raft),
         })
@@ -101,17 +103,21 @@ impl<S: KvStore + Clone + 'static> WorkerPool<S> {
                             let active_shards = self.active_shards.clone();
                             let shard_id_clone = shard_id.clone();
                             let claimer = self.claimer.clone();
+                            let task_store = self.task_store.clone();
                             let worker_shutdown = shutdown.child_token();
 
                             workers.spawn(async move {
                                 let mut lease = lease;
                                 let execution_lease = lease.clone();
                                 let execution_shard_id = shard_id.clone();
-                                let worker_cancel = worker_shutdown.clone();
+                                let execution_cancel = CancellationToken::new();
+                                let worker_cancel = execution_cancel.clone();
                                 let mut execution = tokio::spawn(async move {
                                     executor.execute_with_lease(&execution_shard_id, execution_lease, worker_cancel).await
                                 });
                                 let renew_interval = std::time::Duration::from_secs(8);
+                                let mut shutdown_signalled = false;
+                                let mut task_stop_signalled = false;
                                 loop {
                                     tokio::select! {
                                         result = &mut execution => {
@@ -122,27 +128,43 @@ impl<S: KvStore + Clone + 'static> WorkerPool<S> {
                                             }
                                             break;
                                         }
-                                        _ = worker_shutdown.cancelled() => {
-                                            break;
+                                        _ = worker_shutdown.cancelled(), if !shutdown_signalled => {
+                                            execution_cancel.cancel();
+                                            shutdown_signalled = true;
+                                        }
+                                        _ = tokio::time::sleep(std::time::Duration::from_secs(1)), if !task_stop_signalled => {
+                                            let should_stop = match task_store.get_shard(&lease.shard_id).await {
+                                                Ok(Some(shard)) => match task_store.get_task(&shard.task_id).await {
+                                                    Ok(Some(task)) => task_state_requests_stop(&task.state),
+                                                    _ => false,
+                                                },
+                                                _ => false,
+                                            };
+                                            if should_stop {
+                                                // Signal the executor at its next batch boundary, but keep
+                                                // renewing the lease until its checkpoint and release finish.
+                                                execution_cancel.cancel();
+                                                task_stop_signalled = true;
+                                            }
                                         }
                                         _ = tokio::time::sleep(renew_interval) => {
                                             match claimer.renew(&mut lease).await {
                                                 Ok(true) => {}
                                                 Ok(false) => {
                                                     warn!(%shard_id, fencing_token = lease.fencing_token, "Lease lost; cancelling stale shard worker");
-                                                    worker_shutdown.cancel();
+                                                    execution_cancel.cancel();
                                                     break;
                                                 }
                                                 Err(error) => {
                                                     warn!(%shard_id, %error, "Lease renewal failed; cancelling shard worker");
-                                                    worker_shutdown.cancel();
+                                                    execution_cancel.cancel();
                                                     break;
                                                 }
                                             }
                                         }
                                     }
                                 }
-                                worker_shutdown.cancel();
+                                execution_cancel.cancel();
                                 if !execution.is_finished() {
                                     let _ = execution.await;
                                 }
@@ -187,12 +209,36 @@ impl<S: KvStore + Clone + 'static> WorkerPool<S> {
     }
 }
 
+fn task_state_requests_stop(state: &crate::types::TaskState) -> bool {
+    matches!(
+        state,
+        crate::types::TaskState::Pausing | crate::types::TaskState::Cancelled { .. }
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::storage::index::TieredConfig;
     use crate::storage::rocksdb::RocksDbStore;
     use tempfile::tempdir;
+
+    #[test]
+    fn cancellation_signal_propagates_for_pausing_and_cancelled_tasks() {
+        assert!(task_state_requests_stop(&crate::types::TaskState::Pausing));
+        assert!(task_state_requests_stop(
+            &crate::types::TaskState::Cancelled {
+                cancelled_at: chrono::Utc::now()
+            }
+        ));
+        assert!(!task_state_requests_stop(
+            &crate::types::TaskState::Running {
+                started_at: chrono::Utc::now(),
+                shard_count: 1
+            }
+        ));
+        assert!(!task_state_requests_stop(&crate::types::TaskState::Paused));
+    }
 
     #[tokio::test]
     async fn worker_pool_exits_when_shutdown_is_cancelled() {

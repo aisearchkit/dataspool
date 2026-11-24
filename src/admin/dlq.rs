@@ -71,6 +71,8 @@ impl<S: KvStore + Clone + 'static> DlqApi<S> {
                 "/api/v1/tasks/{task_id}/shards/{shard_id}/dlq/{entry_id}",
                 delete(delete_entry),
             )
+            .route("/metrics", get(metrics))
+            .route("/api/v1/audit", get(list_audit_events))
             .route_layer(middleware::from_fn_with_state(
                 self.state.clone(),
                 authorize::<S>,
@@ -78,6 +80,72 @@ impl<S: KvStore + Clone + 'static> DlqApi<S> {
             .with_state(self.state);
         Router::new().route("/admin/dlq", get(ui)).merge(api)
     }
+}
+
+#[derive(Debug, Deserialize)]
+struct AuditQuery {
+    limit: Option<usize>,
+}
+
+async fn list_audit_events<S: KvStore + Clone>(
+    State(state): State<ApiState<S>>,
+    Query(query): Query<AuditQuery>,
+) -> Response {
+    match state
+        .tasks
+        .list_audit_events(query.limit.unwrap_or(100))
+        .await
+    {
+        Ok(events) => Json(events).into_response(),
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+    }
+}
+
+async fn metrics<S: KvStore + Clone>(State(state): State<ApiState<S>>) -> Response {
+    let metrics = match state.tasks.operational_metrics().await {
+        Ok(metrics) => metrics,
+        Err(error) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response();
+        }
+    };
+    let mut body = format!(
+        "# HELP dataspool_tasks_total Number of known tasks\n# TYPE dataspool_tasks_total gauge\ndataspool_tasks_total {}\n# HELP dataspool_tasks Number of tasks by lifecycle state\n# TYPE dataspool_tasks gauge\ndataspool_tasks{{state=\"pending\"}} {}\ndataspool_tasks{{state=\"running\"}} {}\ndataspool_tasks{{state=\"paused\"}} {}\ndataspool_tasks{{state=\"cancelling\"}} {}\ndataspool_tasks{{state=\"cancelled\"}} {}\ndataspool_tasks{{state=\"completed\"}} {}\ndataspool_tasks{{state=\"failed\"}} {}\n# HELP dataspool_shards Number of shards by state\n# TYPE dataspool_shards gauge\ndataspool_shards{{state=\"pending\"}} {}\ndataspool_shards{{state=\"running\"}} {}\ndataspool_shards{{state=\"completed\"}} {}\ndataspool_shards{{state=\"failed\"}} {}\n# HELP dataspool_nodes Number of nodes by state\n# TYPE dataspool_nodes gauge\ndataspool_nodes{{state=\"healthy\"}} {}\ndataspool_nodes{{state=\"degraded\"}} {}\ndataspool_nodes{{state=\"paused\"}} {}\ndataspool_nodes{{state=\"offline\"}} {}\n# HELP dataspool_retries_total Total failed shard attempts beyond the first attempt\n# TYPE dataspool_retries_total counter\ndataspool_retries_total {}\n# HELP dataspool_oldest_pending_seconds Age of the oldest pending shard\n# TYPE dataspool_oldest_pending_seconds gauge\ndataspool_oldest_pending_seconds {}\n",
+        metrics.tasks_total,
+        metrics.tasks_pending,
+        metrics.tasks_running,
+        metrics.tasks_paused,
+        metrics.tasks_cancelling,
+        metrics.tasks_cancelled,
+        metrics.tasks_completed,
+        metrics.tasks_failed,
+        metrics.shards_pending,
+        metrics.shards_running,
+        metrics.shards_completed,
+        metrics.shards_failed,
+        metrics.nodes_healthy,
+        metrics.nodes_degraded,
+        metrics.nodes_paused,
+        metrics.nodes_offline,
+        metrics.retries_total,
+        metrics.oldest_pending_seconds,
+    );
+    body.push_str(&format!("# HELP dataspool_scheduler_delay_seconds Age of the oldest pending shard waiting for scheduling\n# TYPE dataspool_scheduler_delay_seconds gauge\ndataspool_scheduler_delay_seconds {}\n# HELP dataspool_node_active_shards Number of active shard leases per node\n# TYPE dataspool_node_active_shards gauge\n# HELP dataspool_node_capacity_shards Configured concurrent shard capacity per node\n# TYPE dataspool_node_capacity_shards gauge\n# HELP dataspool_node_memory_capacity_mb Configured memory capacity per node in MiB\n# TYPE dataspool_node_memory_capacity_mb gauge\n# HELP dataspool_node_reserved_memory_mb Memory reserved by active shard leases per node in MiB\n# TYPE dataspool_node_reserved_memory_mb gauge\n", metrics.oldest_pending_seconds));
+    for node in &metrics.node_load {
+        let label = node
+            .node_id
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('\n', "\\n");
+        body.push_str(&format!("dataspool_node_active_shards{{node_id=\"{label}\"}} {}\ndataspool_node_capacity_shards{{node_id=\"{label}\"}} {}\ndataspool_node_memory_capacity_mb{{node_id=\"{label}\"}} {}\ndataspool_node_reserved_memory_mb{{node_id=\"{label}\"}} {}\n", node.active_shards, node.capacity_shards, node.memory_capacity_mb, node.reserved_memory_mb));
+    }
+    let mut response = body.into_response();
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        "text/plain; version=0.0.4; charset=utf-8"
+            .parse()
+            .expect("static content type"),
+    );
+    response
 }
 
 async fn ui() -> Html<&'static str> {
@@ -403,9 +471,55 @@ mod tests {
         let unauthorized = app.clone().oneshot(Request::builder().uri("/api/v1/tasks/00000000-0000-0000-0000-000000000001/shards/00000000-0000-0000-0000-000000000002/dlq").body(Body::empty()).unwrap()).await.unwrap();
         assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
 
-        let authorized = app.oneshot(Request::builder().uri("/api/v1/tasks/00000000-0000-0000-0000-000000000001/shards/00000000-0000-0000-0000-000000000002/dlq")
+        let authorized = app.clone().oneshot(Request::builder().uri("/api/v1/tasks/00000000-0000-0000-0000-000000000001/shards/00000000-0000-0000-0000-000000000002/dlq")
             .header("authorization", "Bearer a-secure-test-token-with-at-least-32-bytes").body(Body::empty()).unwrap()).await.unwrap();
         assert_eq!(authorized.status(), StatusCode::NOT_FOUND);
+
+        let metrics = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .header(
+                        "authorization",
+                        "Bearer a-secure-test-token-with-at-least-32-bytes",
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(metrics.status(), StatusCode::OK);
+        assert!(
+            metrics
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .contains("text/plain")
+        );
+        let metrics_body = axum::body::to_bytes(metrics.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&metrics_body).contains("dataspool_scheduler_delay_seconds")
+        );
+
+        let audit = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/audit?limit=5")
+                    .header(
+                        "authorization",
+                        "Bearer a-secure-test-token-with-at-least-32-bytes",
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(audit.status(), StatusCode::OK);
     }
 
     #[test]

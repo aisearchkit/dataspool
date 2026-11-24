@@ -8,6 +8,52 @@ use crate::storage::{KvStore, cf};
 use crate::task::{ShardMeta, TaskMeta};
 use crate::types::{ShardId, ShardState, TaskId};
 
+/// Immutable audit record written by the committed Raft state machine.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct AuditEvent {
+    pub log_index: u64,
+    pub actor: String,
+    pub request_id: String,
+    pub action: String,
+    pub resource_id: String,
+    pub from_state: String,
+    pub to_state: String,
+    pub occurred_at_ms: i64,
+}
+
+/// Cluster-wide operational counters derived from replicated task and node metadata.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct NodeLoadMetric {
+    pub node_id: String,
+    pub active_shards: u64,
+    pub reserved_memory_mb: u64,
+    pub capacity_shards: u64,
+    pub memory_capacity_mb: u64,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct OperationalMetrics {
+    pub tasks_total: u64,
+    pub tasks_pending: u64,
+    pub tasks_running: u64,
+    pub tasks_paused: u64,
+    pub tasks_cancelling: u64,
+    pub tasks_cancelled: u64,
+    pub tasks_completed: u64,
+    pub tasks_failed: u64,
+    pub shards_pending: u64,
+    pub shards_running: u64,
+    pub shards_completed: u64,
+    pub shards_failed: u64,
+    pub nodes_healthy: u64,
+    pub nodes_degraded: u64,
+    pub nodes_paused: u64,
+    pub nodes_offline: u64,
+    pub retries_total: u64,
+    pub oldest_pending_seconds: u64,
+    pub node_load: Vec<NodeLoadMetric>,
+}
+
 /// Replicated application column-family contents included in Raft snapshots.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TaskStoreSnapshot {
@@ -77,6 +123,112 @@ impl<S: KvStore> TaskStore<S> {
             .collect()
     }
 
+    /// Read the newest audit events, newest first.
+    pub async fn list_audit_events(&self, limit: usize) -> Result<Vec<AuditEvent>> {
+        let mut events: Vec<AuditEvent> = self
+            .store
+            .prefix_scan_cf(cf::META, b"audit:")
+            .await?
+            .into_iter()
+            .map(|(_, value)| serde_json::from_slice(&value))
+            .collect::<std::result::Result<_, _>>()?;
+        events.sort_by_key(|event| std::cmp::Reverse(event.log_index));
+        events.truncate(limit.clamp(1, 1000));
+        Ok(events)
+    }
+
+    /// Compute bounded-cardinality operational metrics from the replicated metadata.
+    pub async fn operational_metrics(&self) -> Result<OperationalMetrics> {
+        let now = chrono::Utc::now();
+        let tasks = self.list_tasks().await?;
+        let mut metrics = OperationalMetrics {
+            tasks_total: tasks.len() as u64,
+            ..Default::default()
+        };
+        let mut active_by_node = std::collections::HashMap::<String, u64>::new();
+        let mut active_memory_by_node = std::collections::HashMap::<String, u64>::new();
+        for task in tasks {
+            match task.state {
+                crate::types::TaskState::Pending => metrics.tasks_pending += 1,
+                crate::types::TaskState::Running { .. } | crate::types::TaskState::Pausing => {
+                    metrics.tasks_running += 1
+                }
+                crate::types::TaskState::Paused => metrics.tasks_paused += 1,
+                crate::types::TaskState::Canceling => metrics.tasks_cancelling += 1,
+                crate::types::TaskState::Cancelled { .. } => metrics.tasks_cancelled += 1,
+                crate::types::TaskState::Completed { .. } => metrics.tasks_completed += 1,
+                crate::types::TaskState::Failed { .. } => metrics.tasks_failed += 1,
+            }
+            for shard in self.list_task_shards(&task.task_id).await? {
+                metrics.retries_total = metrics.retries_total.saturating_add(shard.retry_count);
+                if let ShardState::Running { node_id, .. } = &shard.state
+                    && shard
+                        .lease_expires_at
+                        .as_ref()
+                        .is_some_and(|expiry| expiry > &now)
+                {
+                    *active_by_node.entry(node_id.to_string()).or_default() += 1;
+                    let reserved_memory = task
+                        .metadata
+                        .get("requires.memory_mb")
+                        .and_then(|value| value.parse::<u64>().ok())
+                        .unwrap_or_default();
+                    let active_memory = active_memory_by_node
+                        .entry(node_id.to_string())
+                        .or_default();
+                    *active_memory = active_memory.saturating_add(reserved_memory);
+                }
+                match shard.state {
+                    ShardState::Pending => {
+                        metrics.shards_pending += 1;
+                        let age = now
+                            .timestamp_millis()
+                            .saturating_sub(
+                                chrono::DateTime::<chrono::Utc>::from(shard.created_at)
+                                    .timestamp_millis(),
+                            )
+                            .max(0) as u64
+                            / 1000;
+                        metrics.oldest_pending_seconds = metrics.oldest_pending_seconds.max(age);
+                    }
+                    ShardState::Running { .. } => metrics.shards_running += 1,
+                    ShardState::Completed { .. } => metrics.shards_completed += 1,
+                    ShardState::Failed { .. } => metrics.shards_failed += 1,
+                }
+            }
+        }
+        for node in self.list_nodes().await? {
+            let capacity_shards = node
+                .tags
+                .get("capacity.max_concurrent")
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or_default();
+            let memory_capacity_mb = node
+                .tags
+                .get("capacity.memory_mb")
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or_default();
+            metrics.node_load.push(NodeLoadMetric {
+                node_id: node.node_id.to_string(),
+                active_shards: active_by_node
+                    .remove(node.node_id.as_str())
+                    .unwrap_or_default(),
+                reserved_memory_mb: active_memory_by_node
+                    .remove(node.node_id.as_str())
+                    .unwrap_or_default(),
+                capacity_shards,
+                memory_capacity_mb,
+            });
+            match node.status {
+                crate::types::NodeStatus::Healthy => metrics.nodes_healthy += 1,
+                crate::types::NodeStatus::Degraded => metrics.nodes_degraded += 1,
+                crate::types::NodeStatus::Paused => metrics.nodes_paused += 1,
+                crate::types::NodeStatus::Offline => metrics.nodes_offline += 1,
+            }
+        }
+        Ok(metrics)
+    }
+
     /// Read the committed payload associated with a control-plane idempotency key.
     pub async fn get_control_request(&self, request_id: &str) -> Result<Option<String>> {
         let key = format!("control_request:{request_id}");
@@ -90,12 +242,32 @@ impl<S: KvStore> TaskStore<S> {
             .transpose()
     }
 
-    /// Persist a control-plane idempotency key on every state-machine replica.
-    pub async fn save_control_request(&self, request_id: &str, payload: &str) -> Result<()> {
-        let key = format!("control_request:{request_id}");
-        self.store
-            .put_cf(cf::META, key.as_bytes(), payload.as_bytes())
-            .await?;
+    /// Atomically commit a control request, its state mutations, and optional audit event.
+    /// This prevents a replay from observing an idempotency key without its audit record.
+    pub async fn save_control_batch(
+        &self,
+        request_id: &str,
+        payload: &str,
+        records: Vec<(String, Vec<u8>)>,
+        audit: Option<AuditEvent>,
+    ) -> Result<()> {
+        let mut batch = crate::storage::WriteBatch::new();
+        batch.put_cf(
+            cf::META,
+            format!("control_request:{request_id}"),
+            payload.as_bytes().to_vec(),
+        );
+        for (key, value) in records {
+            batch.put_cf(cf::META, key, value);
+        }
+        if let Some(event) = audit {
+            batch.put_cf(
+                cf::META,
+                format!("audit:{:020}", event.log_index),
+                serde_json::to_vec(&event)?,
+            );
+        }
+        self.store.write_batch(batch).await?;
         Ok(())
     }
 
@@ -190,11 +362,12 @@ impl<S: KvStore> TaskStore<S> {
         Ok(())
     }
 
-    /// Atomically persist a shard mutation and its task-level aggregate.
-    pub(crate) async fn save_shard_and_task(
+    /// Atomically persist a shard mutation, task aggregate, and optional lifecycle audit event.
+    pub(crate) async fn save_shard_and_task_with_audit(
         &self,
         shard: &ShardMeta,
         task: &TaskMeta,
+        audit: Option<AuditEvent>,
     ) -> Result<()> {
         let shard_key = format!("shard:{}", shard.shard_id);
         let task_shard_key = format!("task_shard:{}:{}", shard.task_id, shard.shard_id);
@@ -203,6 +376,13 @@ impl<S: KvStore> TaskStore<S> {
         batch.put_cf(cf::META, shard_key, serde_json::to_vec(shard)?);
         batch.put_cf(cf::META, task_shard_key, bytes::Bytes::new());
         batch.put_cf(cf::META, task_key, serde_json::to_vec(task)?);
+        if let Some(event) = audit {
+            batch.put_cf(
+                cf::META,
+                format!("audit:{:020}", event.log_index),
+                serde_json::to_vec(&event)?,
+            );
+        }
         self.store.write_batch(batch).await?;
         Ok(())
     }

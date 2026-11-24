@@ -282,7 +282,10 @@ impl TaskMeta {
             self.started_at = started_at;
         }
         let terminal_count = aggregate.completed_shards + aggregate.failed_shards;
-        if aggregate.total_shards > 0 && terminal_count == aggregate.total_shards {
+        if !matches!(self.state, TaskState::Cancelled { .. })
+            && aggregate.total_shards > 0
+            && terminal_count == aggregate.total_shards
+        {
             let finished_at = latest_finish.unwrap_or(at);
             let duration_ms = started_at
                 .map(|start| {

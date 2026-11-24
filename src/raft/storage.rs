@@ -521,7 +521,7 @@ impl RaftStateMachine<TypeConfig> for RocksStateMachine {
                     let mut machine =
                         crate::raft::MetaStateMachine::new(self.task_store.kv_store().clone());
                     let response = machine
-                        .apply_command(command.clone())
+                        .apply_command_at(command.clone(), entry.log_id.index)
                         .await
                         .map_err(|e| StorageIOError::write_state_machine(&e))?;
                     res.push(response);

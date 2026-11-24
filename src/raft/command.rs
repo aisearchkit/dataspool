@@ -19,6 +19,10 @@ pub enum Command {
     CreateTask {
         task: Box<TaskMeta>,
         shards: Vec<ShardMeta>,
+        #[serde(default)]
+        request_id: String,
+        #[serde(default = "default_command_actor")]
+        actor: String,
     },
 
     /// Update task state
@@ -32,16 +36,22 @@ pub enum Command {
         task_id: String,
         action: String,
         request_id: String,
+        actor: String,
     },
 
     /// Requeue failed shards without resetting their durable checkpoints.
-    RetryTask { task_id: String, request_id: String },
+    RetryTask {
+        task_id: String,
+        request_id: String,
+        actor: String,
+    },
 
     /// Pause or resume new shard claims on a worker node.
     ControlNodeExecution {
         node_id: String,
         paused: bool,
         request_id: String,
+        actor: String,
     },
 
     /// Delete a task (soft delete - mark as archived)
@@ -296,6 +306,10 @@ impl Command {
     }
 }
 
+fn default_command_actor() -> String {
+    "system".to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -333,6 +347,8 @@ mod tests {
                 "{}".to_string(), // sink_config
             )),
             shards: vec![],
+            request_id: "create-command-test".into(),
+            actor: "test".into(),
         };
 
         // task_id is generated, so we check the prefix

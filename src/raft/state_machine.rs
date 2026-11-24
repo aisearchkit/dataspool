@@ -6,6 +6,7 @@
 //! Deterministic application of committed Raft commands.
 
 use serde::{Deserialize, Serialize};
+use sha2::Digest;
 use tracing::info;
 
 use super::Command;
@@ -23,6 +24,7 @@ pub struct CommandResponse {
 
 pub struct MetaStateMachine<S: KvStore> {
     task_store: TaskStore<S>,
+    applied_log_index: Option<u64>,
 }
 
 struct CacheBatchRequest {
@@ -50,13 +52,40 @@ impl<S: KvStore + Clone> MetaStateMachine<S> {
     pub fn new(store: S) -> Self {
         Self {
             task_store: TaskStore::new(store),
+            applied_log_index: None,
         }
     }
 
+    pub async fn apply_command_at(
+        &mut self,
+        cmd: Command,
+        log_index: u64,
+    ) -> Result<CommandResponse> {
+        let previous_index = self.applied_log_index.replace(log_index);
+        let result = self.apply_command_inner(cmd).await;
+        self.applied_log_index = previous_index;
+        result
+    }
+
     pub async fn apply_command(&mut self, cmd: Command) -> Result<CommandResponse> {
+        let previous_index = self.applied_log_index.take();
+        let result = self.apply_command_inner(cmd).await;
+        self.applied_log_index = previous_index;
+        result
+    }
+
+    async fn apply_command_inner(&mut self, cmd: Command) -> Result<CommandResponse> {
         info!("Applying committed command: {}", cmd.description());
         match cmd {
-            Command::CreateTask { task, shards } => self.apply_create_task(*task, shards).await,
+            Command::CreateTask {
+                task,
+                shards,
+                request_id,
+                actor,
+            } => {
+                self.apply_create_task(*task, shards, request_id, actor)
+                    .await
+            }
             Command::ClaimShard {
                 shard_id,
                 node_id,
@@ -246,20 +275,51 @@ impl<S: KvStore + Clone> MetaStateMachine<S> {
                 task_id,
                 action,
                 request_id,
-            } => self.apply_control_task(task_id, action, request_id).await,
+                actor,
+            } => {
+                self.apply_control_task(task_id, action, request_id, actor)
+                    .await
+            }
             Command::RetryTask {
                 task_id,
                 request_id,
-            } => self.apply_retry_task(task_id, request_id).await,
+                actor,
+            } => self.apply_retry_task(task_id, request_id, actor).await,
             Command::ControlNodeExecution {
                 node_id,
                 paused,
                 request_id,
-            } => self.apply_control_node(node_id, paused, request_id).await,
+                actor,
+            } => {
+                self.apply_control_node(node_id, paused, request_id, actor)
+                    .await
+            }
             Command::UpdateTaskState { .. }
             | Command::DeleteTask { .. }
             | Command::UpdateConfig { .. } => Ok(rejected("Command is not implemented")),
         }
+    }
+
+    fn audit_event(
+        &self,
+        actor: &str,
+        request_id: &str,
+        action: &str,
+        resource_id: &str,
+        from_state: &str,
+        to_state: &str,
+    ) -> Option<crate::task::AuditEvent> {
+        self.applied_log_index
+            .map(|log_index| crate::task::AuditEvent {
+                log_index,
+                actor: actor.to_string(),
+                request_id: request_id.to_string(),
+                action: action.to_string(),
+                resource_id: resource_id.to_string(),
+                from_state: from_state.to_string(),
+                to_state: to_state.to_string(),
+                occurred_at_ms: chrono::Utc::now().timestamp_millis(),
+            })
     }
 
     async fn apply_control_task(
@@ -267,6 +327,7 @@ impl<S: KvStore + Clone> MetaStateMachine<S> {
         task_id: String,
         action: String,
         request_id: String,
+        actor: String,
     ) -> Result<CommandResponse> {
         if request_id.trim().is_empty() || request_id.len() > 128 {
             return Ok(rejected("request_id must contain 1-128 characters"));
@@ -291,12 +352,32 @@ impl<S: KvStore + Clone> MetaStateMachine<S> {
         let Some(mut task) = self.task_store.get_task(&id).await? else {
             return Ok(rejected("Task not found"));
         };
+        let previous_state = task_state_name(&task.state).to_string();
         let next = match action.as_str() {
             "pause" => match &task.state {
-                crate::types::TaskState::Pending | crate::types::TaskState::Running { .. } => {
-                    crate::types::TaskState::Paused
+                crate::types::TaskState::Pending => crate::types::TaskState::Paused,
+                crate::types::TaskState::Running { .. } => {
+                    let active = self
+                        .task_store
+                        .list_task_shards(&id)
+                        .await?
+                        .iter()
+                        .filter(|shard| {
+                            matches!(shard.state, ShardState::Running { .. })
+                                && shard
+                                    .lease_expires_at
+                                    .as_ref()
+                                    .is_some_and(|expiry| *expiry > chrono::Utc::now())
+                        })
+                        .count();
+                    if active == 0 {
+                        crate::types::TaskState::Paused
+                    } else {
+                        crate::types::TaskState::Pausing
+                    }
                 }
                 crate::types::TaskState::Paused => crate::types::TaskState::Paused,
+                crate::types::TaskState::Pausing => crate::types::TaskState::Pausing,
                 _ => return Ok(rejected("Only pending or running tasks can be paused")),
             },
             "resume" => match &task.state {
@@ -322,9 +403,21 @@ impl<S: KvStore + Clone> MetaStateMachine<S> {
             _ => return Ok(rejected("Unsupported task action")),
         };
         task.set_state(next);
-        self.task_store.save_task(&task).await?;
+        let to_state = task_state_name(&task.state).to_string();
         self.task_store
-            .save_control_request(&request_id, &request_payload)
+            .save_control_batch(
+                &request_id,
+                &request_payload,
+                vec![(format!("task:{}", task.task_id), serde_json::to_vec(&task)?)],
+                self.audit_event(
+                    &actor,
+                    &request_id,
+                    &format!("task.{action}"),
+                    &task_id,
+                    &previous_state,
+                    &to_state,
+                ),
+            )
             .await?;
         Ok(accepted(
             "Task control command committed",
@@ -336,6 +429,7 @@ impl<S: KvStore + Clone> MetaStateMachine<S> {
         &self,
         task_id: String,
         request_id: String,
+        actor: String,
     ) -> Result<CommandResponse> {
         if request_id.trim().is_empty() || request_id.len() > 128 {
             return Ok(rejected("request_id must contain 1-128 characters"));
@@ -370,13 +464,26 @@ impl<S: KvStore + Clone> MetaStateMachine<S> {
         let mut retried = 0usize;
         for shard in &mut shards {
             if matches!(shard.state, ShardState::Failed { .. }) {
+                shard.retry_count = shard.retry_count.saturating_add(1);
                 shard.set_state_at(ShardState::Pending, chrono::Utc::now());
                 retried += 1;
             }
         }
         if retried == 0 {
             self.task_store
-                .save_control_request(&request_id, &request_payload)
+                .save_control_batch(
+                    &request_id,
+                    &request_payload,
+                    Vec::new(),
+                    self.audit_event(
+                        &actor,
+                        &request_id,
+                        "task.retry",
+                        &task_id,
+                        "failed",
+                        "no_failed_shards",
+                    ),
+                )
                 .await?;
             return Ok(accepted(
                 "No failed shards to retry",
@@ -388,22 +495,28 @@ impl<S: KvStore + Clone> MetaStateMachine<S> {
             shard_count: task.shard_count,
         };
         task.refresh_from_shards(&shards, chrono::Utc::now());
-        let mut batch = crate::storage::WriteBatch::new();
+        let mut records = Vec::with_capacity(shards.len() + 1);
         for shard in &shards {
-            batch.put_cf(
-                crate::storage::cf::META,
+            records.push((
                 format!("shard:{}", shard.shard_id),
                 serde_json::to_vec(shard)?,
-            );
+            ));
         }
-        batch.put_cf(
-            crate::storage::cf::META,
-            format!("task:{}", task.task_id),
-            serde_json::to_vec(&task)?,
-        );
-        self.task_store.kv_store().write_batch(batch).await?;
+        records.push((format!("task:{}", task.task_id), serde_json::to_vec(&task)?));
         self.task_store
-            .save_control_request(&request_id, &request_payload)
+            .save_control_batch(
+                &request_id,
+                &request_payload,
+                records,
+                self.audit_event(
+                    &actor,
+                    &request_id,
+                    "task.retry",
+                    &task_id,
+                    "failed",
+                    &format!("requeued:{retried}"),
+                ),
+            )
             .await?;
         Ok(accepted(
             "Failed shards requeued; committed checkpoints preserved",
@@ -416,6 +529,7 @@ impl<S: KvStore + Clone> MetaStateMachine<S> {
         node_id: String,
         paused: bool,
         request_id: String,
+        actor: String,
     ) -> Result<CommandResponse> {
         if request_id.trim().is_empty() || request_id.len() > 128 {
             return Ok(rejected("request_id must contain 1-128 characters"));
@@ -442,14 +556,26 @@ impl<S: KvStore + Clone> MetaStateMachine<S> {
                 "Offline nodes must re-register before execution can resume",
             ));
         }
+        let previous_status = format!("{:?}", node.status).to_ascii_lowercase();
         node.status = if paused {
             crate::types::NodeStatus::Paused
         } else {
             crate::types::NodeStatus::Healthy
         };
-        self.task_store.save_node(&node).await?;
         self.task_store
-            .save_control_request(&request_id, &request_payload)
+            .save_control_batch(
+                &request_id,
+                &request_payload,
+                vec![(format!("node:{}", node.node_id), serde_json::to_vec(&node)?)],
+                self.audit_event(
+                    &actor,
+                    &request_id,
+                    if paused { "node.pause" } else { "node.resume" },
+                    &node_id,
+                    &previous_status,
+                    if paused { "paused" } else { "healthy" },
+                ),
+            )
             .await?;
         Ok(accepted(
             if paused {
@@ -584,6 +710,7 @@ impl<S: KvStore + Clone> MetaStateMachine<S> {
                     shard.task_id, shard.shard_id
                 ))
             })?;
+        let previous_state = task_state_name(&task.state).to_string();
         let mut shards = self.task_store.list_task_shards(&shard.task_id).await?;
         if let Some(existing) = shards
             .iter_mut()
@@ -605,22 +732,85 @@ impl<S: KvStore + Clone> MetaStateMachine<S> {
             )
             .unwrap_or_else(chrono::Utc::now),
         );
-        self.task_store.save_shard_and_task(shard, &task).await
+        if matches!(task.state, crate::types::TaskState::Pausing)
+            && !shards
+                .iter()
+                .any(|candidate| matches!(candidate.state, ShardState::Running { .. }))
+        {
+            task.set_state(crate::types::TaskState::Paused);
+        }
+        let next_state = task_state_name(&task.state).to_string();
+        let audit = if previous_state != next_state {
+            self.applied_log_index
+                .map(|log_index| crate::task::AuditEvent {
+                    log_index,
+                    actor: "system".into(),
+                    request_id: format!("raft:{log_index}"),
+                    action: format!("task.state.{next_state}"),
+                    resource_id: task.task_id.to_string(),
+                    from_state: previous_state,
+                    to_state: next_state,
+                    occurred_at_ms: chrono::Utc::now().timestamp_millis(),
+                })
+        } else {
+            None
+        };
+        self.task_store
+            .save_shard_and_task_with_audit(shard, &task, audit)
+            .await
     }
 
     async fn apply_create_task(
         &self,
         mut task: crate::task::TaskMeta,
-        shards: Vec<ShardMeta>,
+        incoming_shards: Vec<ShardMeta>,
+        request_id: String,
+        actor: String,
     ) -> Result<CommandResponse> {
         let task_id = task.task_id;
-        for shard in &shards {
-            if shard.task_id != task_id {
-                return Ok(rejected("Shard belongs to a different task"));
-            }
+        let request_id = if request_id.trim().is_empty() {
+            // Older persisted Raft entries predate CreateTask request IDs.
+            format!("legacy-create:{task_id}")
+        } else {
+            request_id
+        };
+        if request_id.len() > 128 {
+            return Ok(rejected(
+                "CreateTask request_id must contain at most 128 characters",
+            ));
         }
-        // Re-applying a committed entry after a crash must be safe.
-        if let Some(existing) = self.task_store.get_task(&task_id).await? {
+        if incoming_shards.iter().any(|shard| shard.task_id != task_id) {
+            return Ok(rejected("Shard belongs to a different task"));
+        }
+        let canonical_metadata: std::collections::BTreeMap<_, _> = task.metadata.iter().collect();
+        let payload_fingerprint = format!(
+            "{:x}",
+            sha2::Sha256::digest(serde_json::to_vec(&(
+                &task.name,
+                &task.source_config,
+                &task.sink_config,
+                &task.transform_configs,
+                &task.sharding_config,
+                task.priority,
+                canonical_metadata,
+            ))?)
+        );
+        let request_payload = format!("create:{task_id}:{payload_fingerprint}");
+        if let Some(existing_payload) = self.task_store.get_control_request(&request_id).await? {
+            return if existing_payload == request_payload {
+                Ok(accepted(
+                    "Task creation already committed",
+                    serde_json::json!({"task_id": task_id}),
+                ))
+            } else {
+                Ok(rejected(
+                    "request_id was already used for a different command",
+                ))
+            };
+        }
+
+        let existing_task = self.task_store.get_task(&task_id).await?;
+        let previous_state = if let Some(existing) = existing_task {
             if existing.name != task.name
                 || existing.source_config != task.source_config
                 || existing.sink_config != task.sink_config
@@ -633,32 +823,63 @@ impl<S: KvStore + Clone> MetaStateMachine<S> {
                     "Task creation idempotency key was reused with a different payload",
                 ));
             }
-            // Preserve the committed lifecycle state and timestamps on retries.
+            let state = task_state_name(&existing.state).to_string();
             task = existing;
+            state
         } else {
-            self.task_store.save_task(&task).await?;
-        }
-        for shard in &shards {
-            match self.task_store.get_shard(&shard.shard_id).await? {
-                None => self.task_store.save_shard(shard).await?,
-                Some(existing)
-                    if matches!(&existing.state, ShardState::Running { .. })
-                        && existing.lease_expires_at.is_none()
-                        && existing.lease_id.is_none()
-                        && matches!(&shard.state, ShardState::Pending) =>
+            "absent".to_string()
+        };
+
+        let mut committed_shards = self.task_store.list_task_shards(&task_id).await?;
+        for incoming in incoming_shards {
+            if let Some(existing) = committed_shards
+                .iter_mut()
+                .find(|shard| shard.shard_id == incoming.shard_id)
+            {
+                // Bootstrap may replace a legacy unleased Running record with Pending.
+                if matches!(&existing.state, ShardState::Running { .. })
+                    && existing.lease_expires_at.is_none()
+                    && existing.lease_id.is_none()
+                    && matches!(&incoming.state, ShardState::Pending)
                 {
-                    self.task_store.save_shard(shard).await?;
+                    *existing = incoming;
                 }
-                Some(_) => {}
+            } else {
+                committed_shards.push(incoming);
             }
         }
-        let committed_shards = self.task_store.list_task_shards(&task_id).await?;
-        let aggregate_at = chrono::DateTime::<chrono::Utc>::from(task.updated_at);
-        task.refresh_from_shards(&committed_shards, aggregate_at);
-        self.task_store.save_task(&task).await?;
+        task.refresh_from_shards(&committed_shards, chrono::Utc::now());
+        let to_state = task_state_name(&task.state).to_string();
+        let mut records = Vec::with_capacity(committed_shards.len() * 2 + 1);
+        records.push((format!("task:{}", task.task_id), serde_json::to_vec(&task)?));
+        for shard in &committed_shards {
+            records.push((
+                format!("shard:{}", shard.shard_id),
+                serde_json::to_vec(shard)?,
+            ));
+            records.push((
+                format!("task_shard:{}:{}", shard.task_id, shard.shard_id),
+                Vec::new(),
+            ));
+        }
+        self.task_store
+            .save_control_batch(
+                &request_id,
+                &request_payload,
+                records,
+                self.audit_event(
+                    &actor,
+                    &request_id,
+                    "task.create",
+                    &task_id.to_string(),
+                    &previous_state,
+                    &to_state,
+                ),
+            )
+            .await?;
         Ok(accepted(
             "Task and shards created",
-            serde_json::json!({"task_id": task_id, "shards": shards.len()}),
+            serde_json::json!({"task_id": task_id, "shards": committed_shards.len(), "request_id": request_id}),
         ))
     }
 
@@ -865,9 +1086,16 @@ impl<S: KvStore + Clone> MetaStateMachine<S> {
             .task_store
             .get_task(&shard.task_id)
             .await?
-            .is_some_and(|task| matches!(task.state, crate::types::TaskState::Cancelled { .. }))
+            .is_some_and(|task| {
+                matches!(
+                    task.state,
+                    crate::types::TaskState::Pausing | crate::types::TaskState::Cancelled { .. }
+                )
+            })
         {
-            return Ok(rejected("Task has been cancelled"));
+            return Ok(rejected(
+                "Task is pausing or cancelled; no new source batches are accepted",
+            ));
         }
         let at = chrono::DateTime::from_timestamp_millis(issued_at_ms)
             .ok_or_else(|| DatspoolError::Serialization("Invalid cache batch timestamp".into()))?;
@@ -1078,14 +1306,6 @@ impl<S: KvStore + Clone> MetaStateMachine<S> {
             Some(shard) => shard,
             None => return Ok(rejected("Shard not found")),
         };
-        if self
-            .task_store
-            .get_task(&shard.task_id)
-            .await?
-            .is_some_and(|task| matches!(task.state, crate::types::TaskState::Cancelled { .. }))
-        {
-            return Ok(rejected("Task has been cancelled"));
-        }
         if !lease_matches(
             &shard,
             &node_id,
@@ -1266,6 +1486,19 @@ fn rejected(message: &str) -> CommandResponse {
     }
 }
 
+fn task_state_name(state: &crate::types::TaskState) -> &'static str {
+    match state {
+        crate::types::TaskState::Pending => "pending",
+        crate::types::TaskState::Running { .. } => "running",
+        crate::types::TaskState::Pausing => "pausing",
+        crate::types::TaskState::Paused => "paused",
+        crate::types::TaskState::Canceling => "canceling",
+        crate::types::TaskState::Cancelled { .. } => "cancelled",
+        crate::types::TaskState::Completed { .. } => "completed",
+        crate::types::TaskState::Failed { .. } => "failed",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1288,6 +1521,8 @@ mod tests {
         let mut sm = MetaStateMachine::new(store.kv_store().clone());
         let created = sm
             .apply_command(Command::CreateTask {
+                request_id: format!("create:{}", task.task_id),
+                actor: "system".into(),
                 task: Box::new(task),
                 shards: vec![shard],
             })
@@ -1474,6 +1709,8 @@ mod tests {
 
         let created = sm
             .apply_command(Command::CreateTask {
+                request_id: format!("create:{}", task.task_id),
+                actor: "system".into(),
                 task: Box::new(task),
                 shards: vec![shard_a, shard_b],
             })
@@ -1653,6 +1890,8 @@ mod tests {
         let mut sm = MetaStateMachine::new(store.kv_store().clone());
         assert!(
             sm.apply_command(Command::CreateTask {
+                request_id: format!("create:{}", task.task_id),
+                actor: "system".into(),
                 task: Box::new(task.clone()),
                 shards: shards.clone()
             })
@@ -1675,6 +1914,8 @@ mod tests {
         );
         assert!(
             sm.apply_command(Command::CreateTask {
+                request_id: format!("create:{}", task.task_id),
+                actor: "system".into(),
                 task: Box::new(task),
                 shards
             })
@@ -1682,12 +1923,289 @@ mod tests {
             .unwrap()
             .success
         );
+        let mut conflicting_task = store.get_task(&task_id).await.unwrap().unwrap();
+        conflicting_task.name = "different-payload".into();
+        let conflict = sm
+            .apply_command(Command::CreateTask {
+                request_id: format!("create:{}", task_id),
+                actor: "system".into(),
+                task: Box::new(conflicting_task),
+                shards: store.list_task_shards(&task_id).await.unwrap(),
+            })
+            .await
+            .unwrap();
+        assert!(!conflict.success);
         let committed = store.get_task(&task_id).await.unwrap().unwrap();
         assert!(matches!(
             committed.state,
             crate::types::TaskState::Running { .. }
         ));
         assert_eq!(store.list_task_shards(&task_id).await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn graceful_pause_waits_for_active_lease_checkpoint_and_release() {
+        let dir = tempdir().unwrap();
+        let db = RocksDbStore::open(dir.path()).unwrap();
+        let store = TaskStore::new(db);
+        let mut sm = MetaStateMachine::new(store.kv_store().clone());
+        assert!(
+            sm.apply_command(Command::RegisterNode {
+                node_id: "graceful-worker".into(),
+                address: "127.0.0.1:9001".into(),
+                tags: Default::default(),
+                issued_at_ms: 1_000
+            })
+            .await
+            .unwrap()
+            .success
+        );
+        let task = TaskMeta::new("graceful-pause".into(), "{}".into(), "{}".into());
+        let task_id = task.task_id;
+        let shard = ShardMeta::new(task_id, 0, "{}".into());
+        let shard_id = shard.shard_id;
+        assert!(
+            sm.apply_command(Command::CreateTask {
+                request_id: format!("create:{}", task.task_id),
+                actor: "system".into(),
+                task: Box::new(task),
+                shards: vec![shard]
+            })
+            .await
+            .unwrap()
+            .success
+        );
+        let now = chrono::Utc::now().timestamp_millis();
+        let claim = sm
+            .apply_command(Command::ClaimShard {
+                shard_id: shard_id.to_string(),
+                node_id: "graceful-worker".into(),
+                claim_id: "graceful-claim".into(),
+                issued_at_ms: now,
+                lease_expires_at_ms: now + 30_000,
+            })
+            .await
+            .unwrap();
+        let fencing_token = claim.data.unwrap()["fencing_token"].as_u64().unwrap();
+        assert!(
+            sm.apply_command(Command::ControlTask {
+                task_id: task_id.to_string(),
+                action: "pause".into(),
+                request_id: "graceful-pause-1".into(),
+                actor: "operator".into()
+            })
+            .await
+            .unwrap()
+            .success
+        );
+        assert!(matches!(
+            store.get_task(&task_id).await.unwrap().unwrap().state,
+            crate::types::TaskState::Pausing
+        ));
+        assert!(
+            !sm.apply_command(Command::ClaimShard {
+                shard_id: shard_id.to_string(),
+                node_id: "graceful-worker".into(),
+                claim_id: "blocked-claim".into(),
+                issued_at_ms: now,
+                lease_expires_at_ms: now + 30_000
+            })
+            .await
+            .unwrap()
+            .success
+        );
+        assert!(
+            sm.apply_command(Command::ReleaseShardLease {
+                shard_id: shard_id.to_string(),
+                node_id: "graceful-worker".into(),
+                fencing_token,
+                issued_at_ms: now + 1
+            })
+            .await
+            .unwrap()
+            .success
+        );
+        assert!(matches!(
+            store.get_task(&task_id).await.unwrap().unwrap().state,
+            crate::types::TaskState::Paused
+        ));
+    }
+
+    #[tokio::test]
+    async fn cancellation_stops_new_work_but_allows_inflight_checkpoint_to_commit() {
+        let dir = tempdir().unwrap();
+        let db = RocksDbStore::open(dir.path()).unwrap();
+        let store = TaskStore::new(db);
+        let mut sm = MetaStateMachine::new(store.kv_store().clone());
+        assert!(
+            sm.apply_command(Command::RegisterNode {
+                node_id: "cancel-worker".into(),
+                address: "127.0.0.1:9002".into(),
+                tags: Default::default(),
+                issued_at_ms: 1_000
+            })
+            .await
+            .unwrap()
+            .success
+        );
+        let task = TaskMeta::new("cancel-inflight".into(), "{}".into(), "{}".into());
+        let task_id = task.task_id;
+        let shard = ShardMeta::new(task_id, 0, "{}".into());
+        let shard_id = shard.shard_id;
+        assert!(
+            sm.apply_command(Command::CreateTask {
+                request_id: format!("create:{task_id}"),
+                actor: "operator".into(),
+                task: Box::new(task),
+                shards: vec![shard]
+            })
+            .await
+            .unwrap()
+            .success
+        );
+        let now = chrono::Utc::now().timestamp_millis();
+        let claim = sm
+            .apply_command(Command::ClaimShard {
+                shard_id: shard_id.to_string(),
+                node_id: "cancel-worker".into(),
+                claim_id: "cancel-claim".into(),
+                issued_at_ms: now,
+                lease_expires_at_ms: now + 30_000,
+            })
+            .await
+            .unwrap();
+        let fencing_token = claim.data.unwrap()["fencing_token"].as_u64().unwrap();
+        assert!(
+            sm.apply_command(Command::ControlTask {
+                task_id: task_id.to_string(),
+                action: "cancel".into(),
+                request_id: "cancel-inflight-1".into(),
+                actor: "operator".into()
+            })
+            .await
+            .unwrap()
+            .success
+        );
+        let progress = sm
+            .apply_command(Command::UpdateShardProgress {
+                shard_id: shard_id.to_string(),
+                node_id: "cancel-worker".into(),
+                fencing_token,
+                issued_at_ms: now + 1,
+                processed_records: 5,
+                processed_bytes: 512,
+                offset: serde_json::to_string(&crate::pipeline::OffsetValue::DocumentCount(5))
+                    .unwrap(),
+            })
+            .await
+            .unwrap();
+        assert!(
+            progress.success,
+            "an in-flight committed batch must checkpoint after cancellation"
+        );
+        let completion = sm
+            .apply_command(Command::CompleteShard {
+                shard_id: shard_id.to_string(),
+                node_id: "cancel-worker".into(),
+                fencing_token,
+                issued_at_ms: now + 2,
+                total_records: 5,
+            })
+            .await
+            .unwrap();
+        assert!(
+            !completion.success,
+            "cancelled work must not transition to completed"
+        );
+        assert!(
+            sm.apply_command(Command::ReleaseShardLease {
+                shard_id: shard_id.to_string(),
+                node_id: "cancel-worker".into(),
+                fencing_token,
+                issued_at_ms: now + 3,
+            })
+            .await
+            .unwrap()
+            .success
+        );
+        let restored = store.get_shard(&shard_id).await.unwrap().unwrap();
+        assert_eq!(restored.records_processed, 5);
+        assert_eq!(
+            restored.offset,
+            crate::pipeline::OffsetValue::DocumentCount(5)
+        );
+        assert!(matches!(
+            store.get_task(&task_id).await.unwrap().unwrap().state,
+            crate::types::TaskState::Cancelled { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn audit_event_contains_actor_request_and_applied_raft_index() {
+        let dir = tempdir().unwrap();
+        let db = RocksDbStore::open(dir.path()).unwrap();
+        let store = TaskStore::new(db);
+        let task = TaskMeta::new("audited-task".into(), "{}".into(), "{}".into());
+        let task_id = task.task_id;
+        let mut sm = MetaStateMachine::new(store.kv_store().clone());
+        assert!(
+            sm.apply_command_at(
+                Command::CreateTask {
+                    request_id: "audit-create-1".into(),
+                    actor: "bob".into(),
+                    task: Box::new(task),
+                    shards: vec![],
+                },
+                76,
+            )
+            .await
+            .unwrap()
+            .success
+        );
+        assert!(
+            sm.apply_command_at(
+                Command::ControlTask {
+                    task_id: task_id.to_string(),
+                    action: "pause".into(),
+                    request_id: "audit-pause-1".into(),
+                    actor: "alice".into()
+                },
+                77
+            )
+            .await
+            .unwrap()
+            .success
+        );
+        assert!(
+            sm.apply_command_at(
+                Command::ControlTask {
+                    task_id: task_id.to_string(),
+                    action: "pause".into(),
+                    request_id: "audit-pause-1".into(),
+                    actor: "alice".into(),
+                },
+                78
+            )
+            .await
+            .unwrap()
+            .success
+        );
+        let events = store.list_audit_events(10).await.unwrap();
+        assert_eq!(
+            events.len(),
+            2,
+            "an idempotent replay must not duplicate its audit event"
+        );
+        assert_eq!(events[0].log_index, 77);
+        assert_eq!(events[0].actor, "alice");
+        assert_eq!(events[0].request_id, "audit-pause-1");
+        assert_eq!(events[0].action, "task.pause");
+        assert_eq!(events[0].from_state, "pending");
+        assert_eq!(events[0].to_state, "paused");
+        assert_eq!(events[1].log_index, 76);
+        assert_eq!(events[1].actor, "bob");
+        assert_eq!(events[1].request_id, "audit-create-1");
+        assert_eq!(events[1].action, "task.create");
     }
 
     #[tokio::test]
@@ -1701,6 +2219,8 @@ mod tests {
         let mut sm = MetaStateMachine::new(store.kv_store().clone());
         assert!(
             sm.apply_command(Command::CreateTask {
+                request_id: format!("create:{}", task.task_id),
+                actor: "system".into(),
                 task: Box::new(task),
                 shards: vec![shard]
             })
@@ -1713,6 +2233,7 @@ mod tests {
             task_id: task_id.to_string(),
             action: "pause".into(),
             request_id: "pause-1".into(),
+            actor: "test".into(),
         };
         assert!(sm.apply_command(pause.clone()).await.unwrap().success);
         assert!(sm.apply_command(pause).await.unwrap().success);
@@ -1738,6 +2259,7 @@ mod tests {
             task_id: task_id.to_string(),
             action: "resume".into(),
             request_id: "resume-1".into(),
+            actor: "test".into(),
         };
         assert!(sm.apply_command(resume).await.unwrap().success);
         assert!(matches!(
@@ -1749,6 +2271,7 @@ mod tests {
             task_id: task_id.to_string(),
             action: "cancel".into(),
             request_id: "cancel-1".into(),
+            actor: "test".into(),
         };
         assert!(sm.apply_command(cancel.clone()).await.unwrap().success);
         assert!(sm.apply_command(cancel).await.unwrap().success);
@@ -1760,6 +2283,7 @@ mod tests {
             task_id: task_id.to_string(),
             action: "resume".into(),
             request_id: "cancel-1".into(),
+            actor: "test".into(),
         };
         assert!(!sm.apply_command(conflicting).await.unwrap().success);
     }
@@ -1787,6 +2311,8 @@ mod tests {
         let shard_id = shard.shard_id;
         assert!(
             sm.apply_command(Command::CreateTask {
+                request_id: format!("create:{}", task.task_id),
+                actor: "system".into(),
                 task: Box::new(task),
                 shards: vec![shard]
             })
@@ -1798,7 +2324,8 @@ mod tests {
             sm.apply_command(Command::ControlNodeExecution {
                 node_id: "worker-control".into(),
                 paused: true,
-                request_id: "node-pause-1".into()
+                request_id: "node-pause-1".into(),
+                actor: "test".into()
             })
             .await
             .unwrap()
@@ -1835,7 +2362,8 @@ mod tests {
             sm.apply_command(Command::ControlNodeExecution {
                 node_id: "worker-control".into(),
                 paused: false,
-                request_id: "node-resume-1".into()
+                request_id: "node-resume-1".into(),
+                actor: "test".into()
             })
             .await
             .unwrap()
@@ -1866,6 +2394,8 @@ mod tests {
         let mut sm = MetaStateMachine::new(store.kv_store().clone());
         assert!(
             sm.apply_command(Command::CreateTask {
+                request_id: format!("create:{}", task.task_id),
+                actor: "system".into(),
                 task: Box::new(task),
                 shards: vec![shard]
             })
@@ -1876,6 +2406,7 @@ mod tests {
         let retry = Command::RetryTask {
             task_id: task_id.to_string(),
             request_id: "retry-1".into(),
+            actor: "test".into(),
         };
         let result = sm.apply_command(retry.clone()).await.unwrap();
         assert!(result.success, "{}", result.message);
@@ -1888,5 +2419,7 @@ mod tests {
         );
         assert_eq!(restored.records_processed, 42);
         assert_eq!(restored.bytes_processed, 8192);
+        assert_eq!(restored.retry_count, 1);
+        assert_eq!(store.operational_metrics().await.unwrap().retries_total, 1);
     }
 }

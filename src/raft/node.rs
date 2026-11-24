@@ -217,6 +217,8 @@ impl RaftNode {
             }
             let response = self
                 .propose(Command::CreateTask {
+                    request_id: format!("create:{}", task.task_id),
+                    actor: "system".into(),
                     task: Box::new(task),
                     shards: shards.clone(),
                 })
@@ -539,6 +541,8 @@ mod cluster_tests {
         let shard_id = shard.shard_id;
         let created = leader
             .propose(Command::CreateTask {
+                request_id: format!("create:{}", task.task_id),
+                actor: "system".into(),
                 task: Box::new(task),
                 shards: vec![shard],
             })
@@ -849,6 +853,8 @@ mod cluster_tests {
         let recovery_shard = ShardMeta::new(recovery_task_id, 0, "{}".into());
         let recovery_created = worker_node
             .propose(Command::CreateTask {
+                request_id: format!("create:{}", recovery_task.task_id),
+                actor: "system".into(),
                 task: Box::new(recovery_task),
                 shards: vec![recovery_shard],
             })
@@ -907,6 +913,8 @@ mod cluster_tests {
         let after_failover_shard = ShardMeta::new(after_failover_id, 0, "{}".into());
         let failover_created = nodes[new_leader_index]
             .propose(Command::CreateTask {
+                request_id: format!("create:{}", after_failover.task_id),
+                actor: "system".into(),
                 task: Box::new(after_failover),
                 shards: vec![after_failover_shard],
             })
