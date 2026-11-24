@@ -314,11 +314,8 @@ async fn test_client_write(
     Json(mut command): Json<super::Command>,
 ) -> Result<Json<super::CommandResponse>, StatusCode> {
     super::node::normalize_command_timestamp(&mut command).map_err(|_| StatusCode::BAD_REQUEST)?;
-    state
-        .raft
-        .read()
-        .await
-        .clone()
+    let raft = state.raft.read().await;
+    raft.as_ref()
         .ok_or(StatusCode::SERVICE_UNAVAILABLE)?
         .client_write(command)
         .await
@@ -331,11 +328,8 @@ async fn test_vote(
     State(state): State<MutableRaftHttpState>,
     Json(request): Json<VoteRequest<RocksNodeId>>,
 ) -> Result<Json<VoteResponse<RocksNodeId>>, StatusCode> {
-    state
-        .raft
-        .read()
-        .await
-        .clone()
+    let raft = state.raft.read().await;
+    raft.as_ref()
         .ok_or(StatusCode::SERVICE_UNAVAILABLE)?
         .vote(request)
         .await
@@ -348,11 +342,8 @@ async fn test_append(
     State(state): State<MutableRaftHttpState>,
     Json(request): Json<AppendEntriesRequest<TypeConfig>>,
 ) -> Result<Json<AppendEntriesResponse<RocksNodeId>>, StatusCode> {
-    state
-        .raft
-        .read()
-        .await
-        .clone()
+    let raft = state.raft.read().await;
+    raft.as_ref()
         .ok_or(StatusCode::SERVICE_UNAVAILABLE)?
         .append_entries(request)
         .await
@@ -365,11 +356,8 @@ async fn test_snapshot(
     State(state): State<MutableRaftHttpState>,
     Json(request): Json<InstallSnapshotRequest<TypeConfig>>,
 ) -> Result<Json<InstallSnapshotResponse<RocksNodeId>>, StatusCode> {
-    state
-        .raft
-        .read()
-        .await
-        .clone()
+    let raft = state.raft.read().await;
+    raft.as_ref()
         .ok_or(StatusCode::SERVICE_UNAVAILABLE)?
         .install_snapshot(request)
         .await
