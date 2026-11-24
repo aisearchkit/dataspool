@@ -783,6 +783,7 @@ struct TestRaftGroup {
     addresses: Vec<String>,
     tokens: String,
     servers: Vec<Option<JoinHandle<()>>>,
+    server_shutdowns: Vec<Option<ShutdownToken>>,
     ids: [u64; 3],
 }
 
@@ -812,6 +813,7 @@ impl TestRaftGroup {
         let config = raft_config(Duration::from_millis(150), Duration::from_millis(600));
         let mut nodes = Vec::new();
         let mut servers = Vec::new();
+        let mut server_shutdowns = Vec::new();
         for index in 0..3 {
             let node = RaftNode::new(
                 ids[index],
@@ -824,9 +826,14 @@ impl TestRaftGroup {
             .unwrap();
             let router = raft_router(node.handle(), token.to_string());
             let listener = listeners.remove(0);
+            let shutdown = ShutdownToken::new();
+            let server_shutdown = shutdown.clone();
             servers.push(Some(tokio::spawn(async move {
-                let _ = axum::serve(listener, router).await;
+                let _ = axum::serve(listener, router)
+                    .with_graceful_shutdown(server_shutdown.cancelled_owned())
+                    .await;
             })));
+            server_shutdowns.push(Some(shutdown));
             nodes.push(Some(node));
         }
         nodes[0]
@@ -842,6 +849,7 @@ impl TestRaftGroup {
             addresses,
             tokens: token.to_string(),
             servers,
+            server_shutdowns,
             ids,
         };
         group.wait_for_leader(None).await;
@@ -875,8 +883,16 @@ impl TestRaftGroup {
     }
 
     async fn stop(&mut self, index: usize) {
-        if let Some(server) = self.servers[index].take() {
-            server.abort();
+        if let Some(shutdown) = self.server_shutdowns[index].take() {
+            shutdown.cancel();
+        }
+        if let Some(mut server) = self.servers[index].take() {
+            if tokio::time::timeout(Duration::from_secs(2), &mut server)
+                .await
+                .is_err()
+            {
+                server.abort();
+            }
             let _ = server.await;
         }
         if let Some(node) = self.nodes[index].take() {
@@ -903,9 +919,14 @@ impl TestRaftGroup {
         .await
         .unwrap();
         let router = raft_router(node.handle(), self.tokens.clone());
+        let shutdown = ShutdownToken::new();
+        let server_shutdown = shutdown.clone();
         self.servers[index] = Some(tokio::spawn(async move {
-            let _ = axum::serve(listener, router).await;
+            let _ = axum::serve(listener, router)
+                .with_graceful_shutdown(server_shutdown.cancelled_owned())
+                .await;
         }));
+        self.server_shutdowns[index] = Some(shutdown);
         self.nodes[index] = Some(node);
     }
 
