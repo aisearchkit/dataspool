@@ -50,3 +50,5 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Run library and binary unit tests
         run: cargo test --lib --bins --all-features
+      - name: Run multi-member Raft failover integration
+        run: cargo test --test raft_failover --all-features -- --nocapture
