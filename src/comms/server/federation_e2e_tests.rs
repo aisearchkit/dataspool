@@ -1218,14 +1218,13 @@ async fn federation_mtls_recovery_survives_two_source_and_target_leader_changes(
     // scenario in the recovery window until the schedule has been exhausted.
     let config = ChaosConfig::default();
     let mut chaos = ChaosScheduler::new(0xDADA_2026_1124, config);
-    let source_follower = (0..3)
-        .find(|index| *index != source_leader && *index != source_leader_2)
-        .expect("source group has one non-leader member");
-    let target_follower = (0..3)
-        .find(|index| *index != target_leader && *index != target_leader_2)
-        .expect("target group has one non-leader member");
+    // Reuse the former source leader as the chaos member: it is already down,
+    // while the replacement leader and the third member retain quorum. The
+    // former target leader has already restarted and can be independently flapped.
+    let source_follower = source_leader;
+    let target_follower = target_leader;
     let mut partitioned = true;
-    let mut source_follower_running = true;
+    let mut source_follower_running = false;
     let mut target_follower_running = true;
     let mut event_log = Vec::new();
     while let Some(event) = chaos.next_event() {
@@ -1355,23 +1354,15 @@ async fn federation_mtls_recovery_survives_two_source_and_target_leader_changes(
         .wait_replicated_migration("ha-leader-change-migration", MigrationState::Completed)
         .await;
 
-    // Restart old leader from its own disk and wait until its state catches up.
-    source.restart(source_leader).await;
-    tokio::time::timeout(Duration::from_secs(15), async {
-        loop {
-            let state = source
-                .task_store(source_leader)
-                .get_federated_migration("ha-leader-change-migration")
-                .await
-                .unwrap();
-            if state.is_some_and(|migration| migration.state == MigrationState::Completed) {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-    })
-    .await
-    .expect("restarted former leader did not catch up");
+    // Ensure the former source leader is back online and has applied the
+    // terminal record, whether the seeded schedule restarted it earlier or
+    // left it offline until this point.
+    if !source_follower_running {
+        source.restart(source_follower).await;
+    }
+    source
+        .wait_replicated_migration("ha-leader-change-migration", MigrationState::Completed)
+        .await;
 
     // Crash the replacement leader as well: a second election must preserve the
     // terminal state and reconciliation must remain a no-op on the new leader.
