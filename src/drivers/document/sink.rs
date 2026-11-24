@@ -1098,7 +1098,7 @@ mod tests {
                     break;
                 }
                 request.extend_from_slice(&chunk[..read]);
-                if let Some(header_end) = request.windows(4).position(|w| w == b"\\r\\n\\r\\n") {
+                if let Some(header_end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
                     let headers =
                         String::from_utf8_lossy(&request[..header_end]).to_ascii_lowercase();
                     let content_length = headers
@@ -1121,7 +1121,7 @@ mod tests {
             for attempt in 0..2 {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let request = read_request(&mut stream).await;
-                let header_end = request.find("\\r\\n\\r\\n").unwrap() + 4;
+                let header_end = request.find("\r\n\r\n").unwrap() + 4;
                 let action_lines = request[header_end..].lines().step_by(2).count();
                 request_sizes.push(action_lines);
                 let body = if attempt == 0 {
@@ -1130,7 +1130,7 @@ mod tests {
                     r#"{"errors":false,"items":[{"index":{"status":201}}]}"#
                 };
                 let response = format!(
-                    "HTTP/1.1 200 OK\\r\\nContent-Type: application/json\\r\\nContent-Length: {}\\r\\nConnection: close\\r\\n\\r\\n{body}",
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                     body.len()
                 );
                 stream.write_all(response.as_bytes()).await.unwrap();
