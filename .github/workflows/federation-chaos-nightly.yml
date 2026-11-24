@@ -1,0 +1,82 @@
+name: Nightly Federation Chaos Soak
+
+on:
+  schedule:
+    - cron: '41 2 * * *'
+  workflow_dispatch:
+    inputs:
+      seeds:
+        description: Comma-separated decimal or 0x-prefixed hexadecimal seeds
+        required: false
+        type: string
+        default: '0xDADA202611240001,0xDADA202611240002,0xDADA202611240003,0xDADA202611240004,0xDADA202611240005,0xDADA202611240006,0xDADA202611240007,0xDADA202611240008'
+      rounds:
+        description: Chaos events per seed (1-512)
+        required: false
+        type: number
+        default: 64
+
+permissions:
+  contents: read
+
+concurrency:
+  group: federation-chaos-nightly-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  CXXFLAGS: -include cstdint
+
+jobs:
+  federation-chaos:
+    name: Federation chaos multi-seed soak
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install native build dependencies
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler clang libclang-dev llvm-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run deterministic multi-seed federation chaos suite
+        env:
+          FEDERATION_CHAOS_ARTIFACT_DIR: artifacts/federation-chaos
+          FEDERATION_CHAOS_ROUNDS: ${{ github.event.inputs.rounds || '64' }}
+          FEDERATION_CHAOS_MAX_DELAY_MS: '40'
+          FEDERATION_CHAOS_SEEDS: ${{ github.event.inputs.seeds || '0xDADA202611240001,0xDADA202611240002,0xDADA202611240003,0xDADA202611240004,0xDADA202611240005,0xDADA202611240006,0xDADA202611240007,0xDADA202611240008' }}
+        run: |
+          mkdir -p "$FEDERATION_CHAOS_ARTIFACT_DIR"
+          overall_status=0
+          IFS=',' read -r -a seeds <<< "$FEDERATION_CHAOS_SEEDS"
+          for raw_seed in "${seeds[@]}"; do
+            seed="$(printf '%s' "$raw_seed" | xargs)"
+            [ -n "$seed" ] || continue
+            safe_seed="${seed//[^a-zA-Z0-9_-]/_}"
+            log_file="$FEDERATION_CHAOS_ARTIFACT_DIR/seed-${safe_seed}.log"
+            echo "::group::Federation chaos seed ${seed}"
+            echo "Replay seed: ${seed}; rounds: ${FEDERATION_CHAOS_ROUNDS}"
+            set +e
+            FEDERATION_CHAOS_SEED="$seed" cargo test --lib --all-features \
+              comms::server::federation_e2e_tests::federation_mtls_recovery_survives_two_source_and_target_leader_changes \
+              -- --exact --nocapture > "$log_file" 2>&1
+            result=$?
+            set -e
+            cat "$log_file"
+            if [ "$result" -ne 0 ]; then
+              echo "Seed ${seed} failed with exit code ${result}"
+              overall_status=1
+            else
+              echo "Seed ${seed} passed"
+            fi
+            echo "::endgroup::"
+          done
+          exit "$overall_status"
+      - name: Upload replay seeds, event logs, and Raft state snapshots
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: federation-chaos-${{ github.run_id }}-${{ github.run_attempt }}
+          path: artifacts/federation-chaos/
+          if-no-files-found: error
+          retention-days: 90

@@ -102,7 +102,19 @@ On SIGINT or SIGTERM, the HTTP server stops accepting new requests and drains ac
 
 ## Federation chaos and recovery validation
 
-The federation integration suite includes a deterministic chaos scheduler on top of two independent three-member Raft groups and a real mTLS gRPC connection routed through a bidirectional TCP fault proxy. `ChaosConfig` bounds the number of rounds and maximum injected delay and assigns weights to partition/heal, commit-ACK loss, independent follower crash/restart, and duplicate-reconcile events. Crash and restart are separate scheduled actions, so a member can remain offline across intervening reconciliation rounds. The xorshift64* scheduler is deterministic across platforms; a failure report includes the seed and ordered event log so the exact sequence can be replayed by constructing `ChaosScheduler` with the same seed and configuration.
+The federation integration suite includes a deterministic chaos scheduler on top of two independent three-member Raft groups and a real mTLS gRPC connection routed through a bidirectional TCP fault proxy. `ChaosConfig` bounds the number of rounds and maximum injected delay and assigns weights to partition/heal, commit-ACK loss, independent follower crash/restart, and duplicate-reconcile events. Crash and restart are separate scheduled actions, so a member can remain offline across intervening reconciliation rounds. The xorshift64* scheduler is deterministic across platforms. The scenario accepts `FEDERATION_CHAOS_SEED`, `FEDERATION_CHAOS_ROUNDS` (1-512), and `FEDERATION_CHAOS_MAX_DELAY_MS` (0-5000) so a fixed seed and bounded configuration can be replayed without changing source code. When `FEDERATION_CHAOS_ARTIFACT_DIR` is set, the test continuously writes an atomic JSON artifact containing the seed, full event sequence, scheduler configuration, replay command, and logical state snapshots for all three Source and all three Target Raft members. Each member snapshot includes its running/offline status, OpenRaft metrics, migration record, remote-operation record, and task records. The artifact is refreshed after each injected event and after terminal/fencing checks, so a panic leaves the last completed checkpoint available.
+
+The independent `.github/workflows/federation-chaos-nightly.yml` workflow runs eight deterministic seeds nightly (or a caller-supplied comma-separated seed list on manual dispatch), with 64 rounds per seed by default. It continues through the remaining seeds after a failure and uploads per-seed logs plus JSON state snapshots as a 90-day GitHub Actions artifact. This workload is separate from PR CI. To replay a captured seed locally or in a one-off CI job:
+
+```bash
+export FEDERATION_CHAOS_SEED=0xDADA202611240001
+export FEDERATION_CHAOS_ROUNDS=64
+export FEDERATION_CHAOS_MAX_DELAY_MS=40
+export FEDERATION_CHAOS_ARTIFACT_DIR=artifacts/federation-chaos
+cargo test --lib --all-features \
+  comms::server::federation_e2e_tests::federation_mtls_recovery_survives_two_source_and_target_leader_changes \
+  -- --exact --nocapture
+```
 
 The in-doubt commit scenario deliberately keeps the source migration in `Committing`: an isolated link cannot reach the target, while an available link drops the Commit response only after the target has durably committed. This exercises retries against the target's idempotent durable operation record rather than treating a successful transport response as the commit point. The suite verifies that source and target Raft members converge, the target provisions exactly one task, and stale fencing tokens cannot mutate shard progress. The scheduler is bounded for normal CI; longer randomized soak runs should use a separate scheduled workflow rather than slowing every pull request.
 

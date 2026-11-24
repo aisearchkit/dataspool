@@ -320,6 +320,14 @@ impl ChaosScheduler {
                 <= 10,
             "chaos event weights must sum to at most 10"
         );
+        assert!(
+            config.rounds > 0 && config.rounds <= 512,
+            "chaos rounds must be between 1 and 512"
+        );
+        assert!(
+            config.max_delay_ms <= 5_000,
+            "chaos delay must not exceed 5000ms"
+        );
         Self {
             seed,
             state: if seed == 0 {
@@ -377,6 +385,107 @@ impl ChaosScheduler {
 
     fn seed(&self) -> u64 {
         self.seed
+    }
+}
+
+fn chaos_env_u64(name: &str, default: u64) -> u64 {
+    let Ok(value) = std::env::var(name) else {
+        return default;
+    };
+    let parsed = value
+        .strip_prefix("0x")
+        .map(|hex| u64::from_str_radix(hex, 16))
+        .unwrap_or_else(|| value.parse::<u64>());
+    parsed.unwrap_or_else(|error| panic!("invalid {name}={value:?}: {error}"))
+}
+
+struct ChaosArtifactRecorder {
+    seed: u64,
+    config: ChaosConfig,
+    events: Vec<String>,
+    source_snapshot: Vec<String>,
+    target_snapshot: Vec<String>,
+    path: Option<PathBuf>,
+}
+
+impl ChaosArtifactRecorder {
+    fn new(seed: u64, config: ChaosConfig) -> Self {
+        let path = std::env::var_os("FEDERATION_CHAOS_ARTIFACT_DIR").map(|directory| {
+            PathBuf::from(directory).join(format!("federation-chaos-seed-{seed:016x}.json"))
+        });
+        Self {
+            seed,
+            config,
+            events: Vec::new(),
+            source_snapshot: Vec::new(),
+            target_snapshot: Vec::new(),
+            path,
+        }
+    }
+
+    fn record_event(&mut self, event: ChaosEvent) {
+        self.record_note(format!("{event:?}"));
+    }
+
+    fn record_note(&mut self, note: String) {
+        self.events
+            .push(format!("{:04}: {note}", self.events.len() + 1));
+        self.persist();
+    }
+
+    async fn capture(&mut self, source: &TestRaftGroup, target: &TestRaftGroup) {
+        self.source_snapshot = source
+            .diagnostic_snapshot("ha-leader-change-migration")
+            .await;
+        self.target_snapshot = target
+            .diagnostic_snapshot("ha-leader-change-migration")
+            .await;
+        self.persist();
+    }
+
+    fn persist(&self) {
+        let Some(path) = &self.path else {
+            return;
+        };
+        if let Some(parent) = path.parent()
+            && let Err(error) = std::fs::create_dir_all(parent)
+        {
+            eprintln!("failed to create chaos artifact directory: {error}");
+            return;
+        }
+        let payload = serde_json::json!({
+            "schema_version": 1,
+            "seed": format!("0x{:016x}", self.seed),
+            "seed_decimal": self.seed,
+            "config": {
+                "rounds": self.config.rounds,
+                "max_delay_ms": self.config.max_delay_ms,
+                "partition_weight": self.config.partition_weight,
+                "ack_loss_weight": self.config.ack_loss_weight,
+                "crash_restart_weight": self.config.crash_restart_weight,
+                "duplicate_reconcile_weight": self.config.duplicate_reconcile_weight,
+            },
+            "events": self.events,
+            "source_raft_members": self.source_snapshot,
+            "target_raft_members": self.target_snapshot,
+            "replay": format!(
+                "FEDERATION_CHAOS_SEED=0x{:016x} FEDERATION_CHAOS_ROUNDS={} FEDERATION_CHAOS_ARTIFACT_DIR=artifacts/federation-chaos cargo test --lib --all-features comms::server::federation_e2e_tests::federation_mtls_recovery_survives_two_source_and_target_leader_changes -- --exact --nocapture",
+                self.seed,
+                self.config.rounds,
+            ),
+        });
+        let temporary = path.with_extension("json.tmp");
+        match serde_json::to_vec_pretty(&payload)
+            .map_err(std::io::Error::other)
+            .and_then(|bytes| std::fs::write(&temporary, bytes))
+            .and_then(|()| std::fs::rename(&temporary, path))
+        {
+            Ok(()) => {}
+            Err(error) => eprintln!(
+                "failed to persist chaos artifact {}: {error}",
+                path.display()
+            ),
+        }
     }
 }
 
@@ -867,6 +976,42 @@ impl TestRaftGroup {
         Arc::new(TaskStore::new(self.stores[index].clone()))
     }
 
+    async fn diagnostic_snapshot(&self, migration_id: &str) -> Vec<String> {
+        let mut members = Vec::with_capacity(self.stores.len());
+        for index in 0..self.stores.len() {
+            let store = self.task_store(index);
+            let migration = store
+                .get_federated_migration(migration_id)
+                .await
+                .map(|value| format!("{value:#?}"))
+                .unwrap_or_else(|error| format!("read_error: {error}"));
+            let remote_operation = store
+                .get_federated_remote_operation(migration_id, 0)
+                .await
+                .map(|value| format!("{value:#?}"))
+                .unwrap_or_else(|error| format!("read_error: {error}"));
+            let tasks = store
+                .list_tasks()
+                .await
+                .map(|value| format!("{value:#?}"))
+                .unwrap_or_else(|error| format!("read_error: {error}"));
+            let raft_metrics = self.nodes[index]
+                .as_ref()
+                .map(|node| format!("{:#?}", node.handle().metrics().borrow().clone()))
+                .unwrap_or_else(|| "offline".to_string());
+            members.push(format!(
+                "member_id={} running={} raft_metrics={} migration={} remote_operation={} tasks={}",
+                self.ids[index],
+                self.nodes[index].is_some(),
+                raft_metrics,
+                migration,
+                remote_operation,
+                tasks,
+            ));
+        }
+        members
+    }
+
     async fn wait_for_leader(&self, excluded: Option<usize>) -> usize {
         tokio::time::timeout(Duration::from_secs(15), async {
             loop {
@@ -1245,8 +1390,13 @@ async fn federation_mtls_recovery_survives_two_source_and_target_leader_changes(
     // its seed. While the commit is in-doubt, an open link always loses its ACK;
     // a partitioned link fails before reaching the target. This keeps the
     // scenario in the recovery window until the schedule has been exhausted.
-    let config = ChaosConfig::default();
-    let mut chaos = ChaosScheduler::new(0xDADA_2026_1124, config);
+    let mut config = ChaosConfig::default();
+    config.rounds = chaos_env_u64("FEDERATION_CHAOS_ROUNDS", config.rounds as u64) as usize;
+    config.max_delay_ms = chaos_env_u64("FEDERATION_CHAOS_MAX_DELAY_MS", config.max_delay_ms);
+    let seed = chaos_env_u64("FEDERATION_CHAOS_SEED", 0xDADA_2026_1124);
+    let mut chaos = ChaosScheduler::new(seed, config);
+    let mut artifacts = ChaosArtifactRecorder::new(seed, config);
+    artifacts.capture(&source, &target).await;
     let source_follower = (0..3)
         .find(|index| *index != source_leader && *index != source_leader_2)
         .expect("source group has one non-leader member");
@@ -1261,6 +1411,7 @@ async fn federation_mtls_recovery_survives_two_source_and_target_leader_changes(
     let mut event_log = Vec::new();
     while let Some(event) = chaos.next_event() {
         event_log.push(format!("{event:?}"));
+        artifacts.record_event(event);
         match event {
             ChaosEvent::Delay(milliseconds) => {
                 proxy.set_delay(Duration::from_millis(milliseconds));
@@ -1341,6 +1492,7 @@ async fn federation_mtls_recovery_survives_two_source_and_target_leader_changes(
             .await
             .unwrap()
             .unwrap();
+        artifacts.capture(&source, &target).await;
         assert_eq!(
             current.state,
             MigrationState::Committing,
@@ -1398,6 +1550,7 @@ async fn federation_mtls_recovery_survives_two_source_and_target_leader_changes(
     source
         .wait_replicated_migration("ha-leader-change-migration", MigrationState::Completed)
         .await;
+    artifacts.capture(&source, &target).await;
 
     // Crash the replacement leader as well: a second election must preserve the
     // terminal state and reconciliation must remain a no-op on the new leader.
@@ -1429,6 +1582,7 @@ async fn federation_mtls_recovery_survives_two_source_and_target_leader_changes(
             .state,
         FederatedRemoteOperationState::Committed
     );
+    artifacts.capture(&source, &target).await;
 
     // A stale generation from the pre-failover reconciler cannot mutate the
     // completed migration. Replaying an identical request ID is idempotent;
@@ -1489,6 +1643,7 @@ async fn federation_mtls_recovery_survives_two_source_and_target_leader_changes(
     // Repeatedly flap the inter-cluster TCP path and run terminal reconciliation.
     // The operation must converge without recreating tasks or changing terminal state.
     for cycle in 0..20 {
+        artifacts.record_note(format!("terminal_reconcile_flap cycle={cycle}"));
         proxy.set_partitioned(true);
         third.reconcile_once().await.unwrap();
         proxy.set_partitioned(false);
@@ -1513,8 +1668,10 @@ async fn federation_mtls_recovery_survives_two_source_and_target_leader_changes(
                 .state,
             MigrationState::Completed
         );
+        artifacts.capture(&source, &target).await;
     }
 
+    artifacts.record_note("stale_fencing_token_rejection_check".to_string());
     // Old shard fencing tokens must not be able to mutate the completed shard.
     let parsed: crate::types::TaskId = remote_id.parse().unwrap();
     let (_, shards) = target
@@ -1552,6 +1709,7 @@ async fn federation_mtls_recovery_survives_two_source_and_target_leader_changes(
         unchanged.records_processed, 3,
         "stale fencing token changed committed shard data"
     );
+    artifacts.capture(&source, &target).await;
 
     proxy.set_partitioned(true);
     proxy.task.abort();
