@@ -19,6 +19,8 @@ export ES_REQUIRE_LIVE=1
 COMPOSE=(docker compose -f "$ROOT_DIR/deploy/compose/elasticsearch-multinode.yml" --profile "$PROFILE")
 TARGET_CONTAINER="dataspool-e2e-target-${VERSION}"
 export ES_WORKER_TARGET_URL="http://127.0.0.1:19402"
+export ES_CDC_SOURCE_URL="${ES_CDC_SOURCE_URL:-${ES_7102_URL:-${ES_717_URL:-${ES_8X_URL:-${ES_9X_URL:-}}}}}"
+export ES_CDC_TARGET_URL="$ES_WORKER_TARGET_URL"
 cleanup() {
   docker rm -f "$TARGET_CONTAINER" >/dev/null 2>&1 || true
   "${COMPOSE[@]}" down -v
@@ -36,4 +38,5 @@ for attempt in $(seq 1 90); do
   sleep 2
 done
 cargo test --test elasticsearch_compat -- --nocapture
+cargo test --test cdc_cutover_e2e -- --nocapture
 cargo test --features test-fault-injection --test worker_process_crash -- --nocapture
