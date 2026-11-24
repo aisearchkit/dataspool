@@ -95,14 +95,18 @@ async fn three_member_raft_leader_failover_fences_stale_worker() {
     // Stop the actual Raft leader while retaining the other two live members.
     nodes[leader_index].shutdown().await.unwrap();
     let surviving_index = (leader_index + 1) % 3;
-    let new_leader_id = nodes[surviving_index]
-        .wait_for_leader(Duration::from_secs(12))
-        .await
-        .unwrap();
-    assert_ne!(
-        new_leader_id, leader_id,
-        "a different member must lead after failover"
-    );
+    let new_leader_id = tokio::time::timeout(Duration::from_secs(12), async {
+        loop {
+            if let Some(current) = nodes[surviving_index].current_leader().await
+                && current != leader_id
+            {
+                break current;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("surviving Raft members did not elect a replacement leader");
     let remaining = (first_lease.expires_at - chrono::Utc::now())
         .to_std()
         .unwrap_or_default();
