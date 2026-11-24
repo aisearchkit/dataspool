@@ -795,7 +795,10 @@ impl TestRaftGroup {
         for _ in 0..3 {
             let directory = tempfile::tempdir().unwrap();
             stores.push(RocksDbStore::open(directory.path().join("app")).unwrap());
-            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let socket = TcpSocket::new_v4().unwrap();
+            socket.set_reuseaddr(true).unwrap();
+            socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+            let listener = socket.listen(1024).unwrap();
             addresses.push(listener.local_addr().unwrap().to_string());
             directories.push(directory);
             listeners.push(listener);
@@ -1372,9 +1375,9 @@ async fn federation_mtls_recovery_survives_two_source_and_target_leader_changes(
         .wait_replicated_migration("ha-leader-change-migration", MigrationState::Completed)
         .await;
 
-    // Ensure the former source leader is back online and has applied the
-    // terminal record, whether the seeded schedule restarted it earlier or
-    // left it offline until this point.
+    // Ensure the chaos follower is back online and has applied the terminal
+    // record, whether the seeded schedule restarted it earlier or left it
+    // offline until this point.
     if !source_follower_running {
         source.restart(source_follower).await;
     }
