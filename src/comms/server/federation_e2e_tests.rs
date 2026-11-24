@@ -1364,6 +1364,7 @@ async fn federation_mtls_recovery_survives_two_source_and_target_leader_changes(
     }
     if !source_follower_running {
         source.restart(source_follower).await;
+        source_follower_running = true;
     }
     if !target_follower_running {
         target.restart(target_follower).await;
