@@ -39,4 +39,5 @@ for attempt in $(seq 1 90); do
 done
 cargo test --test elasticsearch_compat -- --nocapture
 cargo test --test cdc_cutover_e2e -- --nocapture
+cargo test --features test-fault-injection --test cdc_worker_failover -- --nocapture
 cargo test --features test-fault-injection --test worker_process_crash -- --nocapture

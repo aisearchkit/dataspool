@@ -273,6 +273,9 @@ impl Source for ElasticsearchCdcSource {
                 .into());
             }
             let mut record = Record::with_id(id, "elasticsearch_cdc", payload);
+            if let Some(event_id) = hit["_id"].as_str() {
+                record.add_metadata("_cdc_event_id", event_id);
+            }
             record.add_metadata("_op", operation);
             record.add_metadata("_target_index", target_index);
             if let Some(routing) = source[&self.cdc.routing_field].as_str() {
