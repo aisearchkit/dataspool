@@ -21,6 +21,18 @@ pub struct AuditEvent {
     pub occurred_at_ms: i64,
 }
 
+/// Current task-level SLA status. Alerts are derived, never independently persisted.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SlaAlert {
+    pub task_id: String,
+    pub task_name: String,
+    pub state: String,
+    pub breached: bool,
+    pub elapsed_seconds: u64,
+    pub retries: u64,
+    pub reasons: Vec<String>,
+}
+
 /// Cluster-wide operational counters derived from replicated task and node metadata.
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct NodeLoadMetric {
@@ -33,6 +45,8 @@ pub struct NodeLoadMetric {
 
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct OperationalMetrics {
+    pub sla_tasks_at_risk: u64,
+    pub sla_tasks_breached: u64,
     pub tasks_total: u64,
     pub tasks_pending: u64,
     pub tasks_running: u64,
@@ -121,6 +135,86 @@ impl<S: KvStore> TaskStore<S> {
             .into_iter()
             .map(|(_, value)| serde_json::from_slice(&value).map_err(Into::into))
             .collect()
+    }
+
+    /// Evaluate task-level SLA policies from replicated task metadata.
+    /// Supported metadata keys: sla.deadline_at (RFC3339),
+    /// sla.max_duration_seconds, and sla.max_retries.
+    pub async fn sla_alerts(&self) -> Result<Vec<SlaAlert>> {
+        let now = chrono::Utc::now();
+        let mut alerts = Vec::new();
+        for task in self.list_tasks().await? {
+            if matches!(
+                task.state,
+                crate::types::TaskState::Completed { .. }
+                    | crate::types::TaskState::Cancelled { .. }
+            ) {
+                continue;
+            }
+            let elapsed = task
+                .started_at
+                .map(|started| (now - started).num_seconds().max(0) as u64)
+                .unwrap_or(0);
+            let retries: u64 = self
+                .list_task_shards(&task.task_id)
+                .await?
+                .iter()
+                .map(|shard| shard.retry_count)
+                .sum();
+            let mut reasons = Vec::new();
+            let mut breached = false;
+            if let Some(deadline) = task.metadata.get("sla.deadline_at")
+                && let Ok(deadline) = chrono::DateTime::parse_from_rfc3339(deadline)
+            {
+                if now >= deadline.with_timezone(&chrono::Utc) {
+                    reasons.push("deadline_exceeded".to_string());
+                    breached = true;
+                } else if (deadline.with_timezone(&chrono::Utc) - now).num_minutes() <= 15 {
+                    reasons.push("deadline_at_risk".to_string());
+                }
+            }
+            if let Some(limit) = task
+                .metadata
+                .get("sla.max_duration_seconds")
+                .and_then(|v| v.parse::<u64>().ok())
+            {
+                if elapsed >= limit && limit > 0 {
+                    reasons.push("duration_exceeded".to_string());
+                    breached = true;
+                } else if limit > elapsed && limit - elapsed <= 900 {
+                    reasons.push("duration_at_risk".to_string());
+                }
+            }
+            if let Some(limit) = task
+                .metadata
+                .get("sla.max_retries")
+                .and_then(|v| v.parse::<u64>().ok())
+            {
+                if retries > limit {
+                    reasons.push("retry_budget_exceeded".to_string());
+                    breached = true;
+                } else if retries == limit && limit > 0 {
+                    reasons.push("retry_budget_exhausted".to_string());
+                }
+            }
+            if !reasons.is_empty() {
+                alerts.push(SlaAlert {
+                    task_id: task.task_id.to_string(),
+                    task_name: task.name,
+                    state: format!("{:?}", task.state),
+                    breached,
+                    elapsed_seconds: elapsed,
+                    retries,
+                    reasons,
+                });
+            }
+        }
+        alerts.sort_by(|a, b| {
+            b.breached
+                .cmp(&a.breached)
+                .then_with(|| a.task_id.cmp(&b.task_id))
+        });
+        Ok(alerts)
     }
 
     /// Read the newest audit events, newest first.
@@ -882,6 +976,36 @@ mod tests {
         restored.replace_snapshot(snapshot).await.unwrap();
         assert_eq!(restored.raft_applied_state().await.unwrap(), Some(marker));
         assert!(restored.bootstrap_complete().await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn sla_alerts_report_deadline_duration_and_retry_breaches() {
+        let (store, _temp) = create_test_store().await;
+        let mut task = TaskMeta::new("sla-task".into(), "{}".into(), "{}".into());
+        task.start(1);
+        task.metadata.insert(
+            "sla.deadline_at".into(),
+            (chrono::Utc::now() - chrono::Duration::minutes(1)).to_rfc3339(),
+        );
+        task.metadata
+            .insert("sla.max_duration_seconds".into(), "1".into());
+        task.metadata.insert("sla.max_retries".into(), "0".into());
+        let task_id = task.task_id;
+        store.save_task(&task).await.unwrap();
+        let mut shard = ShardMeta::new(task_id, 0, "{}".into());
+        shard.retry_count = 1;
+        store.save_shard(&shard).await.unwrap();
+
+        let alerts = store.sla_alerts().await.unwrap();
+        assert_eq!(alerts.len(), 1);
+        assert!(alerts[0].breached);
+        assert!(alerts[0].reasons.contains(&"deadline_exceeded".to_string()));
+        assert!(alerts[0].reasons.contains(&"duration_exceeded".to_string()));
+        assert!(
+            alerts[0]
+                .reasons
+                .contains(&"retry_budget_exceeded".to_string())
+        );
     }
 
     #[tokio::test]

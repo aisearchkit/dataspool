@@ -73,6 +73,7 @@ impl<S: KvStore + Clone + 'static> DlqApi<S> {
             )
             .route("/metrics", get(metrics))
             .route("/api/v1/audit", get(list_audit_events))
+            .route("/api/v1/alerts/sla", get(list_sla_alerts))
             .route_layer(middleware::from_fn_with_state(
                 self.state.clone(),
                 authorize::<S>,
@@ -101,6 +102,15 @@ async fn list_audit_events<S: KvStore + Clone>(
     }
 }
 
+async fn list_sla_alerts<S: KvStore + Clone>(State(state): State<ApiState<S>>) -> Response {
+    match state.tasks.sla_alerts().await {
+        Ok(alerts) => {
+            Json(serde_json::json!({"alerts": alerts, "total": alerts.len()})).into_response()
+        }
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+    }
+}
+
 async fn metrics<S: KvStore + Clone>(State(state): State<ApiState<S>>) -> Response {
     let metrics = match state.tasks.operational_metrics().await {
         Ok(metrics) => metrics,
@@ -108,8 +118,18 @@ async fn metrics<S: KvStore + Clone>(State(state): State<ApiState<S>>) -> Respon
             return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response();
         }
     };
+    let sla_alerts = match state.tasks.sla_alerts().await {
+        Ok(alerts) => alerts,
+        Err(error) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response();
+        }
+    };
+    let sla_at_risk = sla_alerts.iter().filter(|alert| !alert.breached).count();
+    let sla_breached = sla_alerts.iter().filter(|alert| alert.breached).count();
     let mut body = format!(
-        "# HELP dataspool_tasks_total Number of known tasks\n# TYPE dataspool_tasks_total gauge\ndataspool_tasks_total {}\n# HELP dataspool_tasks Number of tasks by lifecycle state\n# TYPE dataspool_tasks gauge\ndataspool_tasks{{state=\"pending\"}} {}\ndataspool_tasks{{state=\"running\"}} {}\ndataspool_tasks{{state=\"paused\"}} {}\ndataspool_tasks{{state=\"cancelling\"}} {}\ndataspool_tasks{{state=\"cancelled\"}} {}\ndataspool_tasks{{state=\"completed\"}} {}\ndataspool_tasks{{state=\"failed\"}} {}\n# HELP dataspool_shards Number of shards by state\n# TYPE dataspool_shards gauge\ndataspool_shards{{state=\"pending\"}} {}\ndataspool_shards{{state=\"running\"}} {}\ndataspool_shards{{state=\"completed\"}} {}\ndataspool_shards{{state=\"failed\"}} {}\n# HELP dataspool_nodes Number of nodes by state\n# TYPE dataspool_nodes gauge\ndataspool_nodes{{state=\"healthy\"}} {}\ndataspool_nodes{{state=\"degraded\"}} {}\ndataspool_nodes{{state=\"paused\"}} {}\ndataspool_nodes{{state=\"offline\"}} {}\n# HELP dataspool_retries_total Total failed shard attempts beyond the first attempt\n# TYPE dataspool_retries_total counter\ndataspool_retries_total {}\n# HELP dataspool_oldest_pending_seconds Age of the oldest pending shard\n# TYPE dataspool_oldest_pending_seconds gauge\ndataspool_oldest_pending_seconds {}\n",
+        "# HELP dataspool_sla_tasks_at_risk Tasks approaching configured SLA limits\n# TYPE dataspool_sla_tasks_at_risk gauge\ndataspool_sla_tasks_at_risk {}\n# HELP dataspool_sla_tasks_breached Tasks breaching configured SLA limits\n# TYPE dataspool_sla_tasks_breached gauge\ndataspool_sla_tasks_breached {}\n# HELP dataspool_tasks_total Number of known tasks\n# TYPE dataspool_tasks_total gauge\ndataspool_tasks_total {}\n# HELP dataspool_tasks Number of tasks by lifecycle state\n# TYPE dataspool_tasks gauge\ndataspool_tasks{{state=\"pending\"}} {}\ndataspool_tasks{{state=\"running\"}} {}\ndataspool_tasks{{state=\"paused\"}} {}\ndataspool_tasks{{state=\"cancelling\"}} {}\ndataspool_tasks{{state=\"cancelled\"}} {}\ndataspool_tasks{{state=\"completed\"}} {}\ndataspool_tasks{{state=\"failed\"}} {}\n# HELP dataspool_shards Number of shards by state\n# TYPE dataspool_shards gauge\ndataspool_shards{{state=\"pending\"}} {}\ndataspool_shards{{state=\"running\"}} {}\ndataspool_shards{{state=\"completed\"}} {}\ndataspool_shards{{state=\"failed\"}} {}\n# HELP dataspool_nodes Number of nodes by state\n# TYPE dataspool_nodes gauge\ndataspool_nodes{{state=\"healthy\"}} {}\ndataspool_nodes{{state=\"degraded\"}} {}\ndataspool_nodes{{state=\"paused\"}} {}\ndataspool_nodes{{state=\"offline\"}} {}\n# HELP dataspool_retries_total Total failed shard attempts beyond the first attempt\n# TYPE dataspool_retries_total counter\ndataspool_retries_total {}\n# HELP dataspool_oldest_pending_seconds Age of the oldest pending shard\n# TYPE dataspool_oldest_pending_seconds gauge\ndataspool_oldest_pending_seconds {}\n",
+        sla_at_risk,
+        sla_breached,
         metrics.tasks_total,
         metrics.tasks_pending,
         metrics.tasks_running,

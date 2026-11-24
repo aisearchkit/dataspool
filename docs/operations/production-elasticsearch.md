@@ -172,3 +172,48 @@ grpcurl -plaintext -d '{"task_id":"<task-uuid>","request_id":"pause-<unique-id>"
 grpcurl -plaintext -d '{"node_id":"worker-1","paused":true,"request_id":"node-pause-<unique-id>"}' \
   127.0.0.1:50052 dataspool.task.TaskService/ControlNodeExecution
 ```
+
+
+## Task SLA alerts (Phase 2.8)
+
+Task metadata supplied at creation can define an SLA policy. The fields are replicated with the task, so every Raft member evaluates the same policy against committed task/shard state:
+
+- `sla.deadline_at`: absolute RFC3339 deadline, for example `2026-12-01T18:00:00Z`.
+- `sla.max_duration_seconds`: maximum elapsed execution duration.
+- `sla.max_retries`: retry budget across all task shards.
+
+The authenticated `GET /api/v1/alerts/sla` endpoint returns derived alerts. Deadlines within 15 minutes, duration budgets within 15 minutes, and exhausted retry budgets are reported as `at risk`; exceeded budgets are `breached`. Completed and cancelled tasks are excluded. Invalid policy values are ignored rather than blocking task execution. Prometheus exposes `dataspool_sla_tasks_at_risk` and `dataspool_sla_tasks_breached`; alert delivery (PagerDuty, email, webhook) should be handled by the Prometheus Alertmanager rule path so notification retries and deduplication remain outside the Raft state machine.
+
+### Recovery and multi-cluster deployment boundary
+
+Each Dataspool Raft group is an independent consistency domain. A task can read from and write to Elasticsearch clusters across regions, but Raft membership, task metadata, leases, and checkpoints are not shared between independent Dataspool clusters. Do not configure two Raft groups to write the same task/shard namespace or assume that a remote cluster's task status is covered by the local quorum. For multi-cluster operations, use a single orchestration/control cluster to own the migration task and connect it to remote source/destination data clusters; keep the worker-to-control-plane path routable during leader changes.
+
+During a Raft leader failure, workers continue to hold their last committed leases only until expiry. They retry proposals through the elected leader; a new claim is committed by the new leader and increments the fencing generation before a replacement worker resumes from the last committed checkpoint. This is at-least-once execution with destination fencing, not a promise of uninterrupted writes during election. Keep the 30-second lease longer than the expected election plus transient network recovery window, and alert on `dataspool_scheduler_delay_seconds` and expired running leases. A follower without quorum must not locally reassign work.
+
+Example task tags for a 2-hour execution budget and retry budget of 5:
+
+```json
+{
+  "sla.max_duration_seconds": "7200",
+  "sla.max_retries": "5",
+  "sla.deadline_at": "2026-12-01T18:00:00Z"
+}
+```
+
+Prometheus rule example:
+
+```yaml
+groups:
+  - name: dataspool-task-sla
+    rules:
+      - alert: DataspoolTaskSlaBreached
+        expr: dataspool_sla_tasks_breached > 0
+        for: 1m
+        labels:
+          severity: critical
+      - alert: DataspoolTaskSlaAtRisk
+        expr: dataspool_sla_tasks_at_risk > 0
+        for: 5m
+        labels:
+          severity: warning
+```

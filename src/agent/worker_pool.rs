@@ -71,6 +71,7 @@ impl<S: KvStore + Clone + 'static> WorkerPool<S> {
     pub async fn run_until_cancelled(&mut self, shutdown: CancellationToken) -> Result<()> {
         info!("Starting worker pool on node {}", self.node_id);
         let mut workers = JoinSet::new();
+        let mut claim_failure_streak = 0_u32;
 
         loop {
             while let Some(joined) = workers.try_join_next() {
@@ -95,6 +96,7 @@ impl<S: KvStore + Clone + 'static> WorkerPool<S> {
 
                     match self.claimer.try_claim().await {
                         Ok(Some(lease)) => {
+                            claim_failure_streak = 0;
                             let shard_id = lease.shard_id.to_string();
                             info!(shard_id, fencing_token = lease.fencing_token, expires_at = %lease.expires_at, "Claimed shard with Raft lease");
                             self.active_shards.write().await.push(shard_id.clone());
@@ -173,6 +175,7 @@ impl<S: KvStore + Clone + 'static> WorkerPool<S> {
                             });
                         }
                         Ok(None) => {
+                            claim_failure_streak = 0;
                             drop(permit);
                             tokio::select! {
                                 _ = shutdown.cancelled() => break,
@@ -180,11 +183,21 @@ impl<S: KvStore + Clone + 'static> WorkerPool<S> {
                             }
                         }
                         Err(error) => {
-                            warn!("Failed to claim shard: {}", error);
+                            claim_failure_streak = claim_failure_streak.saturating_add(1);
+                            let backoff_ms = 500_u64.saturating_mul(1_u64 << claim_failure_streak.min(4));
+                            let backoff = tokio::time::Duration::from_millis(backoff_ms.min(8_000));
+                            let leader_id = self.claimer.leader_id().await;
+                            warn!(
+                                %error,
+                                retry_in_ms = backoff.as_millis() as u64,
+                                consecutive_failures = claim_failure_streak,
+                                leader_id = ?leader_id,
+                                "Shard claim failed; retrying through the current Raft leader"
+                            );
                             drop(permit);
                             tokio::select! {
                                 _ = shutdown.cancelled() => break,
-                                _ = tokio::time::sleep(tokio::time::Duration::from_secs(10)) => {}
+                                _ = tokio::time::sleep(backoff) => {}
                             }
                         }
                     }

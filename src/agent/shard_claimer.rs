@@ -113,6 +113,11 @@ impl<S: KvStore + Clone + 'static> ShardClaimer<S> {
         Ok(self)
     }
 
+    /// Expose the currently observed Raft leader for recovery diagnostics.
+    pub async fn leader_id(&self) -> Option<String> {
+        self.raft.get_leader_id().await
+    }
+
     pub async fn try_claim(&self) -> Result<Option<ShardLease>> {
         let mut tasks = self.task_store.list_tasks().await?;
         // Priority is strict; creation time provides deterministic FIFO fairness within a tier.
