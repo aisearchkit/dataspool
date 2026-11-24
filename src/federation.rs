@@ -198,7 +198,7 @@ mod tests {
         );
         assert!(
             migration
-                .transition(MigrationState::Running, 0, 3, None)
+                .transition(MigrationState::Running, 1, 3, None)
                 .is_err()
         );
         assert!(
