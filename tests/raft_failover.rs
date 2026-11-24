@@ -145,7 +145,10 @@ async fn three_member_raft_leader_failover_fences_stale_worker() {
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             let mut replicated = true;
-            for store in &stores {
+            for (index, store) in stores.iter().enumerate() {
+                if index == leader_index {
+                    continue; // The stopped member is intentionally outside the live quorum.
+                }
                 let persisted = TaskStore::new(store.clone())
                     .get_shard(&shard_id)
                     .await
