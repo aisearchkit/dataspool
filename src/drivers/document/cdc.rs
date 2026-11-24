@@ -307,6 +307,99 @@ impl Source for ElasticsearchCdcSource {
     }
 }
 
+/// Producer-specific write barrier. Implementations must stop accepting source
+/// mutations and return the final, durable outbox sequence after all accepted
+/// mutations have corresponding searchable CDC events.
+#[async_trait]
+pub trait CdcWriteBarrier: Send {
+    async fn pause_and_capture_final_watermark(&mut self) -> Result<u64>;
+    async fn resume_writes(&mut self) -> Result<()>;
+}
+
+#[derive(Debug, Clone)]
+pub struct CdcCutoverConfig {
+    pub target_base_url: String,
+    pub alias: String,
+    pub old_index: Option<String>,
+    pub new_index: String,
+    pub timeout: Duration,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CdcCutoverResult {
+    pub final_watermark: u64,
+    pub applied_watermark: u64,
+}
+
+/// Coordinate a no-gap cutover: pause the producer, capture its final watermark,
+/// wait for the target consumer to reach it, switch the alias atomically, then
+/// resume writes. The application supplies the producer-specific barrier and a
+/// callback that reads the durable target CDC checkpoint (normally from Raft).
+pub async fn cutover_with_write_barrier<B, F, Fut>(
+    client: &Client,
+    config: &CdcCutoverConfig,
+    barrier: &mut B,
+    mut read_applied_watermark: F,
+) -> Result<CdcCutoverResult>
+where
+    B: CdcWriteBarrier,
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<u64>>,
+{
+    let final_watermark = match barrier.pause_and_capture_final_watermark().await {
+        Ok(watermark) => watermark,
+        Err(error) => {
+            if let Err(resume_error) = barrier.resume_writes().await {
+                tracing::error!(%resume_error, "Failed to resume producer after cutover barrier error");
+            }
+            return Err(error);
+        }
+    };
+
+    let started = std::time::Instant::now();
+    let cutover = async {
+        loop {
+            let applied = read_applied_watermark().await?;
+            if applied >= final_watermark {
+                switch_alias_after_catchup(
+                    client,
+                    &config.target_base_url,
+                    &config.alias,
+                    config.old_index.as_deref(),
+                    &config.new_index,
+                    applied,
+                    final_watermark,
+                )
+                .await?;
+                return Ok(CdcCutoverResult {
+                    final_watermark,
+                    applied_watermark: applied,
+                });
+            }
+            if started.elapsed() >= config.timeout {
+                return Err(DatspoolError::Internal(format!(
+                    "CDC cutover timed out: target watermark {applied} is behind final source watermark {final_watermark}"
+                )));
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+    .await;
+
+    let resumed = barrier.resume_writes().await;
+    match (cutover, resumed) {
+        (Ok(result), Ok(())) => Ok(result),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(resume_error)) => Err(DatspoolError::Internal(format!(
+            "Alias cutover succeeded but producer writes could not be resumed: {resume_error}"
+        ))),
+        (Err(error), Err(resume_error)) => {
+            tracing::error!(%resume_error, "Producer writes could not be resumed after failed CDC cutover");
+            Err(error)
+        }
+    }
+}
+
 /// Atomically move an alias only after the consumer has caught up to the
 /// source's final sequence watermark. The caller supplies an authenticated client.
 pub async fn switch_alias_after_catchup(
@@ -380,6 +473,43 @@ mod tests {
         );
         resumed.restore_offset(&offset).unwrap();
         assert_eq!(resumed.last_sequence, 42);
+    }
+
+    struct TestWriteBarrier {
+        paused: bool,
+        final_watermark: u64,
+    }
+
+    #[async_trait]
+    impl CdcWriteBarrier for TestWriteBarrier {
+        async fn pause_and_capture_final_watermark(&mut self) -> Result<u64> {
+            self.paused = true;
+            Ok(self.final_watermark)
+        }
+        async fn resume_writes(&mut self) -> Result<()> {
+            self.paused = false;
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn timed_out_cutover_resumes_source_writes_without_switching_alias() {
+        let client = Client::new();
+        let mut barrier = TestWriteBarrier {
+            paused: false,
+            final_watermark: 10,
+        };
+        let config = CdcCutoverConfig {
+            target_base_url: "http://127.0.0.1:1".into(),
+            alias: "live".into(),
+            old_index: Some("old".into()),
+            new_index: "new".into(),
+            timeout: Duration::from_millis(1),
+        };
+        let result =
+            cutover_with_write_barrier(&client, &config, &mut barrier, || async { Ok(9) }).await;
+        assert!(result.is_err());
+        assert!(!barrier.paused, "producer writes must resume after timeout");
     }
 
     #[test]

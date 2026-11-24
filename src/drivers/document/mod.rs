@@ -38,7 +38,10 @@ mod sink;
 mod source;
 pub mod verification;
 
-pub use cdc::{CdcConfig, ElasticsearchCdcSource, switch_alias_after_catchup};
+pub use cdc::{
+    CdcConfig, CdcCutoverResult, CdcWriteBarrier, ElasticsearchCdcSource,
+    cutover_with_write_barrier, switch_alias_after_catchup,
+};
 pub use config::DocumentConfig;
 pub use online::ElasticsearchOnlineMigrationSource;
 pub use sink::{ClusterNodePressure, DocumentSink, NodeWritePressure};
