@@ -40,8 +40,19 @@ pub struct PostgresTransactionalOutbox {
 
 impl PostgresTransactionalOutbox {
     pub async fn connect(database_url: &str, stream_key: impl Into<String>) -> Result<Self> {
+        Self::connect_with_max_connections(database_url, stream_key, 16).await
+    }
+
+    /// Connect with an explicit per-application-instance pool limit. This is
+    /// useful when several producer processes share the same PostgreSQL
+    /// cluster and their aggregate connection budget must be bounded.
+    pub async fn connect_with_max_connections(
+        database_url: &str,
+        stream_key: impl Into<String>,
+        max_connections: u32,
+    ) -> Result<Self> {
         let pool = PgPoolOptions::new()
-            .max_connections(16)
+            .max_connections(max_connections.max(1))
             .acquire_timeout(Duration::from_secs(15))
             .connect(database_url)
             .await

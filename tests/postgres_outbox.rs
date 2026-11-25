@@ -311,10 +311,20 @@ async fn postgres_outbox_is_atomic_ordered_and_barrier_survives_restart() {
         }
         monitor_pool.close().await;
     });
+    // Eight independent application pools emulate multiple producer
+    // processes; each is capped at four PostgreSQL connections.
+    let mut application_instances = Vec::new();
+    for _ in 0..8 {
+        application_instances.push(
+            PostgresTransactionalOutbox::connect_with_max_connections(&database_url(), &stream, 4)
+                .await
+                .unwrap(),
+        );
+    }
     let started = std::time::Instant::now();
     let mut tasks = Vec::new();
     for index in 0..32 {
-        let producer = resumed.clone();
+        let producer = application_instances[index % application_instances.len()].clone();
         let stream_key = stream.clone();
         tasks.push(tokio::spawn(async move {
             let id = format!("concurrent-{index}");
@@ -369,6 +379,81 @@ async fn postgres_outbox_is_atomic_ordered_and_barrier_survives_restart() {
         deadlocks_after.0 - deadlocks_before.0,
         max_lock_waits
     );
+
+    // Compare four independent stream gates using the same eight app pools.
+    // This shows whether sharding unrelated workloads across stream_key values
+    // removes the single-row serialization ceiling.
+    let partition_keys = (0..4)
+        .map(|partition| format!("{stream}-partition-{partition}"))
+        .collect::<Vec<_>>();
+    let partitioned = application_instances
+        .iter()
+        .map(|app| {
+            partition_keys
+                .iter()
+                .map(|key| PostgresTransactionalOutbox::new(app.pool().clone(), key.clone()))
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    for producer in &partitioned[0] {
+        producer.migrate().await.unwrap();
+    }
+    let partition_started = std::time::Instant::now();
+    let mut partition_tasks = Vec::new();
+    for index in 0..32 {
+        let producer = partitioned[index % 8][index % 4].clone();
+        partition_tasks.push(tokio::spawn(async move {
+            let id = format!("partitioned-{index}");
+            let started = std::time::Instant::now();
+            let mut writer = producer.begin_write().await.unwrap();
+            sqlx::query("SELECT pg_sleep(0.005)")
+                .execute(writer.connection())
+                .await
+                .unwrap();
+            writer
+                .append_event(
+                    Uuid::new_v4(),
+                    "index",
+                    &id,
+                    "target-index",
+                    &json!({"value":index}),
+                )
+                .await
+                .unwrap();
+            writer.commit().await.unwrap();
+            started.elapsed()
+        }));
+    }
+    let mut partition_latencies = Vec::new();
+    for task in partition_tasks {
+        partition_latencies.push(task.await.unwrap());
+    }
+    partition_latencies.sort_unstable();
+    let partition_elapsed = partition_started.elapsed();
+    println!(
+        "POSTGRES_OUTBOX_PARTITIONED streams=4 app_instances=8 writers=32 elapsed_ms={} throughput_ops_s={:.1} p50_transaction_ms={} p95_transaction_ms={} p99_transaction_ms={}",
+        partition_elapsed.as_millis(),
+        32.0 / partition_elapsed.as_secs_f64(),
+        partition_latencies[partition_latencies.len() / 2].as_millis(),
+        partition_latencies
+            [(partition_latencies.len() * 95 / 100).min(partition_latencies.len() - 1)]
+        .as_millis(),
+        partition_latencies
+            [(partition_latencies.len() * 99 / 100).min(partition_latencies.len() - 1)]
+        .as_millis(),
+    );
+    for key in &partition_keys {
+        sqlx::query("DELETE FROM dataspool_cdc_outbox WHERE stream_key = $1")
+            .bind(key)
+            .execute(outbox.pool())
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM dataspool_cdc_outbox_gate WHERE stream_key = $1")
+            .bind(key)
+            .execute(outbox.pool())
+            .await
+            .unwrap();
+    }
 
     // Retention is coordinated with all registered consumers. No consumer
     // checkpoint may be skipped, and a lagging consumer pins the safe watermark.

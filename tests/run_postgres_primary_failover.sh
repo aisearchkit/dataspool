@@ -23,7 +23,7 @@ for attempt in $(seq 1 60); do
 done
 docker exec "$PRIMARY" psql -U postgres -d dataspool_test -v ON_ERROR_STOP=1 -c "CREATE ROLE replicator WITH REPLICATION LOGIN PASSWORD 'replica';"
 docker exec "$PRIMARY" bash -lc "echo 'host replication replicator 0.0.0.0/0 scram-sha-256' >> \$PGDATA/pg_hba.conf"
-docker exec -u postgres "$PRIMARY" pg_ctl -D /var/lib/postgresql/data reload >/dev/null
+docker exec -u postgres "$PRIMARY" /usr/lib/postgresql/16/bin/pg_ctl -D /var/lib/postgresql/data reload >/dev/null
 
 docker run -d --name "$STANDBY" --network "$NETWORK" -p 15434:5432 \
   --user postgres --entrypoint bash postgres:16 -lc '
@@ -32,7 +32,7 @@ docker run -d --name "$STANDBY" --network "$NETWORK" -p 15434:5432 \
     chmod 600 "$HOME/.pgpass"
     rm -rf "$PGDATA"/*
     until pg_basebackup -h dataspool-pg-ha-primary -D "$PGDATA" -U replicator -Fp -Xs -P -R; do sleep 1; done
-    exec postgres -c hot_standby=on -c listen_addresses="*"
+    exec /usr/lib/postgresql/16/bin/postgres -c hot_standby=on -c listen_addresses="*"
   ' >/dev/null
 for attempt in $(seq 1 90); do
   if docker exec "$STANDBY" pg_isready -U postgres -d dataspool_test >/dev/null 2>&1; then break; fi
@@ -52,7 +52,7 @@ for attempt in $(seq 1 90); do
 done
 
 docker stop "$PRIMARY" >/dev/null
-docker exec -u postgres "$STANDBY" pg_ctl -D /var/lib/postgresql/data promote >/dev/null
+docker exec -u postgres "$STANDBY" /usr/lib/postgresql/16/bin/pg_ctl -D /var/lib/postgresql/data promote >/dev/null
 for attempt in $(seq 1 60); do
   if docker exec "$STANDBY" psql -U postgres -d dataspool_test -Atqc 'SELECT NOT pg_is_in_recovery()' | grep -qx t; then break; fi
   if [ "$attempt" -eq 60 ]; then docker logs "$STANDBY"; exit 1; fi

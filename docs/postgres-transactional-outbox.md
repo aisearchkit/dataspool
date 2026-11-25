@@ -1,6 +1,6 @@
 # PostgreSQL Transactional Outbox and CDC cutover
 
-Dataspool provides a PostgreSQL-backed Transactional Outbox for application writers that need a durable CDC feed and a final cutover barrier. The producer and consumer use the same `stream_key`. The per-stream gate is intentionally a serialization point; use the included 32-writer CI load test as a baseline only, then benchmark on production-like hardware and pool settings before setting a capacity target.
+Dataspool provides a PostgreSQL-backed Transactional Outbox for application writers that need a durable CDC feed and a final cutover barrier. The producer and consumer use the same `stream_key`. The per-stream gate is intentionally a serialization point. `connect_with_max_connections()` lets each application process cap its own pool; the CI load test uses eight independent application pools (four connections each), then compares 32 writers on one stream with 32 writers distributed over four independent streams. Treat CI throughput as a contention baseline, not a production capacity figure; benchmark on production-like hardware, PostgreSQL settings, payload sizes, and network latency before setting a capacity target.
 
 ## Guarantees and operating contract
 
