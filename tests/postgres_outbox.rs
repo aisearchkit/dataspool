@@ -636,7 +636,12 @@ async fn postgres_drop_commit_response_proxy(
             client_read.read_exact(&mut body).await?;
             if tag[0] == b'Q' || tag[0] == b'P' {
                 let query = String::from_utf8_lossy(&body).to_ascii_uppercase();
-                if query.contains("COMMIT") {
+                // Match a complete SQL statement, not identifiers such as
+                // dataspool_ambiguous_commit_documents.
+                if query
+                    .split(char::from(0))
+                    .any(|part| part.trim() == "COMMIT")
+                {
                     eprintln!("[postgres-fault-proxy] forwarding COMMIT query");
                     frontend_commit.store(true, std::sync::atomic::Ordering::SeqCst);
                 }
