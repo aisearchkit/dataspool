@@ -178,9 +178,7 @@ async fn run_child_process() {
                 cluster_id: peer_id.into(),
                 current_fingerprint: OLD_FINGERPRINT.into(),
                 new_fingerprint: NEW_FINGERPRINT.into(),
-                // Backdate the staged transition so the overlap is expired by
-                // the time the recovered process serves mTLS requests.
-                at_ms: now - 60_000,
+                at_ms: now,
                 grace_period_ms: 60_000,
                 request_id: format!("stage-process-{role}"),
                 actor: "old-certificate".into(),
@@ -411,6 +409,10 @@ async fn federated_certificate_rotation_recovers_after_sigkill_across_both_raft_
     // withheld by the child harness; kill both processes at that exact point.
     assert_sigkill(&mut source, "crash after Proof commit before ACK");
     assert_sigkill(&mut target, "crash after Proof commit before ACK");
+
+    // Let the protocol's minimum one-minute overlap expire in wall-clock time
+    // before testing fresh mTLS reconnects with the old leaf certificate.
+    tokio::time::sleep(Duration::from_secs(61)).await;
 
     // Restart both clusters concurrently from their original durable RocksDB
     // directories and verify the active identity, overlap deadline and replay.
