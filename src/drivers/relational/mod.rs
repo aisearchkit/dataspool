@@ -11,9 +11,14 @@
 //! - SQLite (future support)
 
 pub mod config;
+pub mod outbox;
 pub mod sink;
 pub mod source;
 
 pub use config::{DatabaseType, RelationalConfig, SslConfig};
+pub use outbox::{
+    PostgresOutboxConfig, PostgresOutboxEvent, PostgresOutboxSource, PostgresOutboxWrite,
+    PostgresTransactionalOutbox,
+};
 pub use sink::RelationalSink;
 pub use source::RelationalSource;

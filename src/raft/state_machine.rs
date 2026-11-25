@@ -1572,6 +1572,7 @@ impl<S: KvStore + Clone> MetaStateMachine<S> {
                 matches!(
                     source,
                     crate::drivers::factory::SourceConfig::ElasticsearchOnline { .. }
+                        | crate::drivers::factory::SourceConfig::PostgresOutbox { .. }
                 )
             })
         {

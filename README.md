@@ -94,7 +94,7 @@ docker compose -f deploy/compose/elasticsearch-compat.yml down -v
 
 ## 当前限制
 
-本版本是 Elasticsearch HTTP 迁移方向的 early preview，不代表完整生产集群产品。MySQL/PostgreSQL Sink 完整性、生产级 Raft consensus、完整 gRPC 集群与任务 API、本地 Lucene Reader，以及 Control/Agent 生产级编排生命周期仍未全部交付。CDC 依赖外部生产者维护 append-only change index；它不是 Elasticsearch translog 或原生 CDC 接口。
+本版本是 Elasticsearch HTTP 迁移方向的 early preview，不代表完整生产集群产品。MySQL/PostgreSQL Sink 完整性、生产级 Raft consensus、完整 gRPC 集群与任务 API、本地 Lucene Reader，以及 Control/Agent 生产级编排生命周期仍未全部交付。CDC 不依赖 Elasticsearch 原生 translog；除外部 change index 外，现已提供 PostgreSQL Transactional Outbox 与持久化写入屏障。该保证仅覆盖使用事务包装器写入的应用路径。
 
 发布版本、已知限制和变更记录见 [CHANGELOG.md](CHANGELOG.md)；在线迁移约束见 [docs/elasticsearch-online-migration.md](docs/elasticsearch-online-migration.md)。
 

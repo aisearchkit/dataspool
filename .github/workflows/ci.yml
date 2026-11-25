@@ -42,6 +42,22 @@ jobs:
   unit-test:
     name: Unit Tests
     runs-on: ubuntu-24.04
+    env:
+      DATASPOOL_TEST_POSTGRES_URL: postgres://postgres:postgres@127.0.0.1:5432/dataspool_test
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: dataspool_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d dataspool_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - uses: actions/checkout@v7
       - name: Install native build dependencies
@@ -50,5 +66,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Run library and binary unit tests
         run: cargo test --lib --bins --all-features
+      - name: Run PostgreSQL transactional Outbox integration
+        run: cargo test --test postgres_outbox -- --nocapture
+      - name: Run PostgreSQL Outbox and Raft cutover integration
+        run: cargo test --test postgres_cutover -- --nocapture
       - name: Run multi-member Raft failover integration
         run: cargo test --test raft_failover --all-features -- --nocapture

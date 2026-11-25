@@ -34,10 +34,10 @@ Before alias cutover:
 1. Establish a source write barrier or equivalent final watermark.
 2. Read and apply CDC events through that exact watermark.
 3. Verify the target applied watermark is at least the source watermark.
-4. Call `switch_alias_after_catchup`; it refuses to switch when the watermark is behind and uses one atomic `_aliases` request.
-5. Release the write barrier only after verifying the alias target.
+4. Call `cutover_with_raft`; it refuses to switch when the watermark is behind, uses one atomic `_aliases` request, and commits the Raft cutover record.
+5. Release the write barrier only after the Raft record succeeds.
 
-Without a write barrier/final watermark protocol, a producer can append events between watermark sampling and alias switch; the helper cannot make that external race safe by itself.
+For PostgreSQL applications, use the `PostgresTransactionalOutbox` and `PostgresOutboxSource` described in [PostgreSQL Transactional Outbox](../postgres-transactional-outbox.md). `cutover_with_raft` retains the durable pause if the alias has switched but the Raft result has not committed. Without a write barrier/final watermark protocol, a producer can append events between watermark sampling and alias switch; the helper cannot make that external race safe by itself.
 
 ## Compatibility test matrix
 

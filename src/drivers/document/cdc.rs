@@ -343,61 +343,63 @@ pub struct CdcCutoverResult {
     pub applied_watermark: u64,
 }
 
-/// Coordinate a no-gap cutover: pause the producer, capture its final watermark,
-/// wait for the target consumer to reach it, switch the alias atomically, then
-/// resume writes. The application supplies the producer-specific barrier and a
-/// callback that reads the durable target CDC checkpoint (normally from Raft).
+/// Wait until the target reaches the producer's final watermark and atomically
+/// switch the alias. The producer remains paused while this function runs.
+async fn wait_for_catchup_and_switch<F, Fut>(
+    client: &Client,
+    config: &CdcCutoverConfig,
+    final_watermark: u64,
+    mut read_applied_watermark: F,
+) -> Result<CdcCutoverResult>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<u64>>,
+{
+    let started = std::time::Instant::now();
+    loop {
+        let applied = read_applied_watermark().await?;
+        if applied >= final_watermark {
+            switch_alias_after_catchup(
+                client,
+                &config.target_base_url,
+                &config.alias,
+                config.old_index.as_deref(),
+                &config.new_index,
+                applied,
+                final_watermark,
+            )
+            .await?;
+            return Ok(CdcCutoverResult {
+                final_watermark,
+                applied_watermark: applied,
+            });
+        }
+        if started.elapsed() >= config.timeout {
+            return Err(DatspoolError::Internal(format!(
+                "CDC cutover timed out: target watermark {applied} is behind final source watermark {final_watermark}"
+            )));
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Coordinate a no-gap cutover and resume producer writes after the alias switch.
+/// Use `cutover_with_raft` for production: it keeps writes paused until the Raft
+/// cutover record has committed.
 pub async fn cutover_with_write_barrier<B, F, Fut>(
     client: &Client,
     config: &CdcCutoverConfig,
     barrier: &mut B,
-    mut read_applied_watermark: F,
+    read_applied_watermark: F,
 ) -> Result<CdcCutoverResult>
 where
     B: CdcWriteBarrier,
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<u64>>,
 {
-    let final_watermark = match barrier.pause_and_capture_final_watermark().await {
-        Ok(watermark) => watermark,
-        Err(error) => {
-            if let Err(resume_error) = barrier.resume_writes().await {
-                tracing::error!(%resume_error, "Failed to resume producer after cutover barrier error");
-            }
-            return Err(error);
-        }
-    };
-
-    let started = std::time::Instant::now();
-    let cutover = async {
-        loop {
-            let applied = read_applied_watermark().await?;
-            if applied >= final_watermark {
-                switch_alias_after_catchup(
-                    client,
-                    &config.target_base_url,
-                    &config.alias,
-                    config.old_index.as_deref(),
-                    &config.new_index,
-                    applied,
-                    final_watermark,
-                )
-                .await?;
-                return Ok(CdcCutoverResult {
-                    final_watermark,
-                    applied_watermark: applied,
-                });
-            }
-            if started.elapsed() >= config.timeout {
-                return Err(DatspoolError::Internal(format!(
-                    "CDC cutover timed out: target watermark {applied} is behind final source watermark {final_watermark}"
-                )));
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-    }
-    .await;
-
+    let final_watermark = barrier.pause_and_capture_final_watermark().await?;
+    let cutover =
+        wait_for_catchup_and_switch(client, config, final_watermark, read_applied_watermark).await;
     let resumed = barrier.resume_writes().await;
     match (cutover, resumed) {
         (Ok(result), Ok(())) => Ok(result),
@@ -412,9 +414,10 @@ where
     }
 }
 
-/// Run the write-barrier cutover and persist its successful result through Raft.
-/// The task completion gate remains closed if the alias switch succeeds but the
-/// Raft proposal fails; callers must retry recording before completing the task.
+/// Run the PostgreSQL/producer write barrier, wait for catch-up, switch the alias,
+/// and commit the cutover record to Raft before resuming writes. If the Raft
+/// proposal fails after the alias switch, the durable producer pause is retained;
+/// a retry can safely re-run the idempotent alias switch and Raft proposal.
 pub async fn cutover_with_raft<B, F, Fut>(
     client: &Client,
     raft: &RaftNode,
@@ -428,8 +431,23 @@ where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<u64>>,
 {
-    let result =
-        cutover_with_write_barrier(client, config, barrier, read_applied_watermark).await?;
+    let final_watermark = barrier.pause_and_capture_final_watermark().await?;
+    let result = match wait_for_catchup_and_switch(
+        client,
+        config,
+        final_watermark,
+        read_applied_watermark,
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(error) => {
+            if let Err(resume_error) = barrier.resume_writes().await {
+                tracing::error!(%resume_error, "Failed to resume producer after pre-Raft cutover failure");
+            }
+            return Err(error);
+        }
+    };
     let response = raft
         .propose(Command::RecordCdcCutover {
             task_id: fence.task_id.clone(),
@@ -445,11 +463,14 @@ where
         })
         .await?;
     if !response.success {
+        // Deliberately leave the persistent producer gate closed. Resuming here
+        // would permit writes after the alias changed but before Raft recorded it.
         return Err(DatspoolError::Internal(format!(
             "CDC alias cutover succeeded but Raft rejected its completion record: {}",
             response.message
         )));
     }
+    barrier.resume_writes().await?;
     Ok(result)
 }
 

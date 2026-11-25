@@ -38,6 +38,11 @@ pub enum SourceConfig {
         #[serde(default)]
         cdc: super::document::CdcConfig,
     },
+    /// Continuous CDC source reading committed PostgreSQL Transactional Outbox rows.
+    PostgresOutbox {
+        #[serde(flatten)]
+        config: super::relational::PostgresOutboxConfig,
+    },
     // Future drivers:
     // NoSql { config: NoSqlConfig }, // MongoDB, Redis, Cassandra
     // Streaming { config: StreamingConfig }, // Kafka, Pulsar, AutoMQ
@@ -81,9 +86,9 @@ pub fn create_source_with_license(
         let feature = match config {
             SourceConfig::Document { .. } => Feature::DocumentMigration,
             SourceConfig::Relational { .. } => Feature::RelationalMigration,
-            SourceConfig::ElasticsearchCdc { .. } | SourceConfig::ElasticsearchOnline { .. } => {
-                Feature::StreamingMigration
-            }
+            SourceConfig::ElasticsearchCdc { .. }
+            | SourceConfig::ElasticsearchOnline { .. }
+            | SourceConfig::PostgresOutbox { .. } => Feature::StreamingMigration,
         };
 
         manager
@@ -117,6 +122,9 @@ pub fn create_source_with_license(
             );
             Ok(Box::new(source))
         }
+        SourceConfig::PostgresOutbox { config } => Ok(Box::new(
+            super::relational::PostgresOutboxSource::new(config.clone()),
+        )),
     }
 }
 
