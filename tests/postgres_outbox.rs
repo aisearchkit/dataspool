@@ -266,6 +266,36 @@ async fn postgres_outbox_is_atomic_ordered_and_barrier_survives_restart() {
         .install_write_guard("public", "dataspool_outbox_guard_test")
         .await
         .unwrap();
+    sqlx::raw_sql("DROP ROLE IF EXISTS dataspool_outbox_app_test; CREATE ROLE dataspool_outbox_app_test LOGIN; GRANT SELECT, INSERT, UPDATE, DELETE ON public.dataspool_outbox_guard_test TO dataspool_outbox_app_test;")
+        .execute(outbox.pool()).await.unwrap();
+    outbox
+        .restrict_application_dml(
+            "public",
+            "dataspool_outbox_guard_test",
+            "dataspool_outbox_app_test",
+        )
+        .await
+        .unwrap();
+    let privileges: (bool, bool) = sqlx::query_as("SELECT has_table_privilege('dataspool_outbox_app_test', 'public.dataspool_outbox_guard_test', 'SELECT'), has_table_privilege('dataspool_outbox_app_test', 'public.dataspool_outbox_guard_test', 'INSERT')")
+        .fetch_one(outbox.pool()).await.unwrap();
+    assert!(privileges.0, "application role retains read access");
+    assert!(
+        !privileges.1,
+        "application role must lose direct INSERT privilege"
+    );
+    let mut app_transaction = outbox.pool().begin().await.unwrap();
+    sqlx::query("SET LOCAL ROLE dataspool_outbox_app_test")
+        .execute(&mut *app_transaction)
+        .await
+        .unwrap();
+    let app_write = sqlx::query("INSERT INTO dataspool_outbox_guard_test(stream_key, document_id, payload) VALUES ($1, 'role-bypass', '{}'::jsonb)")
+        .bind(&stream).execute(&mut *app_transaction).await;
+    assert!(
+        app_write.is_err(),
+        "restricted application role cannot bypass the writer service"
+    );
+    app_transaction.rollback().await.unwrap();
+
     let direct_write = sqlx::query("INSERT INTO dataspool_outbox_guard_test(stream_key, document_id, payload) VALUES ($1, 'bypass', '{}'::jsonb)")
         .bind(&stream).execute(outbox.pool()).await;
     assert!(
@@ -517,6 +547,10 @@ async fn postgres_outbox_is_atomic_ordered_and_barrier_survives_restart() {
     sqlx::query("DROP TRIGGER IF EXISTS dataspool_outbox_guard_dataspool_outbox_guard_test ON public.dataspool_outbox_guard_test")
         .execute(outbox.pool()).await.unwrap();
     sqlx::query("DELETE FROM dataspool_outbox_guard_test WHERE document_id = 'guarded'")
+        .execute(outbox.pool())
+        .await
+        .unwrap();
+    sqlx::raw_sql("DROP OWNED BY dataspool_outbox_app_test; DROP ROLE dataspool_outbox_app_test;")
         .execute(outbox.pool())
         .await
         .unwrap();

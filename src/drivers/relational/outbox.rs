@@ -252,6 +252,41 @@ impl PostgresTransactionalOutbox {
         Ok(())
     }
 
+    /// Remove direct table mutation privileges from an application login.
+    /// Run as the table owner or a role with sufficient grant authority. The
+    /// Outbox writer must use a separate, controlled database role that retains
+    /// the required DML privileges.
+    pub async fn restrict_application_dml(
+        &self,
+        schema: &str,
+        table: &str,
+        application_role: &str,
+    ) -> Result<()> {
+        fn ident(value: &str) -> Result<String> {
+            if value.is_empty() || value.contains('\0') {
+                return Err(DatspoolError::Configuration(
+                    "invalid PostgreSQL identifier".into(),
+                ));
+            }
+            Ok(format!("\"{}\"", value.replace('\"', "\"\"")))
+        }
+        let schema_ident = ident(schema)?;
+        let table_ident = ident(table)?;
+        let role_ident = ident(application_role)?;
+        let ddl = format!(
+            r#"
+            REVOKE INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER
+            ON TABLE {schema_ident}.{table_ident} FROM {role_ident};
+            GRANT SELECT ON TABLE {schema_ident}.{table_ident} TO {role_ident};
+            "#
+        );
+        sqlx::raw_sql(&ddl)
+            .execute(&self.pool)
+            .await
+            .map_err(|error| db_error("restrict application role source-table DML", error))?;
+        Ok(())
+    }
+
     /// Register a consumer before it starts reading. A new consumer begins at
     /// sequence zero so pruning cannot discard its backlog.
     pub async fn register_consumer(&self, consumer_key: &str) -> Result<()> {
