@@ -20,6 +20,11 @@ fn database_url() -> String {
 }
 
 async fn producer(stream: &str) -> PostgresTransactionalOutbox {
+    // Multiple integration tests share one PostgreSQL service and can start
+    // concurrently. Serialize idempotent DDL setup because PostgreSQL's
+    // CREATE TABLE IF NOT EXISTS is not a concurrency-safe migration lock.
+    static MIGRATE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let _migration_guard = MIGRATE_LOCK.lock().await;
     let outbox = PostgresTransactionalOutbox::connect(&database_url(), stream)
         .await
         .unwrap();
