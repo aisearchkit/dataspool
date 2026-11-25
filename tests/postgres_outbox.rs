@@ -570,3 +570,166 @@ async fn postgres_outbox_is_atomic_ordered_and_barrier_survives_restart() {
         .await
         .unwrap();
 }
+
+async fn postgres_drop_commit_response_proxy(
+    listener: tokio::net::TcpListener,
+    backend_addr: std::net::SocketAddr,
+    dropped: tokio::sync::oneshot::Sender<()>,
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let (mut client, _) = listener.accept().await.unwrap();
+    let mut backend = tokio::net::TcpStream::connect(backend_addr).await.unwrap();
+
+    // Relay the PostgreSQL startup packet (length + protocol + parameters).
+    let mut startup_len = [0_u8; 4];
+    client.read_exact(&mut startup_len).await.unwrap();
+    let startup_len = u32::from_be_bytes(startup_len) as usize;
+    let mut startup_rest = vec![0; startup_len - 4];
+    client.read_exact(&mut startup_rest).await.unwrap();
+    backend
+        .write_all(&(startup_len as u32).to_be_bytes())
+        .await
+        .unwrap();
+    backend.write_all(&startup_rest).await.unwrap();
+
+    let commit_forwarded = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (mut client_read, mut client_write) = tokio::io::split(client);
+    let (mut backend_read, mut backend_write) = tokio::io::split(backend);
+    let frontend_commit = commit_forwarded.clone();
+    let frontend = tokio::spawn(async move {
+        loop {
+            let mut tag = [0_u8; 1];
+            if client_read.read_exact(&mut tag).await.is_err() {
+                break;
+            }
+            let mut length = [0_u8; 4];
+            client_read.read_exact(&mut length).await?;
+            let length = u32::from_be_bytes(length) as usize;
+            let mut body = vec![0; length - 4];
+            client_read.read_exact(&mut body).await?;
+            if tag[0] == b'Q' || tag[0] == b'P' {
+                let query = String::from_utf8_lossy(&body).to_ascii_uppercase();
+                if query.contains("COMMIT") {
+                    frontend_commit.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+            backend_write.write_all(&tag).await?;
+            backend_write
+                .write_all(&(length as u32).to_be_bytes())
+                .await?;
+            backend_write.write_all(&body).await?;
+        }
+        Ok::<(), std::io::Error>(())
+    });
+    let backend_commit = commit_forwarded;
+    let response = tokio::spawn(async move {
+        loop {
+            let mut tag = [0_u8; 1];
+            if backend_read.read_exact(&mut tag).await.is_err() {
+                break;
+            }
+            let mut length = [0_u8; 4];
+            backend_read.read_exact(&mut length).await?;
+            let length = u32::from_be_bytes(length) as usize;
+            let mut body = vec![0; length - 4];
+            backend_read.read_exact(&mut body).await?;
+            if tag[0] == b'Z' && backend_commit.load(std::sync::atomic::Ordering::SeqCst) {
+                let _ = dropped.send(());
+                break;
+            }
+            client_write.write_all(&tag).await?;
+            client_write
+                .write_all(&(length as u32).to_be_bytes())
+                .await?;
+            client_write.write_all(&body).await?;
+        }
+        Ok::<(), std::io::Error>(())
+    });
+    tokio::select! {
+        _ = frontend => {},
+        _ = response => {},
+    }
+}
+
+#[tokio::test]
+async fn postgres_ambiguous_commit_response_is_recovered_by_event_id() {
+    use sqlx::Row;
+    let stream = format!("outbox-ambiguous-{}", Uuid::new_v4());
+    let direct = producer(&stream).await;
+    sqlx::query("CREATE TABLE IF NOT EXISTS dataspool_ambiguous_commit_documents (stream_key TEXT NOT NULL, document_id TEXT NOT NULL, payload JSONB NOT NULL, PRIMARY KEY(stream_key, document_id))")
+        .execute(direct.pool()).await.unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = listener.local_addr().unwrap();
+    let parsed = url::Url::parse(&database_url()).unwrap();
+    let backend_addr = format!(
+        "{}:{}",
+        parsed.host_str().unwrap(),
+        parsed.port().unwrap_or(5432)
+    )
+    .parse()
+    .unwrap();
+    let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(postgres_drop_commit_response_proxy(
+        listener,
+        backend_addr,
+        dropped_tx,
+    ));
+
+    let mut proxied_url = parsed;
+    proxied_url.set_host(Some("127.0.0.1")).unwrap();
+    proxied_url.set_port(Some(proxy_addr.port())).unwrap();
+    proxied_url
+        .query_pairs_mut()
+        .append_pair("sslmode", "disable");
+    let proxied =
+        PostgresTransactionalOutbox::connect_with_max_connections(proxied_url.as_str(), &stream, 1)
+            .await
+            .unwrap();
+    let event_id = Uuid::new_v4();
+    let payload = json!({"account":"acct-1","balance":42});
+    let mut writer = proxied.begin_write().await.unwrap();
+    sqlx::query("INSERT INTO dataspool_ambiguous_commit_documents(stream_key, document_id, payload) VALUES ($1, $2, $3) ON CONFLICT(stream_key, document_id) DO UPDATE SET payload = EXCLUDED.payload")
+        .bind(&stream).bind("acct-1").bind(&payload).execute(writer.connection()).await.unwrap();
+    let first_sequence = writer
+        .append_event(event_id, "index", "acct-1", "accounts", &payload)
+        .await
+        .unwrap();
+    assert!(
+        writer.commit().await.is_err(),
+        "client must observe a lost COMMIT response"
+    );
+    tokio::time::timeout(Duration::from_secs(5), dropped_rx)
+        .await
+        .unwrap()
+        .unwrap();
+
+    // Verify from an independent connection: PostgreSQL committed even though
+    // the producer received a transport error instead of ReadyForQuery.
+    let source_rows = sqlx::query("SELECT payload FROM dataspool_ambiguous_commit_documents WHERE stream_key = $1 AND document_id = 'acct-1'")
+        .bind(&stream).fetch_all(direct.pool()).await.unwrap();
+    assert_eq!(source_rows.len(), 1);
+    assert_eq!(
+        source_rows[0]
+            .try_get::<serde_json::Value, _>("payload")
+            .unwrap(),
+        payload
+    );
+    let events = direct.read_after(0, 100).await.unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].event_id, event_id.to_string());
+    assert_eq!(events[0].sequence as u64, first_sequence);
+
+    // Retry with the same event ID and an idempotent source upsert. It must
+    // return the original sequence and must not duplicate either side.
+    let mut retry = direct.begin_write().await.unwrap();
+    sqlx::query("INSERT INTO dataspool_ambiguous_commit_documents(stream_key, document_id, payload) VALUES ($1, $2, $3) ON CONFLICT(stream_key, document_id) DO UPDATE SET payload = EXCLUDED.payload")
+        .bind(&stream).bind("acct-1").bind(&payload).execute(retry.connection()).await.unwrap();
+    let retry_sequence = retry
+        .append_event(event_id, "index", "acct-1", "accounts", &payload)
+        .await
+        .unwrap();
+    assert_eq!(retry_sequence, first_sequence);
+    retry.commit().await.unwrap();
+    assert_eq!(direct.watermark().await.unwrap(), first_sequence);
+    assert_eq!(direct.read_after(0, 100).await.unwrap().len(), 1);
+}
