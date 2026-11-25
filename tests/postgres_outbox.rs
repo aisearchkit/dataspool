@@ -637,6 +637,7 @@ async fn postgres_drop_commit_response_proxy(
             if tag[0] == b'Q' || tag[0] == b'P' {
                 let query = String::from_utf8_lossy(&body).to_ascii_uppercase();
                 if query.contains("COMMIT") {
+                    eprintln!("[postgres-fault-proxy] forwarding COMMIT query");
                     frontend_commit.store(true, std::sync::atomic::Ordering::SeqCst);
                 }
             }
@@ -661,6 +662,7 @@ async fn postgres_drop_commit_response_proxy(
             let mut body = vec![0; length - 4];
             backend_read.read_exact(&mut body).await?;
             if tag[0] == b'Z' && backend_commit.load(std::sync::atomic::Ordering::SeqCst) {
+                eprintln!("[postgres-fault-proxy] dropped ReadyForQuery after server COMMIT");
                 let _ = dropped.send(());
                 // Explicitly half-close the client-facing socket. The frontend
                 // task still owns the read half, so dropping this write half
@@ -677,8 +679,8 @@ async fn postgres_drop_commit_response_proxy(
         Ok::<(), std::io::Error>(())
     });
     tokio::select! {
-        _ = frontend => {},
-        _ = response => {},
+        result = frontend => eprintln!("[postgres-fault-proxy] frontend task ended: {result:?}"),
+        result = response => eprintln!("[postgres-fault-proxy] backend task ended: {result:?}"),
     }
 }
 
