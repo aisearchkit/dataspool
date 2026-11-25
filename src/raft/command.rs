@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 ///
 /// All state changes go through Raft consensus. Only the Leader
 /// can propose commands. Followers will forward writes to the Leader.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Command {
     // ==================== Task Management ====================
@@ -252,6 +253,32 @@ pub enum Command {
         request_id: String,
         actor: String,
     },
+    /// Stage a validated CA bundle without changing the currently trusted roots.
+    StageFederatedTrustBundle {
+        cluster_id: String,
+        current_fingerprint: String,
+        bundle_pem: String,
+        bundle_fingerprint: String,
+        at_ms: i64,
+        request_id: String,
+        actor: String,
+    },
+    /// Atomically activate the staged CA bundle and commit the old-root expiry.
+    ActivateFederatedTrustBundle {
+        cluster_id: String,
+        bundle_fingerprint: String,
+        at_ms: i64,
+        overlap_ms: i64,
+        request_id: String,
+        actor: String,
+    },
+    /// Retire old CA material only after the committed overlap deadline.
+    RetireFederatedTrustBundle {
+        cluster_id: String,
+        at_ms: i64,
+        request_id: String,
+        actor: String,
+    },
     TransitionFederatedMigration {
         migration_id: String,
         next_state: crate::federation::MigrationState,
@@ -441,6 +468,15 @@ impl Command {
             }
             Command::CompleteFederatedCertificateRotation { cluster_id, .. } => {
                 format!("CompleteFederatedCertificateRotation({})", cluster_id)
+            }
+            Command::StageFederatedTrustBundle { cluster_id, .. } => {
+                format!("StageFederatedTrustBundle({})", cluster_id)
+            }
+            Command::ActivateFederatedTrustBundle { cluster_id, .. } => {
+                format!("ActivateFederatedTrustBundle({})", cluster_id)
+            }
+            Command::RetireFederatedTrustBundle { cluster_id, .. } => {
+                format!("RetireFederatedTrustBundle({})", cluster_id)
             }
             Command::TransitionFederatedMigration {
                 migration_id,

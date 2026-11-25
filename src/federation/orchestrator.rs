@@ -550,13 +550,25 @@ impl FederatedOrchestrator {
                 "Federated target '{cluster_id}' is offline"
             )));
         }
-        let peer = GrpcClient::connect_mtls(
-            &cluster.endpoint,
-            &self.ca_file,
-            &self.certificate_file,
-            &self.private_key_file,
-        )
-        .await?;
+        let peer = if let Some(bundle) =
+            cluster.effective_trust_bundle(chrono::Utc::now().timestamp_millis())
+        {
+            GrpcClient::connect_mtls_with_ca_pem(
+                &cluster.endpoint,
+                bundle.as_bytes(),
+                &self.certificate_file,
+                &self.private_key_file,
+            )
+            .await?
+        } else {
+            GrpcClient::connect_mtls(
+                &cluster.endpoint,
+                &self.ca_file,
+                &self.certificate_file,
+                &self.private_key_file,
+            )
+            .await?
+        };
         self.record_target_status(&cluster, FederatedClusterStatus::Healthy)
             .await?;
         Ok(peer)

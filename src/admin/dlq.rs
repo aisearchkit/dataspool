@@ -95,6 +95,18 @@ impl<S: KvStore + Clone + 'static> DlqApi<S> {
                 post(heartbeat_federated_cluster),
             )
             .route(
+                "/api/v1/federation/clusters/{cluster_id}/trust-bundle/stage",
+                post(stage_federated_trust_bundle),
+            )
+            .route(
+                "/api/v1/federation/clusters/{cluster_id}/trust-bundle/activate",
+                post(activate_federated_trust_bundle),
+            )
+            .route(
+                "/api/v1/federation/clusters/{cluster_id}/trust-bundle/retire",
+                post(retire_federated_trust_bundle),
+            )
+            .route(
                 "/api/v1/federation/migrations",
                 get(list_federated_migrations).post(create_federated_migration),
             )
@@ -213,6 +225,14 @@ async fn register_federated_cluster<S: KvStore + Clone>(
         pending_identity_fingerprint: None,
         rotation_started_at_ms: None,
         pending_rotation_grace_period_ms: None,
+        trust_bundle_pem: None,
+        trust_bundle_fingerprint: None,
+        pending_trust_bundle_pem: None,
+        pending_trust_bundle_fingerprint: None,
+        trust_bundle_staged_at_ms: None,
+        previous_trust_bundle_pem: None,
+        previous_trust_bundle_fingerprint: None,
+        previous_trust_bundle_expires_at_ms: None,
         version: request.version,
         capabilities: request.capabilities,
         status: FederatedClusterStatus::Healthy,
@@ -222,6 +242,107 @@ async fn register_federated_cluster<S: KvStore + Clone>(
     match raft
         .propose(Command::UpsertFederatedCluster {
             cluster,
+            request_id: request.request_id,
+            actor: request_actor(&headers),
+        })
+        .await
+    {
+        Ok(response) if response.success => Json(response).into_response(),
+        Ok(response) => (StatusCode::CONFLICT, Json(response)).into_response(),
+        Err(error) => (StatusCode::BAD_GATEWAY, error.to_string()).into_response(),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct StageFederatedTrustBundleRequest {
+    #[serde(default)]
+    current_fingerprint: String,
+    bundle_pem: String,
+    request_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ActivateFederatedTrustBundleRequest {
+    bundle_fingerprint: String,
+    overlap_ms: i64,
+    request_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RetireFederatedTrustBundleRequest {
+    request_id: String,
+}
+
+async fn stage_federated_trust_bundle<S: KvStore + Clone>(
+    State(state): State<ApiState<S>>,
+    Path(cluster_id): Path<String>,
+    headers: axum::http::HeaderMap,
+    Json(request): Json<StageFederatedTrustBundleRequest>,
+) -> Response {
+    let Some(raft) = state.raft else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let fingerprint = match crate::federation::validate_trust_bundle(&request.bundle_pem) {
+        Ok(value) => value,
+        Err(error) => return (StatusCode::BAD_REQUEST, error).into_response(),
+    };
+    match raft
+        .propose(Command::StageFederatedTrustBundle {
+            cluster_id,
+            current_fingerprint: request.current_fingerprint,
+            bundle_pem: request.bundle_pem,
+            bundle_fingerprint: fingerprint,
+            at_ms: chrono::Utc::now().timestamp_millis(),
+            request_id: request.request_id,
+            actor: request_actor(&headers),
+        })
+        .await
+    {
+        Ok(response) if response.success => Json(response).into_response(),
+        Ok(response) => (StatusCode::CONFLICT, Json(response)).into_response(),
+        Err(error) => (StatusCode::BAD_GATEWAY, error.to_string()).into_response(),
+    }
+}
+
+async fn activate_federated_trust_bundle<S: KvStore + Clone>(
+    State(state): State<ApiState<S>>,
+    Path(cluster_id): Path<String>,
+    headers: axum::http::HeaderMap,
+    Json(request): Json<ActivateFederatedTrustBundleRequest>,
+) -> Response {
+    let Some(raft) = state.raft else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match raft
+        .propose(Command::ActivateFederatedTrustBundle {
+            cluster_id,
+            bundle_fingerprint: request.bundle_fingerprint,
+            at_ms: chrono::Utc::now().timestamp_millis(),
+            overlap_ms: request.overlap_ms,
+            request_id: request.request_id,
+            actor: request_actor(&headers),
+        })
+        .await
+    {
+        Ok(response) if response.success => Json(response).into_response(),
+        Ok(response) => (StatusCode::CONFLICT, Json(response)).into_response(),
+        Err(error) => (StatusCode::BAD_GATEWAY, error.to_string()).into_response(),
+    }
+}
+
+async fn retire_federated_trust_bundle<S: KvStore + Clone>(
+    State(state): State<ApiState<S>>,
+    Path(cluster_id): Path<String>,
+    headers: axum::http::HeaderMap,
+    Json(request): Json<RetireFederatedTrustBundleRequest>,
+) -> Response {
+    let Some(raft) = state.raft else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match raft
+        .propose(Command::RetireFederatedTrustBundle {
+            cluster_id,
+            at_ms: chrono::Utc::now().timestamp_millis(),
             request_id: request.request_id,
             actor: request_actor(&headers),
         })

@@ -478,6 +478,53 @@ impl<S: KvStore + Clone> MetaStateMachine<S> {
                 )
                 .await
             }
+            Command::StageFederatedTrustBundle {
+                cluster_id,
+                current_fingerprint,
+                bundle_pem,
+                bundle_fingerprint,
+                at_ms,
+                request_id,
+                actor,
+            } => {
+                self.apply_stage_federated_trust_bundle(
+                    cluster_id,
+                    current_fingerprint,
+                    bundle_pem,
+                    bundle_fingerprint,
+                    at_ms,
+                    request_id,
+                    actor,
+                )
+                .await
+            }
+            Command::ActivateFederatedTrustBundle {
+                cluster_id,
+                bundle_fingerprint,
+                at_ms,
+                overlap_ms,
+                request_id,
+                actor,
+            } => {
+                self.apply_activate_federated_trust_bundle(
+                    cluster_id,
+                    bundle_fingerprint,
+                    at_ms,
+                    overlap_ms,
+                    request_id,
+                    actor,
+                )
+                .await
+            }
+            Command::RetireFederatedTrustBundle {
+                cluster_id,
+                at_ms,
+                request_id,
+                actor,
+            } => {
+                self.apply_retire_federated_trust_bundle(cluster_id, at_ms, request_id, actor)
+                    .await
+            }
             Command::TransitionFederatedMigration {
                 migration_id,
                 next_state,
@@ -578,6 +625,15 @@ impl<S: KvStore + Clone> MetaStateMachine<S> {
             cluster.pending_identity_fingerprint = existing.pending_identity_fingerprint;
             cluster.rotation_started_at_ms = existing.rotation_started_at_ms;
             cluster.pending_rotation_grace_period_ms = existing.pending_rotation_grace_period_ms;
+            cluster.trust_bundle_pem = existing.trust_bundle_pem;
+            cluster.trust_bundle_fingerprint = existing.trust_bundle_fingerprint;
+            cluster.pending_trust_bundle_pem = existing.pending_trust_bundle_pem;
+            cluster.pending_trust_bundle_fingerprint = existing.pending_trust_bundle_fingerprint;
+            cluster.trust_bundle_staged_at_ms = existing.trust_bundle_staged_at_ms;
+            cluster.previous_trust_bundle_pem = existing.previous_trust_bundle_pem;
+            cluster.previous_trust_bundle_fingerprint = existing.previous_trust_bundle_fingerprint;
+            cluster.previous_trust_bundle_expires_at_ms =
+                existing.previous_trust_bundle_expires_at_ms;
         }
         let key = format!("federated_cluster:{}", cluster.cluster_id);
         let data = serde_json::to_value(&cluster)?;
@@ -842,6 +898,243 @@ impl<S: KvStore + Clone> MetaStateMachine<S> {
         Ok(accepted(
             "Certificate rotation completed",
             serde_json::json!({"cluster_id": cluster_id, "active_fingerprint": new_fingerprint, "previous_fingerprint_expires_at_ms": cluster.previous_identity_expires_at_ms}),
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn apply_stage_federated_trust_bundle(
+        &self,
+        cluster_id: String,
+        current_fingerprint: String,
+        bundle_pem: String,
+        bundle_fingerprint: String,
+        at_ms: i64,
+        request_id: String,
+        actor: String,
+    ) -> Result<CommandResponse> {
+        if request_id.trim().is_empty() || request_id.len() > 128 {
+            return Ok(rejected("request_id must contain 1-128 characters"));
+        }
+        let calculated = match crate::federation::validate_trust_bundle(&bundle_pem) {
+            Ok(value) => value,
+            Err(error) => return Ok(rejected(&error)),
+        };
+        if !calculated.eq_ignore_ascii_case(&bundle_fingerprint) {
+            return Ok(rejected(
+                "CA bundle fingerprint does not match its PEM certificates",
+            ));
+        }
+        let mut cluster = match self.task_store.get_federated_cluster(&cluster_id).await? {
+            Some(value) => value,
+            None => return Ok(rejected("federated cluster not found")),
+        };
+        let payload =
+            format!("federated-ca-stage:{cluster_id}:{current_fingerprint}:{bundle_fingerprint}");
+        if let Some(existing) = self.task_store.get_control_request(&request_id).await? {
+            return if existing == payload {
+                Ok(accepted(
+                    "CA bundle stage already committed",
+                    serde_json::json!({"cluster_id": cluster_id, "fingerprint": bundle_fingerprint}),
+                ))
+            } else {
+                Ok(rejected(
+                    "request_id was already used with a different payload",
+                ))
+            };
+        }
+        match cluster.trust_bundle_fingerprint.as_deref() {
+            Some(active) if !active.eq_ignore_ascii_case(&current_fingerprint) => {
+                return Ok(rejected(
+                    "CA bundle must be staged by the currently active trust bundle",
+                ));
+            }
+            None if !current_fingerprint.is_empty() => {
+                return Ok(rejected(
+                    "initial CA bundle bootstrap requires an empty current fingerprint",
+                ));
+            }
+            _ => {}
+        }
+        if cluster
+            .previous_trust_bundle_expires_at_ms
+            .is_some_and(|expiry| at_ms < expiry)
+        {
+            return Ok(rejected("previous CA trust overlap is still active"));
+        }
+        if cluster
+            .pending_trust_bundle_fingerprint
+            .as_deref()
+            .is_some_and(|pending| !pending.eq_ignore_ascii_case(&bundle_fingerprint))
+        {
+            return Ok(rejected("another CA bundle rotation is already staged"));
+        }
+        cluster.pending_trust_bundle_pem = Some(bundle_pem);
+        cluster.pending_trust_bundle_fingerprint = Some(bundle_fingerprint.clone());
+        cluster.trust_bundle_staged_at_ms = Some(at_ms);
+        cluster.updated_at_ms = at_ms;
+        let audit = self.audit_event(
+            &actor,
+            &request_id,
+            "federated_cluster.ca_bundle_staged",
+            &cluster_id,
+            "active",
+            "staged",
+        );
+        self.task_store
+            .save_federated_control(
+                &request_id,
+                &payload,
+                format!("federated_cluster:{cluster_id}"),
+                serde_json::to_vec(&cluster)?,
+                audit,
+            )
+            .await?;
+        Ok(accepted(
+            "CA trust bundle staged; active trust is unchanged",
+            serde_json::json!({"cluster_id": cluster_id, "fingerprint": bundle_fingerprint}),
+        ))
+    }
+
+    async fn apply_activate_federated_trust_bundle(
+        &self,
+        cluster_id: String,
+        bundle_fingerprint: String,
+        at_ms: i64,
+        overlap_ms: i64,
+        request_id: String,
+        actor: String,
+    ) -> Result<CommandResponse> {
+        if request_id.trim().is_empty() || request_id.len() > 128 {
+            return Ok(rejected("request_id must contain 1-128 characters"));
+        }
+        if !(60_000..=604_800_000).contains(&overlap_ms) {
+            return Ok(rejected("CA overlap must be between 1 minute and 7 days"));
+        }
+        let mut cluster = match self.task_store.get_federated_cluster(&cluster_id).await? {
+            Some(value) => value,
+            None => return Ok(rejected("federated cluster not found")),
+        };
+        let payload =
+            format!("federated-ca-activate:{cluster_id}:{bundle_fingerprint}:{overlap_ms}");
+        if let Some(existing) = self.task_store.get_control_request(&request_id).await? {
+            return if existing == payload {
+                Ok(accepted(
+                    "CA bundle activation already committed",
+                    serde_json::json!({"cluster_id": cluster_id, "fingerprint": bundle_fingerprint, "previous_expires_at_ms": cluster.previous_trust_bundle_expires_at_ms}),
+                ))
+            } else {
+                Ok(rejected(
+                    "request_id was already used with a different payload",
+                ))
+            };
+        }
+        if !cluster
+            .pending_trust_bundle_fingerprint
+            .as_deref()
+            .is_some_and(|pending| pending.eq_ignore_ascii_case(&bundle_fingerprint))
+            || cluster.pending_trust_bundle_pem.is_none()
+        {
+            return Ok(rejected("CA bundle has not been staged"));
+        }
+        if cluster
+            .previous_trust_bundle_expires_at_ms
+            .is_some_and(|expiry| at_ms < expiry)
+        {
+            return Ok(rejected("previous CA trust overlap is still active"));
+        }
+        cluster.previous_trust_bundle_pem = cluster.trust_bundle_pem.take();
+        cluster.previous_trust_bundle_fingerprint = cluster.trust_bundle_fingerprint.take();
+        cluster.previous_trust_bundle_expires_at_ms = if cluster.previous_trust_bundle_pem.is_some()
+        {
+            Some(at_ms.saturating_add(overlap_ms))
+        } else {
+            None
+        };
+        cluster.trust_bundle_pem = cluster.pending_trust_bundle_pem.take();
+        cluster.trust_bundle_fingerprint = cluster.pending_trust_bundle_fingerprint.take();
+        cluster.trust_bundle_staged_at_ms = None;
+        cluster.updated_at_ms = at_ms;
+        let audit = self.audit_event(
+            &actor,
+            &request_id,
+            "federated_cluster.ca_bundle_activated",
+            &cluster_id,
+            "staged",
+            "active_with_overlap",
+        );
+        self.task_store
+            .save_federated_control(
+                &request_id,
+                &payload,
+                format!("federated_cluster:{cluster_id}"),
+                serde_json::to_vec(&cluster)?,
+                audit,
+            )
+            .await?;
+        Ok(accepted(
+            "CA bundle activated with a committed overlap deadline",
+            serde_json::json!({"cluster_id": cluster_id, "active_fingerprint": cluster.trust_bundle_fingerprint, "previous_expires_at_ms": cluster.previous_trust_bundle_expires_at_ms}),
+        ))
+    }
+
+    async fn apply_retire_federated_trust_bundle(
+        &self,
+        cluster_id: String,
+        at_ms: i64,
+        request_id: String,
+        actor: String,
+    ) -> Result<CommandResponse> {
+        if request_id.trim().is_empty() || request_id.len() > 128 {
+            return Ok(rejected("request_id must contain 1-128 characters"));
+        }
+        let mut cluster = match self.task_store.get_federated_cluster(&cluster_id).await? {
+            Some(value) => value,
+            None => return Ok(rejected("federated cluster not found")),
+        };
+        let payload = format!("federated-ca-retire:{cluster_id}");
+        if let Some(existing) = self.task_store.get_control_request(&request_id).await? {
+            return if existing == payload {
+                Ok(accepted(
+                    "previous CA bundle retirement already committed",
+                    serde_json::json!({"cluster_id": cluster_id}),
+                ))
+            } else {
+                Ok(rejected(
+                    "request_id was already used with a different payload",
+                ))
+            };
+        }
+        let expiry = match cluster.previous_trust_bundle_expires_at_ms {
+            Some(value) => value,
+            None => return Ok(rejected("there is no previous CA bundle to retire")),
+        };
+        if at_ms < expiry {
+            return Ok(rejected("previous CA bundle overlap has not expired"));
+        }
+        cluster.previous_trust_bundle_pem = None;
+        cluster.previous_trust_bundle_fingerprint = None;
+        cluster.previous_trust_bundle_expires_at_ms = None;
+        cluster.updated_at_ms = at_ms;
+        let audit = self.audit_event(
+            &actor,
+            &request_id,
+            "federated_cluster.ca_bundle_retired",
+            &cluster_id,
+            "overlap",
+            "active_only",
+        );
+        self.task_store
+            .save_federated_control(
+                &request_id,
+                &payload,
+                format!("federated_cluster:{cluster_id}"),
+                serde_json::to_vec(&cluster)?,
+                audit,
+            )
+            .await?;
+        Ok(accepted(
+            "previous CA bundle retired",
+            serde_json::json!({"cluster_id": cluster_id, "active_fingerprint": cluster.trust_bundle_fingerprint}),
         ))
     }
 
@@ -3223,6 +3516,14 @@ mod tests {
             pending_identity_fingerprint: None,
             rotation_started_at_ms: None,
             pending_rotation_grace_period_ms: None,
+            trust_bundle_pem: None,
+            trust_bundle_fingerprint: None,
+            pending_trust_bundle_pem: None,
+            pending_trust_bundle_fingerprint: None,
+            trust_bundle_staged_at_ms: None,
+            previous_trust_bundle_pem: None,
+            previous_trust_bundle_fingerprint: None,
+            previous_trust_bundle_expires_at_ms: None,
             version: "0.1.0".into(),
             capabilities: [
                 "elasticsearch-source".to_string(),
@@ -3328,6 +3629,174 @@ mod tests {
         assert!(active.accepts_fingerprint(&"a".repeat(64), 122_999));
         assert!(!active.accepts_fingerprint(&"a".repeat(64), 123_000));
         assert!(active.accepts_fingerprint(&"b".repeat(64), 123_000));
+    }
+
+    #[tokio::test]
+    async fn federated_ca_bundle_rotation_is_raft_persisted_and_expires_exactly() {
+        let dir = tempdir().unwrap();
+        let db = RocksDbStore::open(dir.path()).unwrap();
+        let store = TaskStore::new(db);
+        let mut sm = MetaStateMachine::new(store.kv_store().clone());
+        assert!(
+            sm.apply_command(Command::UpsertFederatedCluster {
+                cluster: federated_cluster("ca-peer"),
+                request_id: "register-ca-peer".into(),
+                actor: "operator".into(),
+            })
+            .await
+            .unwrap()
+            .success
+        );
+        let old_pem = include_str!("../../tests/fixtures/federation-test-ca.pem").to_string();
+        let new_pem = include_str!("../../tests/fixtures/federation-rotation/ca.pem").to_string();
+        let old_fp = crate::federation::validate_trust_bundle(&old_pem).unwrap();
+        let new_fp = crate::federation::validate_trust_bundle(&new_pem).unwrap();
+        let stage = Command::StageFederatedTrustBundle {
+            cluster_id: "ca-peer".into(),
+            current_fingerprint: String::new(),
+            bundle_pem: old_pem.clone(),
+            bundle_fingerprint: old_fp.clone(),
+            at_ms: 1_000,
+            request_id: "stage-initial-ca".into(),
+            actor: "operator".into(),
+        };
+        assert!(sm.apply_command(stage.clone()).await.unwrap().success);
+        assert!(sm.apply_command(stage).await.unwrap().success);
+        assert!(
+            sm.apply_command(Command::ActivateFederatedTrustBundle {
+                cluster_id: "ca-peer".into(),
+                bundle_fingerprint: old_fp.clone(),
+                at_ms: 2_000,
+                overlap_ms: 120_000,
+                request_id: "activate-initial-ca".into(),
+                actor: "operator".into(),
+            })
+            .await
+            .unwrap()
+            .success
+        );
+        let stage_new = Command::StageFederatedTrustBundle {
+            cluster_id: "ca-peer".into(),
+            current_fingerprint: old_fp.clone(),
+            bundle_pem: new_pem.clone(),
+            bundle_fingerprint: new_fp.clone(),
+            at_ms: 3_000,
+            request_id: "stage-next-ca".into(),
+            actor: "operator".into(),
+        };
+        assert!(sm.apply_command(stage_new.clone()).await.unwrap().success);
+        let staged = store
+            .get_federated_cluster("ca-peer")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            staged.trust_bundle_fingerprint.as_deref(),
+            Some(old_fp.as_str())
+        );
+        assert!(
+            staged
+                .effective_trust_bundle(4_000)
+                .unwrap()
+                .contains("BEGIN CERTIFICATE")
+        );
+        assert!(sm.apply_command(stage_new.clone()).await.unwrap().success);
+        assert!(
+            sm.apply_command(Command::ActivateFederatedTrustBundle {
+                cluster_id: "ca-peer".into(),
+                bundle_fingerprint: new_fp.clone(),
+                at_ms: 10_000,
+                overlap_ms: 120_000,
+                request_id: "activate-next-ca".into(),
+                actor: "operator".into(),
+            })
+            .await
+            .unwrap()
+            .success
+        );
+        let active = store
+            .get_federated_cluster("ca-peer")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            active.trust_bundle_fingerprint.as_deref(),
+            Some(new_fp.as_str())
+        );
+        assert_eq!(
+            active.previous_trust_bundle_fingerprint.as_deref(),
+            Some(old_fp.as_str())
+        );
+        assert_eq!(active.previous_trust_bundle_expires_at_ms, Some(130_000));
+        let overlap = active.effective_trust_bundle(129_999).unwrap();
+        assert_eq!(overlap.matches("BEGIN CERTIFICATE").count(), 2);
+        assert_eq!(
+            active
+                .effective_trust_bundle(130_000)
+                .unwrap()
+                .matches("BEGIN CERTIFICATE")
+                .count(),
+            1
+        );
+        // Reopen the RocksDB-backed registry to verify the active/previous CA state
+        // and absolute expiry survive a process restart before retirement.
+        drop(sm);
+        drop(store);
+        let reopened_store = TaskStore::new(RocksDbStore::open(dir.path()).unwrap());
+        let reopened = reopened_store
+            .get_federated_cluster("ca-peer")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            reopened.trust_bundle_fingerprint.as_deref(),
+            Some(new_fp.as_str())
+        );
+        assert_eq!(
+            reopened.previous_trust_bundle_fingerprint.as_deref(),
+            Some(old_fp.as_str())
+        );
+        assert_eq!(reopened.previous_trust_bundle_expires_at_ms, Some(130_000));
+        let mut sm = MetaStateMachine::new(reopened_store.kv_store().clone());
+        let store = reopened_store;
+        let retire = Command::RetireFederatedTrustBundle {
+            cluster_id: "ca-peer".into(),
+            at_ms: 130_000,
+            request_id: "retire-old-ca".into(),
+            actor: "operator".into(),
+        };
+        assert!(sm.apply_command(retire.clone()).await.unwrap().success);
+        assert!(sm.apply_command(retire).await.unwrap().success);
+        let retired = store
+            .get_federated_cluster("ca-peer")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(retired.previous_trust_bundle_pem.is_none());
+        assert!(
+            sm.apply_command(Command::RetireFederatedTrustBundle {
+                cluster_id: "ca-peer".into(),
+                at_ms: 131_000,
+                request_id: "retire-old-ca".into(),
+                actor: "operator".into()
+            })
+            .await
+            .unwrap()
+            .success
+        );
+        assert_eq!(
+            retired.trust_bundle_fingerprint.as_deref(),
+            Some(new_fp.as_str())
+        );
+        assert!(crate::federation::validate_trust_bundle("not a PEM bundle").is_err());
+        assert!(
+            crate::federation::validate_trust_bundle(&format!(
+                "{}\n{}",
+                old_pem,
+                include_str!("../../tests/fixtures/federation-rotation/old-client.key.pem")
+            ))
+            .is_err()
+        );
     }
 
     #[tokio::test]

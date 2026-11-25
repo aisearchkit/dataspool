@@ -39,6 +39,8 @@ pub struct GrpcServer {
     task_service: Arc<RwLock<TaskServiceImpl>>,
     log_service: Arc<RwLock<LogServiceImpl>>,
     tls: Option<ServerTlsConfig>,
+    task_store: Arc<TaskStore<RocksDbStore>>,
+    tls_files: Option<(PathBuf, PathBuf, PathBuf)>,
     #[cfg(feature = "test-fault-injection")]
     rotation_proof_ack_drop_marker: Option<PathBuf>,
 }
@@ -53,9 +55,11 @@ impl GrpcServer {
             bind_addr: bind_addr.to_string(),
             cluster_service: Arc::new(RwLock::new(ClusterServiceImpl)),
             task_service: Arc::new(RwLock::new(TaskServiceImpl {
-                task_store,
+                task_store: task_store.clone(),
                 raft_node,
             })),
+            task_store,
+            tls_files: None,
             log_service: Arc::new(RwLock::new(LogServiceImpl)),
             tls: None,
             #[cfg(feature = "test-fault-injection")]
@@ -84,6 +88,11 @@ impl GrpcServer {
                 .identity(Identity::from_pem(certificate, private_key))
                 .client_ca_root(Certificate::from_pem(client_ca)),
         );
+        self.tls_files = Some((
+            certificate_file.to_path_buf(),
+            private_key_file.to_path_buf(),
+            client_ca_file.to_path_buf(),
+        ));
         Ok(self)
     }
 
@@ -101,7 +110,8 @@ impl GrpcServer {
             .await
     }
 
-    /// Start the gRPC server with coordinated graceful shutdown.
+    /// Start the gRPC server with coordinated graceful shutdown. When federated CA
+    /// bundles change in Raft, the listener drains in-flight RPCs and reloads TLS.
     pub async fn serve_until_cancelled(self, shutdown: crate::CancellationToken) -> Result<()> {
         let addr = self.bind_addr.parse().map_err(|e| {
             DatspoolError::Config(crate::error::ConfigError::Invalid(format!(
@@ -109,35 +119,135 @@ impl GrpcServer {
                 self.bind_addr, e
             )))
         })?;
-
         info!("Starting gRPC server on {}", addr);
 
-        #[cfg(feature = "test-fault-injection")]
-        let mut builder = Server::builder().layer(DropRotationProofAckLayer::new(
-            self.rotation_proof_ack_drop_marker,
-        ));
-        #[cfg(not(feature = "test-fault-injection"))]
-        let mut builder = Server::builder();
-        if let Some(tls) = self.tls {
-            builder = builder.tls_config(tls).map_err(|e| {
-                DatspoolError::Configuration(format!("Invalid gRPC mTLS configuration: {e}"))
-            })?;
+        loop {
+            let tls = self.load_tls_config().await?;
+            let tls_fingerprint = self.tls_material_fingerprint().await?;
+            #[cfg(feature = "test-fault-injection")]
+            let mut builder = Server::builder().layer(DropRotationProofAckLayer::new(
+                self.rotation_proof_ack_drop_marker.clone(),
+            ));
+            #[cfg(not(feature = "test-fault-injection"))]
+            let mut builder = Server::builder();
+            if let Some(tls) = tls {
+                builder = builder.tls_config(tls).map_err(|e| {
+                    DatspoolError::Configuration(format!("Invalid gRPC mTLS configuration: {e}"))
+                })?;
+            }
+            let listener_shutdown = shutdown.child_token();
+            let server = builder
+                .add_service(cluster::cluster_service_server::ClusterServiceServer::new(
+                    self.cluster_service.clone(),
+                ))
+                .add_service(task::task_service_server::TaskServiceServer::new(
+                    self.task_service.clone(),
+                ))
+                .add_service(log::log_service_server::LogServiceServer::new(
+                    self.log_service.clone(),
+                ))
+                .serve_with_shutdown(addr, listener_shutdown.clone().cancelled_owned());
+            tokio::pin!(server);
+            let mut refresh = tokio::time::interval(std::time::Duration::from_secs(3));
+            refresh.tick().await;
+            loop {
+                tokio::select! {
+                    result = &mut server => {
+                        result.map_err(|e| DatspoolError::Internal(format!("gRPC server error: {e}")))?;
+                        return Ok(());
+                    }
+                    _ = shutdown.cancelled() => {
+                        listener_shutdown.cancel();
+                        match tokio::time::timeout(std::time::Duration::from_secs(10), &mut server).await {
+                            Ok(Ok(())) => {},
+                            Ok(Err(error)) => return Err(DatspoolError::Internal(format!("gRPC shutdown error: {error}"))),
+                            Err(_) => warn!("gRPC graceful shutdown exceeded 10 seconds; force-closing listener"),
+                        }
+                        return Ok(());
+                    }
+                    _ = refresh.tick(), if self.tls_files.is_some() => {
+                        let current = self.tls_material_fingerprint().await?;
+                        if current != tls_fingerprint {
+                            info!("Federated TLS trust material changed; gracefully restarting gRPC listener");
+                            listener_shutdown.cancel();
+                            match tokio::time::timeout(std::time::Duration::from_secs(10), &mut server).await {
+                                Ok(Ok(())) => {},
+                                Ok(Err(error)) => return Err(DatspoolError::Internal(format!("gRPC TLS reload shutdown error: {error}"))),
+                                Err(_) => warn!("gRPC connections did not drain within 10 seconds; force-closing listener for TLS reload"),
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
         }
-        builder
-            .add_service(cluster::cluster_service_server::ClusterServiceServer::new(
-                self.cluster_service.clone(),
-            ))
-            .add_service(task::task_service_server::TaskServiceServer::new(
-                self.task_service.clone(),
-            ))
-            .add_service(log::log_service_server::LogServiceServer::new(
-                self.log_service.clone(),
-            ))
-            .serve_with_shutdown(addr, shutdown.cancelled_owned())
-            .await
-            .map_err(|e| DatspoolError::Internal(format!("gRPC server error: {}", e)))?;
+    }
 
-        Ok(())
+    async fn effective_client_ca_pem(&self, configured_ca: &[u8]) -> Result<Vec<u8>> {
+        let peers = self.task_store.list_federated_clusters().await?;
+        if peers.is_empty() {
+            return Ok(configured_ca.to_vec());
+        }
+        let all_peers_managed = peers.iter().all(|peer| peer.trust_bundle_pem.is_some());
+        let mut bundles = Vec::<String>::new();
+        if !all_peers_managed {
+            bundles.push(String::from_utf8_lossy(configured_ca).into_owned());
+        }
+        let now = chrono::Utc::now().timestamp_millis();
+        for peer in peers {
+            if let Some(bundle) = peer.effective_trust_bundle(now)
+                && !bundles.contains(&bundle)
+            {
+                bundles.push(bundle);
+            }
+        }
+        if bundles.is_empty() {
+            return Ok(configured_ca.to_vec());
+        }
+        Ok(bundles.join("\n").into_bytes())
+    }
+
+    async fn load_tls_config(&self) -> Result<Option<ServerTlsConfig>> {
+        let Some((certificate_file, private_key_file, client_ca_file)) = &self.tls_files else {
+            return Ok(self.tls.clone());
+        };
+        let certificate = tokio::fs::read(certificate_file).await.map_err(|e| {
+            DatspoolError::Configuration(format!("Unable to read gRPC certificate: {e}"))
+        })?;
+        let private_key = tokio::fs::read(private_key_file).await.map_err(|e| {
+            DatspoolError::Configuration(format!("Unable to read gRPC private key: {e}"))
+        })?;
+        let configured_ca = tokio::fs::read(client_ca_file).await.map_err(|e| {
+            DatspoolError::Configuration(format!("Unable to read gRPC client CA: {e}"))
+        })?;
+        let client_ca = self.effective_client_ca_pem(&configured_ca).await?;
+        Ok(Some(
+            ServerTlsConfig::new()
+                .identity(Identity::from_pem(certificate, private_key))
+                .client_ca_root(Certificate::from_pem(client_ca)),
+        ))
+    }
+
+    async fn tls_material_fingerprint(&self) -> Result<String> {
+        use sha2::{Digest, Sha256};
+        let Some((certificate_file, private_key_file, client_ca_file)) = &self.tls_files else {
+            return Ok(String::new());
+        };
+        let certificate = tokio::fs::read(certificate_file).await.map_err(|e| {
+            DatspoolError::Configuration(format!("Unable to read gRPC certificate: {e}"))
+        })?;
+        let private_key = tokio::fs::read(private_key_file).await.map_err(|e| {
+            DatspoolError::Configuration(format!("Unable to read gRPC private key: {e}"))
+        })?;
+        let configured_ca = tokio::fs::read(client_ca_file).await.map_err(|e| {
+            DatspoolError::Configuration(format!("Unable to read gRPC client CA: {e}"))
+        })?;
+        let client_ca = self.effective_client_ca_pem(&configured_ca).await?;
+        let mut digest = Sha256::new();
+        digest.update(certificate);
+        digest.update(private_key);
+        digest.update(client_ca);
+        Ok(format!("{:x}", digest.finalize()))
     }
 }
 

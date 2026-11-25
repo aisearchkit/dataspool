@@ -52,6 +52,19 @@ impl GrpcClient {
         certificate_file: &std::path::Path,
         private_key_file: &std::path::Path,
     ) -> Result<Self> {
+        let ca = tokio::fs::read(ca_file)
+            .await
+            .map_err(|e| DatspoolError::Configuration(format!("Unable to read peer CA: {e}")))?;
+        Self::connect_mtls_with_ca_pem(endpoint_url, &ca, certificate_file, private_key_file).await
+    }
+
+    /// Connect with a Raft-managed peer trust bundle rather than a static CA file.
+    pub async fn connect_mtls_with_ca_pem(
+        endpoint_url: &str,
+        ca_pem: &[u8],
+        certificate_file: &std::path::Path,
+        private_key_file: &std::path::Path,
+    ) -> Result<Self> {
         let parsed = url::Url::parse(endpoint_url)
             .map_err(|e| DatspoolError::Configuration(format!("Invalid peer endpoint: {e}")))?;
         if parsed.scheme() != "https"
@@ -65,21 +78,15 @@ impl GrpcClient {
                 "Federated peer endpoint must be an HTTPS origin URL".into(),
             ));
         }
-        let ca = tokio::fs::read(ca_file)
-            .await
-            .map_err(|e| DatspoolError::Configuration(format!("Unable to read peer CA: {e}")))?;
         let cert = tokio::fs::read(certificate_file).await.map_err(|e| {
             DatspoolError::Configuration(format!("Unable to read client certificate: {e}"))
         })?;
         let key = tokio::fs::read(private_key_file).await.map_err(|e| {
             DatspoolError::Configuration(format!("Unable to read client private key: {e}"))
         })?;
-        // Dataspool links multiple TLS stacks (Tonic, Reqwest, SQLx and AWS SDK),
-        // which may enable both rustls ring and aws-lc providers. Install one
-        // process-wide provider explicitly before Tonic builds its TLS connector.
         let _ = rustls::crypto::ring::default_provider().install_default();
         let tls = ClientTlsConfig::new()
-            .ca_certificate(Certificate::from_pem(ca))
+            .ca_certificate(Certificate::from_pem(ca_pem))
             .identity(Identity::from_pem(cert, key))
             .domain_name(parsed.host_str().expect("validated host").to_string());
         let endpoint = Endpoint::from_shared(endpoint_url.to_string())

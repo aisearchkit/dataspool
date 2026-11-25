@@ -32,6 +32,26 @@ pub struct FederatedCluster {
     pub rotation_started_at_ms: Option<i64>,
     #[serde(default)]
     pub pending_rotation_grace_period_ms: Option<i64>,
+    /// Active PEM trust bundle used to validate peer client certificates.
+    /// Public CA material is replicated through Raft; private keys are never stored here.
+    #[serde(default)]
+    pub trust_bundle_pem: Option<String>,
+    #[serde(default)]
+    pub trust_bundle_fingerprint: Option<String>,
+    /// Candidate CA bundle is staged but is not trusted until activation.
+    #[serde(default)]
+    pub pending_trust_bundle_pem: Option<String>,
+    #[serde(default)]
+    pub pending_trust_bundle_fingerprint: Option<String>,
+    #[serde(default)]
+    pub trust_bundle_staged_at_ms: Option<i64>,
+    /// Previous CA bundle remains trusted only until this committed deadline.
+    #[serde(default)]
+    pub previous_trust_bundle_pem: Option<String>,
+    #[serde(default)]
+    pub previous_trust_bundle_fingerprint: Option<String>,
+    #[serde(default)]
+    pub previous_trust_bundle_expires_at_ms: Option<i64>,
     pub version: String,
     pub capabilities: BTreeSet<String>,
     pub status: FederatedClusterStatus,
@@ -197,6 +217,20 @@ impl FederatedMigration {
 }
 
 impl FederatedCluster {
+    /// Return the CA material that should be trusted at this instant. The old bundle
+    /// is included only before its Raft-committed expiry deadline.
+    pub fn effective_trust_bundle(&self, now_ms: i64) -> Option<String> {
+        let active = self.trust_bundle_pem.as_deref()?;
+        let previous = self
+            .previous_trust_bundle_expires_at_ms
+            .filter(|expires| now_ms < *expires)
+            .and(self.previous_trust_bundle_pem.as_deref());
+        Some(match previous {
+            Some(previous) => format!("{}\n{}", active.trim_end(), previous.trim_start()),
+            None => active.to_string(),
+        })
+    }
+
     pub fn accepts_fingerprint(&self, fingerprint: &str, now_ms: i64) -> bool {
         self.identity_fingerprint.eq_ignore_ascii_case(fingerprint)
             || (self
@@ -207,6 +241,45 @@ impl FederatedCluster {
                     .as_deref()
                     .is_some_and(|previous| previous.eq_ignore_ascii_case(fingerprint)))
     }
+}
+
+/// Validate a PEM CA bundle and return its stable SHA-256 fingerprint.
+/// Fingerprints are calculated over the concatenated DER certificates, not PEM whitespace.
+pub fn validate_trust_bundle(pem: &str) -> Result<String, String> {
+    use sha2::{Digest, Sha256};
+    use std::io::Cursor;
+
+    const MAX_BUNDLE_BYTES: usize = 1024 * 1024;
+    const MAX_CERTIFICATES: usize = 32;
+    if pem.trim().is_empty() || pem.len() > MAX_BUNDLE_BYTES {
+        return Err("CA trust bundle must contain 1 byte to 1 MiB of PEM data".into());
+    }
+    let mut reader = Cursor::new(pem.as_bytes());
+    let items = rustls_pemfile::read_all(&mut reader)
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|error| format!("invalid CA bundle PEM: {error}"))?;
+    let mut certificates = Vec::with_capacity(items.len());
+    for item in items {
+        match item {
+            rustls_pemfile::Item::X509Certificate(certificate) => certificates.push(certificate),
+            _ => return Err("CA trust bundle may contain only CERTIFICATE PEM blocks; private keys and other PEM objects are forbidden".into()),
+        }
+    }
+    if certificates.is_empty() || certificates.len() > MAX_CERTIFICATES {
+        return Err("CA trust bundle must contain between 1 and 32 certificates".into());
+    }
+    let mut digest = Sha256::new();
+    let mut roots = rustls::RootCertStore::empty();
+    for certificate in certificates {
+        if certificate.is_empty() {
+            return Err("CA trust bundle contains an empty certificate".into());
+        }
+        roots
+            .add(certificate.clone())
+            .map_err(|error| format!("invalid CA certificate in trust bundle: {error}"))?;
+        digest.update(certificate.as_ref());
+    }
+    Ok(format!("{:x}", digest.finalize()))
 }
 
 pub fn validate_cluster(cluster: &FederatedCluster) -> Result<(), String> {
@@ -290,6 +363,14 @@ mod tests {
             pending_identity_fingerprint: None,
             rotation_started_at_ms: None,
             pending_rotation_grace_period_ms: None,
+            trust_bundle_pem: None,
+            trust_bundle_fingerprint: None,
+            pending_trust_bundle_pem: None,
+            pending_trust_bundle_fingerprint: None,
+            trust_bundle_staged_at_ms: None,
+            previous_trust_bundle_pem: None,
+            previous_trust_bundle_fingerprint: None,
+            previous_trust_bundle_expires_at_ms: None,
             version: "0.1.0".into(),
             capabilities: BTreeSet::new(),
             status: FederatedClusterStatus::Healthy,
