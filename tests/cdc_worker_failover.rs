@@ -26,6 +26,31 @@ fn env_required(key: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| panic!("{key} is required"))
 }
 
+async fn ensure_es_request_with_retry<F>(mut request: F, context: &str)
+where
+    F: FnMut() -> reqwest::RequestBuilder,
+{
+    let mut last_error = String::new();
+    for attempt in 0..15 {
+        match request().send().await {
+            Ok(response) if response.status().is_success() => return,
+            Ok(response) => {
+                let status = response.status();
+                let body = response.text().await.unwrap_or_default();
+                last_error = format!("HTTP {status}: {body}");
+                if !status.is_server_error() && status.as_u16() != 429 {
+                    panic!("{context} failed permanently: {last_error}");
+                }
+            }
+            Err(error) => last_error = error.to_string(),
+        }
+        if attempt < 14 {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    }
+    panic!("{context} failed after transient retries: {last_error}");
+}
+
 async fn wait_for_file(path: &std::path::Path, child: &mut Child, timeout: Duration) {
     let deadline = tokio::time::Instant::now() + timeout;
     while !path.exists() {
@@ -412,13 +437,14 @@ async fn cdc_worker_crash_and_raft_failover_replays_without_duplicate_effects() 
         .await
         .unwrap();
     assert!(response.status().is_success());
-    let response = http
-        .put(format!("{source}/{source_index}/_doc/cdc-doc-1"))
-        .json(&json!({"value":99}))
-        .send()
-        .await
-        .unwrap();
-    assert!(response.status().is_success());
+    ensure_es_request_with_retry(
+        || {
+            http.put(format!("{source}/{source_index}/_doc/cdc-doc-1"))
+                .json(&json!({"value":99}))
+        },
+        "update source CDC document",
+    )
+    .await;
     let event = json!({"sequence":1,"operation":"index","document_id":"cdc-doc-1","target_index":target_index,"document":{"value":99}});
     let event_body = format!(
         "{{\"index\":{{\"_id\":\"event-1\"}}}}\n{}\n",
