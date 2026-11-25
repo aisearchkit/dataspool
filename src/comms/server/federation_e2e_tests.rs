@@ -1127,6 +1127,19 @@ impl TestRaftGroup {
         self.nodes[index] = Some(node);
     }
 
+    async fn restart_all(&mut self) {
+        for index in 0..3 {
+            self.stop(index).await;
+        }
+        for index in 0..3 {
+            self.restart(index).await;
+        }
+        self.wait_for_leader(None).await;
+        for index in 0..3 {
+            self.node(index).ensure_linearizable().await.unwrap();
+        }
+    }
+
     async fn shutdown_all(&mut self) {
         for index in 0..3 {
             self.stop(index).await;
@@ -1533,6 +1546,548 @@ async fn federated_certificate_rotation_recovers_across_independent_raft_failove
     target_shutdown.cancel();
     source_proxy.task.abort();
     target_proxy.task.abort();
+    source_server.await.unwrap();
+    target_server.await.unwrap();
+    source.shutdown_all().await;
+    target.shutdown_all().await;
+}
+
+fn trust_bundle_old_client_fingerprint() -> String {
+    format!(
+        "{:x}",
+        Sha256::digest(cert_der(include_bytes!(
+            "../../../tests/fixtures/federation-trust-bundle/old-client.pem"
+        )))
+    )
+}
+
+fn trust_bundle_new_client_fingerprint() -> String {
+    format!(
+        "{:x}",
+        Sha256::digest(cert_der(include_bytes!(
+            "../../../tests/fixtures/federation-trust-bundle/new-client.pem"
+        )))
+    )
+}
+
+async fn spawn_managed_trust_server(
+    group: &TestRaftGroup,
+    leader: usize,
+    address: &str,
+    certificate: &std::path::Path,
+    private_key: &std::path::Path,
+    configured_ca: &std::path::Path,
+) -> (ShutdownToken, JoinHandle<()>) {
+    let server = GrpcServer::new(
+        address,
+        group.task_store(leader),
+        Some(Arc::new(group.node(leader).clone())),
+    )
+    .await
+    .unwrap()
+    .with_mtls_files(certificate, private_key, configured_ca)
+    .await
+    .unwrap();
+    let shutdown = ShutdownToken::new();
+    let server_shutdown = shutdown.clone();
+    let task = tokio::spawn(async move {
+        server.serve_until_cancelled(server_shutdown).await.unwrap();
+    });
+    (shutdown, task)
+}
+
+async fn connect_trust_bundle_client(
+    endpoint: &str,
+    ca: &std::path::Path,
+    certificate: &std::path::Path,
+    key: &std::path::Path,
+) -> crate::comms::GrpcClient {
+    tokio::time::timeout(Duration::from_secs(12), async {
+        loop {
+            match crate::comms::GrpcClient::connect_mtls(endpoint, ca, certificate, key).await {
+                Ok(client) => return client,
+                Err(_) => tokio::time::sleep(Duration::from_millis(75)).await,
+            }
+        }
+    })
+    .await
+    .expect("managed trust bundle gRPC endpoint did not accept mTLS")
+}
+
+async fn propose_ca_stage_and_activate(
+    group: &TestRaftGroup,
+    peer_id: &str,
+    old_ca: &str,
+    new_ca: &str,
+    old_ca_fingerprint: &str,
+    new_ca_fingerprint: &str,
+    at_ms: i64,
+) -> i64 {
+    let leader = group.wait_for_leader(None).await;
+    let stage = group
+        .node(leader)
+        .propose(Command::StageFederatedTrustBundle {
+            cluster_id: peer_id.into(),
+            current_fingerprint: old_ca_fingerprint.into(),
+            bundle_pem: new_ca.into(),
+            bundle_fingerprint: new_ca_fingerprint.into(),
+            at_ms,
+            request_id: format!("trust-stage-{peer_id}"),
+            actor: "trust-bundle-ha-e2e".into(),
+        })
+        .await
+        .unwrap();
+    assert!(stage.success, "{}", stage.message);
+    let activate_at = at_ms + 1;
+    let activation = group
+        .node(leader)
+        .propose(Command::ActivateFederatedTrustBundle {
+            cluster_id: peer_id.into(),
+            bundle_fingerprint: new_ca_fingerprint.into(),
+            at_ms: activate_at,
+            overlap_ms: 60_000,
+            request_id: format!("trust-activate-{peer_id}"),
+            actor: "trust-bundle-ha-e2e".into(),
+        })
+        .await
+        .unwrap();
+    assert!(activation.success, "{}", activation.message);
+    let expiry = activate_at + 60_000;
+    let replay = group
+        .node(leader)
+        .propose(Command::ActivateFederatedTrustBundle {
+            cluster_id: peer_id.into(),
+            bundle_fingerprint: new_ca_fingerprint.into(),
+            at_ms: expiry + 60_000,
+            overlap_ms: 60_000,
+            request_id: format!("trust-activate-{peer_id}"),
+            actor: "lost-ack-replay".into(),
+        })
+        .await
+        .unwrap();
+    assert!(replay.success, "{}", replay.message);
+    let cluster = group
+        .task_store(leader)
+        .get_federated_cluster(peer_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(cluster.previous_trust_bundle_expires_at_ms, Some(expiry));
+    assert_eq!(cluster.previous_trust_bundle_pem.as_deref(), Some(old_ca));
+    expiry
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn federated_trust_bundle_rotation_converges_across_two_three_member_raft_groups_and_live_mtls()
+ {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let mut source = TestRaftGroup::start("federation-trust-source-ha").await;
+    let mut target = TestRaftGroup::start("federation-trust-target-ha").await;
+    let source_leader = source.wait_for_leader(None).await;
+    let target_leader = target.wait_for_leader(None).await;
+
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/federation-trust-bundle");
+    let old_ca = std::fs::read(fixture.join("old-ca.pem")).unwrap();
+    let new_ca = std::fs::read(fixture.join("new-ca.pem")).unwrap();
+    let old_ca_pem = String::from_utf8(old_ca.clone()).unwrap();
+    let new_ca_pem = String::from_utf8(new_ca.clone()).unwrap();
+    let old_ca_fingerprint = crate::federation::validate_trust_bundle(&old_ca_pem).unwrap();
+    let new_ca_fingerprint = crate::federation::validate_trust_bundle(&new_ca_pem).unwrap();
+    let old_client_fingerprint = trust_bundle_old_client_fingerprint();
+    let new_client_fingerprint = trust_bundle_new_client_fingerprint();
+
+    for (group, leader, peer_id) in [
+        (&source, source_leader, "trust-target"),
+        (&target, target_leader, "trust-source"),
+    ] {
+        let now = chrono::Utc::now().timestamp_millis();
+        let result = group
+            .node(leader)
+            .propose(Command::UpsertFederatedCluster {
+                cluster: FederatedCluster {
+                    cluster_id: peer_id.into(),
+                    endpoint: "https://127.0.0.1:1".into(),
+                    identity_fingerprint: old_client_fingerprint.clone(),
+                    previous_identity_fingerprint: None,
+                    previous_identity_expires_at_ms: None,
+                    pending_identity_fingerprint: None,
+                    rotation_started_at_ms: None,
+                    pending_rotation_grace_period_ms: None,
+                    trust_bundle_pem: Some(old_ca_pem.clone()),
+                    trust_bundle_fingerprint: Some(old_ca_fingerprint.clone()),
+                    pending_trust_bundle_pem: None,
+                    pending_trust_bundle_fingerprint: None,
+                    trust_bundle_staged_at_ms: None,
+                    previous_trust_bundle_pem: None,
+                    previous_trust_bundle_fingerprint: None,
+                    previous_trust_bundle_expires_at_ms: None,
+                    version: env!("CARGO_PKG_VERSION").into(),
+                    capabilities: BTreeSet::new(),
+                    status: FederatedClusterStatus::Healthy,
+                    last_seen_at_ms: now,
+                    updated_at_ms: now,
+                },
+                request_id: format!("register-{peer_id}"),
+                actor: "trust-bundle-ha-e2e".into(),
+            })
+            .await
+            .unwrap();
+        assert!(result.success, "{}", result.message);
+    }
+
+    let source_dir = tempfile::tempdir().unwrap();
+    let target_dir = tempfile::tempdir().unwrap();
+    let write_material = |dir: &std::path::Path, name: &str, bytes: &[u8]| {
+        let path = dir.join(name);
+        std::fs::write(&path, bytes).unwrap();
+        path
+    };
+    let source_server_cert = write_material(
+        source_dir.path(),
+        "server.pem",
+        include_bytes!("../../../tests/fixtures/federation-trust-bundle/old-server.pem"),
+    );
+    let source_server_key = write_material(
+        source_dir.path(),
+        "server.key.pem",
+        include_bytes!("../../../tests/fixtures/federation-trust-bundle/old-server.key.pem"),
+    );
+    let source_configured_ca = write_material(source_dir.path(), "configured-ca.pem", &old_ca);
+    let target_server_cert = write_material(
+        target_dir.path(),
+        "server.pem",
+        include_bytes!("../../../tests/fixtures/federation-trust-bundle/old-server.pem"),
+    );
+    let target_server_key = write_material(
+        target_dir.path(),
+        "server.key.pem",
+        include_bytes!("../../../tests/fixtures/federation-trust-bundle/old-server.key.pem"),
+    );
+    let target_configured_ca = write_material(target_dir.path(), "configured-ca.pem", &old_ca);
+
+    let source_probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let source_addr = source_probe.local_addr().unwrap().to_string();
+    drop(source_probe);
+    let target_probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let target_addr = target_probe.local_addr().unwrap().to_string();
+    drop(target_probe);
+    let (source_shutdown, source_server) = spawn_managed_trust_server(
+        &source,
+        source_leader,
+        &source_addr,
+        &source_server_cert,
+        &source_server_key,
+        &source_configured_ca,
+    )
+    .await;
+    let (target_shutdown, target_server) = spawn_managed_trust_server(
+        &target,
+        target_leader,
+        &target_addr,
+        &target_server_cert,
+        &target_server_key,
+        &target_configured_ca,
+    )
+    .await;
+
+    let old_client_cert = write_material(
+        source_dir.path(),
+        "old-client.pem",
+        include_bytes!("../../../tests/fixtures/federation-trust-bundle/old-client.pem"),
+    );
+    let old_client_key = write_material(
+        source_dir.path(),
+        "old-client.key.pem",
+        include_bytes!("../../../tests/fixtures/federation-trust-bundle/old-client.key.pem"),
+    );
+    let new_client_cert = write_material(
+        source_dir.path(),
+        "new-client.pem",
+        include_bytes!("../../../tests/fixtures/federation-trust-bundle/new-client.pem"),
+    );
+    let new_client_key = write_material(
+        source_dir.path(),
+        "new-client.key.pem",
+        include_bytes!("../../../tests/fixtures/federation-trust-bundle/new-client.key.pem"),
+    );
+    let old_client_ca = write_material(source_dir.path(), "old-client-ca.pem", &old_ca);
+    let old_and_new_ca = write_material(
+        source_dir.path(),
+        "old-and-new-ca.pem",
+        &[old_ca.clone(), new_ca.clone()].concat(),
+    );
+    let new_client_ca = write_material(source_dir.path(), "new-client-ca.pem", &new_ca);
+
+    let mut old_to_source = connect_trust_bundle_client(
+        &format!("https://{source_addr}"),
+        &old_client_ca,
+        &old_client_cert,
+        &old_client_key,
+    )
+    .await;
+    assert!(
+        old_to_source
+            .get_remote_task("00000000-0000-0000-0000-000000000001", "trust-target")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let mut old_to_target = connect_trust_bundle_client(
+        &format!("https://{target_addr}"),
+        &old_client_ca,
+        &old_client_cert,
+        &old_client_key,
+    )
+    .await;
+    assert!(
+        old_to_target
+            .get_remote_task("00000000-0000-0000-0000-000000000001", "trust-source")
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    let now = chrono::Utc::now().timestamp_millis();
+    let source_expiry = propose_ca_stage_and_activate(
+        &source,
+        "trust-target",
+        &old_ca_pem,
+        &new_ca_pem,
+        &old_ca_fingerprint,
+        &new_ca_fingerprint,
+        now,
+    )
+    .await;
+    let target_expiry = propose_ca_stage_and_activate(
+        &target,
+        "trust-source",
+        &old_ca_pem,
+        &new_ca_pem,
+        &old_ca_fingerprint,
+        &new_ca_fingerprint,
+        now,
+    )
+    .await;
+    assert_eq!(source_expiry, target_expiry);
+
+    // Complete the peer leaf identity switch in Raft while the old identity and
+    // old CA remain valid during the bounded overlap.
+    for (group, peer_id) in [(&source, "trust-target"), (&target, "trust-source")] {
+        let leader = group.wait_for_leader(None).await;
+        let stage = group
+            .node(leader)
+            .propose(Command::StageFederatedCertificateRotation {
+                cluster_id: peer_id.into(),
+                current_fingerprint: old_client_fingerprint.clone(),
+                new_fingerprint: new_client_fingerprint.clone(),
+                at_ms: now + 2,
+                grace_period_ms: 60_000,
+                request_id: format!("leaf-stage-{peer_id}"),
+                actor: "trust-bundle-ha-e2e".into(),
+            })
+            .await
+            .unwrap();
+        assert!(stage.success, "{}", stage.message);
+        let complete = group
+            .node(leader)
+            .propose(Command::CompleteFederatedCertificateRotation {
+                cluster_id: peer_id.into(),
+                new_fingerprint: new_client_fingerprint.clone(),
+                at_ms: now + 3,
+                request_id: format!("leaf-complete-{peer_id}"),
+                actor: "trust-bundle-ha-e2e".into(),
+            })
+            .await
+            .unwrap();
+        assert!(complete.success, "{}", complete.message);
+    }
+
+    // Atomically replace both server identities while both Raft-managed CA
+    // bundles are in overlap; the file-backed listeners must reload in place.
+    for (dir, cert, key) in [
+        (
+            source_dir.path(),
+            include_bytes!("../../../tests/fixtures/federation-trust-bundle/new-server.pem")
+                .as_slice(),
+            include_bytes!("../../../tests/fixtures/federation-trust-bundle/new-server.key.pem")
+                .as_slice(),
+        ),
+        (
+            target_dir.path(),
+            include_bytes!("../../../tests/fixtures/federation-trust-bundle/new-server.pem")
+                .as_slice(),
+            include_bytes!("../../../tests/fixtures/federation-trust-bundle/new-server.key.pem")
+                .as_slice(),
+        ),
+    ] {
+        std::fs::write(dir.join("server.pem.next"), cert).unwrap();
+        std::fs::rename(dir.join("server.pem.next"), dir.join("server.pem")).unwrap();
+        std::fs::write(dir.join("server.key.pem.next"), key).unwrap();
+        std::fs::rename(dir.join("server.key.pem.next"), dir.join("server.key.pem")).unwrap();
+    }
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    for (endpoint, peer_id) in [
+        (&source_addr, "trust-target"),
+        (&target_addr, "trust-source"),
+    ] {
+        let mut new_client = connect_trust_bundle_client(
+            &format!("https://{endpoint}"),
+            &old_and_new_ca,
+            &new_client_cert,
+            &new_client_key,
+        )
+        .await;
+        assert!(
+            new_client
+                .get_remote_task("00000000-0000-0000-0000-000000000001", peer_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let mut old_client = connect_trust_bundle_client(
+            &format!("https://{endpoint}"),
+            &old_and_new_ca,
+            &old_client_cert,
+            &old_client_key,
+        )
+        .await;
+        assert!(
+            old_client
+                .get_remote_task("00000000-0000-0000-0000-000000000001", peer_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    // Wait for the committed CA overlap to expire, then prove the old root is
+    // rejected by a fresh TLS handshake (not merely by the application pin).
+    tokio::time::sleep(Duration::from_secs(61)).await;
+    for (group, peer_id, expiry) in [
+        (&source, "trust-target", source_expiry),
+        (&target, "trust-source", target_expiry),
+    ] {
+        let leader = group.wait_for_leader(None).await;
+        let retired = group
+            .node(leader)
+            .propose(Command::RetireFederatedTrustBundle {
+                cluster_id: peer_id.into(),
+                at_ms: expiry,
+                request_id: format!("trust-retire-{peer_id}"),
+                actor: "trust-bundle-ha-e2e".into(),
+            })
+            .await
+            .unwrap();
+        assert!(retired.success, "{}", retired.message);
+    }
+    for (endpoint, peer_id) in [
+        (&source_addr, "trust-target"),
+        (&target_addr, "trust-source"),
+    ] {
+        assert!(
+            crate::comms::GrpcClient::connect_mtls(
+                &format!("https://{endpoint}"),
+                &old_and_new_ca,
+                &old_client_cert,
+                &old_client_key
+            )
+            .await
+            .is_err(),
+            "old CA client unexpectedly opened a fresh mTLS connection to {endpoint}"
+        );
+        let mut new_client = connect_trust_bundle_client(
+            &format!("https://{endpoint}"),
+            &new_client_ca,
+            &new_client_cert,
+            &new_client_key,
+        )
+        .await;
+        assert!(
+            new_client
+                .get_remote_task("00000000-0000-0000-0000-000000000001", peer_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    // Stop both three-member groups and both gRPC listeners together, reopen all
+    // six Raft members from disk, then rebuild listeners against the new leaders.
+    source_shutdown.cancel();
+    target_shutdown.cancel();
+    source_server.await.unwrap();
+    target_server.await.unwrap();
+    let ((), ()) = tokio::join!(source.restart_all(), target.restart_all());
+    let source_leader = source.wait_for_leader(None).await;
+    let target_leader = target.wait_for_leader(None).await;
+    for (group, peer_id) in [(&source, "trust-target"), (&target, "trust-source")] {
+        for member in 0..3 {
+            let cluster = group
+                .task_store(member)
+                .get_federated_cluster(peer_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                cluster.trust_bundle_fingerprint.as_deref(),
+                Some(new_ca_fingerprint.as_str())
+            );
+            assert!(cluster.previous_trust_bundle_pem.is_none());
+            assert!(cluster.previous_trust_bundle_expires_at_ms.is_none());
+            assert_eq!(cluster.identity_fingerprint, new_client_fingerprint);
+        }
+    }
+    let (source_shutdown, source_server) = spawn_managed_trust_server(
+        &source,
+        source_leader,
+        &source_addr,
+        &source_server_cert,
+        &source_server_key,
+        &source_configured_ca,
+    )
+    .await;
+    let (target_shutdown, target_server) = spawn_managed_trust_server(
+        &target,
+        target_leader,
+        &target_addr,
+        &target_server_cert,
+        &target_server_key,
+        &target_configured_ca,
+    )
+    .await;
+    for (endpoint, peer_id) in [
+        (&source_addr, "trust-target"),
+        (&target_addr, "trust-source"),
+    ] {
+        let mut new_client = connect_trust_bundle_client(
+            &format!("https://{endpoint}"),
+            &new_client_ca,
+            &new_client_cert,
+            &new_client_key,
+        )
+        .await;
+        assert!(
+            new_client
+                .get_remote_task("00000000-0000-0000-0000-000000000001", peer_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            crate::comms::GrpcClient::connect_mtls(
+                &format!("https://{endpoint}"),
+                &new_client_ca,
+                &old_client_cert,
+                &old_client_key
+            )
+            .await
+            .is_err()
+        );
+    }
+
+    source_shutdown.cancel();
+    target_shutdown.cancel();
     source_server.await.unwrap();
     target_server.await.unwrap();
     source.shutdown_all().await;
