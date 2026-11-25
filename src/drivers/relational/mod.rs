@@ -17,8 +17,8 @@ pub mod source;
 
 pub use config::{DatabaseType, RelationalConfig, SslConfig};
 pub use outbox::{
-    PostgresOutboxConfig, PostgresOutboxEvent, PostgresOutboxSource, PostgresOutboxWrite,
-    PostgresTransactionalOutbox,
+    PostgresOutboxConfig, PostgresOutboxEvent, PostgresOutboxEventInput, PostgresOutboxSource,
+    PostgresOutboxWrite, PostgresTransactionalOutbox,
 };
 pub use sink::RelationalSink;
 pub use source::RelationalSource;

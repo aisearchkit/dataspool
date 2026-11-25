@@ -31,6 +31,16 @@ pub struct PostgresOutboxEvent {
     pub document: Value,
 }
 
+/// One event in an atomic producer batch.
+#[derive(Debug, Clone)]
+pub struct PostgresOutboxEventInput {
+    pub event_id: uuid::Uuid,
+    pub operation: String,
+    pub document_id: String,
+    pub target_index: String,
+    pub document: Value,
+}
+
 /// PostgreSQL transactional Outbox for one logical CDC stream.
 #[derive(Clone)]
 pub struct PostgresTransactionalOutbox {
@@ -149,6 +159,7 @@ impl PostgresTransactionalOutbox {
             transaction: Some(transaction),
             stream_key: self.stream_key.clone(),
             event_appended: false,
+            failed: false,
         })
     }
 
@@ -309,87 +320,120 @@ impl PostgresTransactionalOutbox {
             .map_err(|e| db_error("commit consumer registration", e))
     }
 
-    /// Persist a monotonic consumer checkpoint. Registration is explicit to
-    /// prevent an untracked consumer from silently falling behind retention.
-    pub async fn record_consumer_checkpoint(
-        &self,
-        consumer_key: &str,
-        sequence: u64,
-    ) -> Result<()> {
-        let sequence = i64::try_from(sequence).map_err(|_| {
-            DatspoolError::Internal("consumer checkpoint exceeds PostgreSQL BIGINT".into())
-        })?;
+    /// Advance multiple registered consumers in one transaction. Each update
+    /// is validated against the committed stream watermark and its previous
+    /// value before any checkpoint becomes visible.
+    pub async fn record_consumer_checkpoints(&self, checkpoints: &[(&str, u64)]) -> Result<()> {
+        if checkpoints.is_empty() {
+            return Ok(());
+        }
+        let mut requested = std::collections::BTreeMap::new();
+        for (consumer, sequence) in checkpoints {
+            let sequence = i64::try_from(*sequence).map_err(|_| {
+                DatspoolError::Internal("consumer checkpoint exceeds PostgreSQL BIGINT".into())
+            })?;
+            if let Some(previous) = requested.insert(*consumer, sequence)
+                && sequence < previous
+            {
+                return Err(DatspoolError::Internal(format!(
+                    "consumer checkpoint regression within batch: {sequence} < {previous}"
+                )));
+            }
+        }
         let mut tx = self
             .pool
             .begin()
             .await
-            .map_err(|e| db_error("begin consumer checkpoint", e))?;
+            .map_err(|e| db_error("begin batched consumer checkpoints", e))?;
         let gate = sqlx::query(
             "SELECT last_sequence FROM dataspool_cdc_outbox_gate WHERE stream_key = $1 FOR UPDATE",
         )
         .bind(&self.stream_key)
         .fetch_one(&mut *tx)
         .await
-        .map_err(|e| db_error("lock stream for checkpoint", e))?;
-        let committed_watermark: i64 = gate
+        .map_err(|e| db_error("lock stream for batched checkpoints", e))?;
+        let watermark: i64 = gate
             .try_get("last_sequence")
-            .map_err(|e| db_error("decode committed Outbox watermark", e))?;
-        if sequence > committed_watermark {
-            tx.rollback()
-                .await
-                .map_err(|e| db_error("rollback checkpoint beyond Outbox watermark", e))?;
-            return Err(DatspoolError::Internal(format!(
-                "consumer checkpoint {sequence} exceeds committed Outbox watermark {committed_watermark}"
-            )));
+            .map_err(|e| db_error("decode batched checkpoint watermark", e))?;
+        for (consumer, sequence) in requested {
+            if sequence > watermark {
+                return Err(DatspoolError::Internal(format!(
+                    "consumer checkpoint {sequence} exceeds committed Outbox watermark {watermark}"
+                )));
+            }
+            let row = sqlx::query(
+                "SELECT last_sequence FROM dataspool_cdc_outbox_consumers WHERE stream_key = $1 AND consumer_key = $2 FOR UPDATE",
+            ).bind(&self.stream_key).bind(consumer).fetch_optional(&mut *tx).await
+                .map_err(|e| db_error("read batched consumer checkpoint", e))?
+                .ok_or_else(|| DatspoolError::Configuration(format!(
+                    "Outbox consumer '{consumer}' is not registered"
+                )))?;
+            let previous: i64 = row
+                .try_get("last_sequence")
+                .map_err(|e| db_error("decode previous batched checkpoint", e))?;
+            if sequence < previous {
+                return Err(DatspoolError::Internal(format!(
+                    "consumer checkpoint regression: {sequence} < {previous}"
+                )));
+            }
+            sqlx::query(
+                "UPDATE dataspool_cdc_outbox_consumers SET last_sequence = $3, updated_at = clock_timestamp() WHERE stream_key = $1 AND consumer_key = $2",
+            ).bind(&self.stream_key).bind(consumer).bind(sequence).execute(&mut *tx).await
+                .map_err(|e| db_error("advance batched consumer checkpoint", e))?;
         }
-        let current = sqlx::query("SELECT last_sequence FROM dataspool_cdc_outbox_consumers WHERE stream_key = $1 AND consumer_key = $2 FOR UPDATE")
-            .bind(&self.stream_key).bind(consumer_key).fetch_optional(&mut *tx).await.map_err(|e| db_error("read consumer checkpoint", e))?;
-        let Some(current) = current else {
-            tx.rollback()
-                .await
-                .map_err(|e| db_error("rollback unregistered consumer checkpoint", e))?;
-            return Err(DatspoolError::Configuration(format!(
-                "Outbox consumer '{consumer_key}' is not registered"
-            )));
-        };
-        let previous: i64 = current
-            .try_get("last_sequence")
-            .map_err(|e| db_error("decode consumer checkpoint", e))?;
-        if sequence < previous {
-            tx.rollback()
-                .await
-                .map_err(|e| db_error("rollback regressing consumer checkpoint", e))?;
-            return Err(DatspoolError::Internal(format!(
-                "consumer checkpoint regression: {sequence} < {previous}"
-            )));
-        }
-        sqlx::query("UPDATE dataspool_cdc_outbox_consumers SET last_sequence = $3, updated_at = clock_timestamp() WHERE stream_key = $1 AND consumer_key = $2")
-            .bind(&self.stream_key).bind(consumer_key).bind(sequence).execute(&mut *tx).await.map_err(|e| db_error("advance consumer checkpoint", e))?;
         tx.commit()
             .await
-            .map_err(|e| db_error("commit consumer checkpoint", e))
+            .map_err(|e| db_error("commit batched consumer checkpoints", e))
+    }
+
+    pub async fn record_consumer_checkpoint(
+        &self,
+        consumer_key: &str,
+        sequence: u64,
+    ) -> Result<()> {
+        self.record_consumer_checkpoints(&[(consumer_key, sequence)])
+            .await
     }
 
     /// Delete only events at or below the slowest registered consumer's
     /// checkpoint. With no registered consumers, nothing is eligible.
+    /// Delete eligible events in bounded transactions. The legacy unbounded
+    /// method drains the safe range in chunks for compatibility.
     pub async fn prune_consumed_events(&self) -> Result<u64> {
+        let mut total = 0;
+        loop {
+            let deleted = self.prune_consumed_events_batch(1_000).await?;
+            total += deleted;
+            if deleted < 1_000 {
+                return Ok(total);
+            }
+        }
+    }
+
+    /// Delete at most `batch_size` rows using bounded CTE selection. The
+    /// consumer watermark and gate lock are revalidated for
+    /// every chunk, limiting WAL bursts and transaction/lock duration.
+    pub async fn prune_consumed_events_batch(&self, batch_size: u32) -> Result<u64> {
+        let batch_size = batch_size.clamp(1, 10_000) as i64;
         let mut tx = self
             .pool
             .begin()
             .await
-            .map_err(|e| db_error("begin safe Outbox pruning", e))?;
+            .map_err(|e| db_error("begin bounded Outbox pruning", e))?;
         sqlx::query(
             "SELECT stream_key FROM dataspool_cdc_outbox_gate WHERE stream_key = $1 FOR UPDATE",
         )
         .bind(&self.stream_key)
         .fetch_one(&mut *tx)
         .await
-        .map_err(|e| db_error("lock stream for Outbox pruning", e))?;
-        let minimum = sqlx::query("SELECT MIN(last_sequence) AS minimum FROM dataspool_cdc_outbox_consumers WHERE stream_key = $1")
-            .bind(&self.stream_key).fetch_one(&mut *tx).await.map_err(|e| db_error("read minimum consumer checkpoint", e))?;
+        .map_err(|e| db_error("lock stream for bounded Outbox pruning", e))?;
+        let minimum = sqlx::query(
+            "SELECT MIN(last_sequence) AS minimum FROM dataspool_cdc_outbox_consumers WHERE stream_key = $1",
+        ).bind(&self.stream_key).fetch_one(&mut *tx).await
+            .map_err(|e| db_error("read bounded pruning watermark", e))?;
         let Some(watermark) = minimum
             .try_get::<Option<i64>, _>("minimum")
-            .map_err(|e| db_error("decode minimum consumer checkpoint", e))?
+            .map_err(|e| db_error("decode bounded pruning watermark", e))?
         else {
             tx.rollback()
                 .await
@@ -397,17 +441,12 @@ impl PostgresTransactionalOutbox {
             return Ok(0);
         };
         let deleted = sqlx::query(
-            "DELETE FROM dataspool_cdc_outbox WHERE stream_key = $1 AND sequence <= $2",
-        )
-        .bind(&self.stream_key)
-        .bind(watermark)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| db_error("prune consumed Outbox events", e))?
-        .rows_affected();
+            "WITH victims AS (SELECT ctid FROM dataspool_cdc_outbox WHERE stream_key = $1 AND sequence <= $2 ORDER BY sequence LIMIT $3) DELETE FROM dataspool_cdc_outbox AS events USING victims WHERE events.ctid = victims.ctid",
+        ).bind(&self.stream_key).bind(watermark).bind(batch_size).execute(&mut *tx).await
+            .map_err(|e| db_error("delete bounded Outbox event batch", e))?.rows_affected();
         tx.commit()
             .await
-            .map_err(|e| db_error("commit safe Outbox pruning", e))?;
+            .map_err(|e| db_error("commit bounded Outbox pruning", e))?;
         Ok(deleted)
     }
 
@@ -426,6 +465,7 @@ pub struct PostgresOutboxWrite<'a> {
     transaction: Option<Transaction<'a, Postgres>>,
     stream_key: String,
     event_appended: bool,
+    failed: bool,
 }
 
 impl PostgresOutboxWrite<'_> {
@@ -436,7 +476,50 @@ impl PostgresOutboxWrite<'_> {
             .expect("transaction already committed or rolled back")
     }
 
+    /// Append several source-change events in the same producer transaction.
+    /// The caller performs all source mutations through `connection()`, calls
+    /// this once, then commits once. Sequence allocation remains serialized by
+    /// the stream gate and follows input order.
+    pub async fn append_events(&mut self, events: &[PostgresOutboxEventInput]) -> Result<Vec<u64>> {
+        if events.is_empty() {
+            return Err(DatspoolError::Configuration(
+                "a batch must contain at least one Outbox event".into(),
+            ));
+        }
+        let mut sequences = Vec::with_capacity(events.len());
+        for event in events {
+            sequences.push(
+                self.append_event(
+                    event.event_id,
+                    &event.operation,
+                    &event.document_id,
+                    &event.target_index,
+                    &event.document,
+                )
+                .await?,
+            );
+        }
+        Ok(sequences)
+    }
+
     pub async fn append_event(
+        &mut self,
+        event_id: uuid::Uuid,
+        operation: &str,
+        document_id: &str,
+        target_index: &str,
+        document: &Value,
+    ) -> Result<u64> {
+        let result = self
+            .append_event_inner(event_id, operation, document_id, target_index, document)
+            .await;
+        if result.is_err() {
+            self.failed = true;
+        }
+        result
+    }
+
+    async fn append_event_inner(
         &mut self,
         event_id: uuid::Uuid,
         operation: &str,
@@ -524,14 +607,16 @@ impl PostgresOutboxWrite<'_> {
             .transaction
             .take()
             .expect("transaction already committed");
-        if !self.event_appended {
-            transaction
-                .rollback()
-                .await
-                .map_err(|error| db_error("rollback source write without Outbox event", error))?;
-            return Err(DatspoolError::Internal(
-                "source write transaction cannot commit without at least one Outbox event".into(),
-            ));
+        if self.failed || !self.event_appended {
+            transaction.rollback().await.map_err(|error| {
+                db_error("rollback failed or empty source write transaction", error)
+            })?;
+            let reason = if self.failed {
+                "source write transaction cannot commit after a failed Outbox append"
+            } else {
+                "source write transaction cannot commit without at least one Outbox event"
+            };
+            return Err(DatspoolError::Internal(reason.into()));
         }
         transaction
             .commit()

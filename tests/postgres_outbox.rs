@@ -9,10 +9,12 @@ use dataspool::pipeline::{OffsetValue, Source};
 use serde_json::json;
 use std::sync::{
     Arc,
-    atomic::{AtomicI64, Ordering},
+    atomic::{AtomicBool, AtomicI64, Ordering},
 };
 use std::time::Duration;
 use uuid::Uuid;
+
+static POSTGRES_OUTBOX_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 fn database_url() -> String {
     std::env::var("DATASPOOL_TEST_POSTGRES_URL")
@@ -48,6 +50,7 @@ async fn producer(stream: &str) -> PostgresTransactionalOutbox {
 
 #[tokio::test]
 async fn postgres_outbox_is_atomic_ordered_and_barrier_survives_restart() {
+    let _test_guard = POSTGRES_OUTBOX_TEST_LOCK.lock().await;
     let stream = format!("outbox-integration-{}", Uuid::new_v4());
     let outbox = producer(&stream).await;
 
@@ -325,6 +328,14 @@ async fn postgres_outbox_is_atomic_ordered_and_barrier_survives_restart() {
     // Concurrent producer transactions are serialized by the per-stream gate.
     // Record real throughput and latency instead of asserting a machine-specific
     // performance threshold; the output is the CI baseline for capacity work.
+    sqlx::query("SELECT pg_stat_force_next_flush()")
+        .execute(outbox.pool())
+        .await
+        .unwrap();
+    let wal_before_32: (i64,) = sqlx::query_as("SELECT wal_bytes::bigint FROM pg_stat_wal")
+        .fetch_one(outbox.pool())
+        .await
+        .unwrap();
     let deadlocks_before: (i64,) =
         sqlx::query_as("SELECT deadlocks FROM pg_stat_database WHERE datname = current_database()")
             .fetch_one(outbox.pool())
@@ -397,6 +408,14 @@ async fn postgres_outbox_is_atomic_ordered_and_barrier_survives_restart() {
     let p95 = percentile(95);
     let p99 = percentile(99);
     let elapsed = started.elapsed();
+    sqlx::query("SELECT pg_stat_force_next_flush()")
+        .execute(outbox.pool())
+        .await
+        .unwrap();
+    let wal_after_32: (i64,) = sqlx::query_as("SELECT wal_bytes::bigint FROM pg_stat_wal")
+        .fetch_one(outbox.pool())
+        .await
+        .unwrap();
     let deadlocks_after: (i64,) =
         sqlx::query_as("SELECT deadlocks FROM pg_stat_database WHERE datname = current_database()")
             .fetch_one(outbox.pool())
@@ -404,7 +423,7 @@ async fn postgres_outbox_is_atomic_ordered_and_barrier_survives_restart() {
             .unwrap();
     let max_lock_waits = max_lock_wait_sessions.load(Ordering::Relaxed);
     println!(
-        "POSTGRES_OUTBOX_LOAD stream={} writers=32 elapsed_ms={} throughput_ops_s={:.1} p50_transaction_ms={} p95_transaction_ms={} p99_transaction_ms={} deadlocks_delta={} max_sampled_lock_wait_sessions={}",
+        "POSTGRES_OUTBOX_LOAD stream={} writers=32 elapsed_ms={} throughput_ops_s={:.1} p50_transaction_ms={} p95_transaction_ms={} p99_transaction_ms={} deadlocks_delta={} max_sampled_lock_wait_sessions={} wal_bytes_delta={}",
         stream,
         elapsed.as_millis(),
         32.0 / elapsed.as_secs_f64(),
@@ -412,7 +431,8 @@ async fn postgres_outbox_is_atomic_ordered_and_barrier_survives_restart() {
         p95.as_millis(),
         p99.as_millis(),
         deadlocks_after.0 - deadlocks_before.0,
-        max_lock_waits
+        max_lock_waits,
+        (wal_after_32.0 - wal_before_32.0).max(0)
     );
 
     // Compare four independent stream gates using the same eight app pools.
@@ -488,6 +508,106 @@ async fn postgres_outbox_is_atomic_ordered_and_barrier_survives_restart() {
             .execute(outbox.pool())
             .await
             .unwrap();
+    }
+
+    // Scale the single-stream load profile to the requested concurrency
+    // levels. Pool count remains eight; each pool is capped at four sessions,
+    // so 512 tasks exercise both pool queueing and the per-stream gate.
+    for concurrency in [128usize, 256, 512] {
+        sqlx::query("SELECT pg_stat_force_next_flush()")
+            .execute(outbox.pool())
+            .await
+            .unwrap();
+        let wal_before: (i64,) = sqlx::query_as("SELECT wal_bytes::bigint FROM pg_stat_wal")
+            .fetch_one(outbox.pool())
+            .await
+            .unwrap();
+        let deadlocks_before_scale: (i64,) = sqlx::query_as(
+            "SELECT deadlocks FROM pg_stat_database WHERE datname = current_database()",
+        )
+        .fetch_one(outbox.pool())
+        .await
+        .unwrap();
+        let scale_monitor_pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&database_url())
+            .await
+            .unwrap();
+        let sampling = Arc::new(AtomicBool::new(true));
+        let sampling_flag = sampling.clone();
+        let sampled_lock_waits = Arc::new(AtomicI64::new(0));
+        let sampled_max = sampled_lock_waits.clone();
+        let lock_monitor = tokio::spawn(async move {
+            while sampling_flag.load(Ordering::Relaxed) {
+                let (waiting,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock'")
+                    .fetch_one(&scale_monitor_pool).await.unwrap();
+                sampled_max.fetch_max(waiting, Ordering::Relaxed);
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+            scale_monitor_pool.close().await;
+        });
+        let scale_started = std::time::Instant::now();
+        let mut scale_tasks = Vec::with_capacity(concurrency);
+        for index in 0..concurrency {
+            let producer = application_instances[index % application_instances.len()].clone();
+            let id = format!("scale-{concurrency}-{index}");
+            scale_tasks.push(tokio::spawn(async move {
+                let started = std::time::Instant::now();
+                let mut writer = producer.begin_write().await.unwrap();
+                sqlx::query("SELECT pg_sleep(0.001)")
+                    .execute(writer.connection())
+                    .await
+                    .unwrap();
+                writer
+                    .append_event(
+                        Uuid::new_v4(),
+                        "index",
+                        &id,
+                        "target-index",
+                        &json!({"load":index}),
+                    )
+                    .await
+                    .unwrap();
+                writer.commit().await.unwrap();
+                started.elapsed()
+            }));
+        }
+        let mut latencies = Vec::with_capacity(concurrency);
+        for task in scale_tasks {
+            latencies.push(task.await.unwrap());
+        }
+        sampling.store(false, Ordering::Relaxed);
+        lock_monitor.await.unwrap();
+        latencies.sort_unstable();
+        let elapsed = scale_started.elapsed();
+        let percentile = |p: usize| latencies[(latencies.len() * p / 100).min(latencies.len() - 1)];
+        sqlx::query("SELECT pg_stat_force_next_flush()")
+            .execute(outbox.pool())
+            .await
+            .unwrap();
+        let wal_after: (i64,) = sqlx::query_as("SELECT wal_bytes::bigint FROM pg_stat_wal")
+            .fetch_one(outbox.pool())
+            .await
+            .unwrap();
+        let deadlocks_after_scale: (i64,) = sqlx::query_as(
+            "SELECT deadlocks FROM pg_stat_database WHERE datname = current_database()",
+        )
+        .fetch_one(outbox.pool())
+        .await
+        .unwrap();
+        println!(
+            "POSTGRES_OUTBOX_LOAD stream={} writers={} elapsed_ms={} throughput_ops_s={:.1} p50_ms={} p95_ms={} p99_ms={} max_lock_wait_sessions={} deadlocks_delta={} wal_bytes_delta={}",
+            stream,
+            concurrency,
+            elapsed.as_millis(),
+            concurrency as f64 / elapsed.as_secs_f64(),
+            percentile(50).as_millis(),
+            percentile(95).as_millis(),
+            percentile(99).as_millis(),
+            sampled_lock_waits.load(Ordering::Relaxed),
+            deadlocks_after_scale.0 - deadlocks_before_scale.0,
+            (wal_after.0 - wal_before.0).max(0),
+        );
     }
 
     // Retention is coordinated with all registered consumers. No consumer
@@ -690,7 +810,79 @@ async fn postgres_drop_commit_response_proxy(
 }
 
 #[tokio::test]
+async fn postgres_outbox_batches_are_atomic_ordered_and_bounded() {
+    let _test_guard = POSTGRES_OUTBOX_TEST_LOCK.lock().await;
+    use dataspool::drivers::relational::PostgresOutboxEventInput;
+
+    let stream = format!("outbox-batch-{}", Uuid::new_v4());
+    let outbox = producer(&stream).await;
+    let mut writer = outbox.begin_write().await.unwrap();
+    let events = (0..25)
+        .map(|index| PostgresOutboxEventInput {
+            event_id: Uuid::new_v4(),
+            operation: "index".into(),
+            document_id: format!("batch-{index}"),
+            target_index: "batch-target".into(),
+            document: json!({"ordinal": index}),
+        })
+        .collect::<Vec<_>>();
+    let sequences = writer.append_events(&events).await.unwrap();
+    assert_eq!(sequences.len(), 25);
+    assert!(sequences.windows(2).all(|pair| pair[0] + 1 == pair[1]));
+    writer.commit().await.unwrap();
+    let watermark_after_batch = outbox.watermark().await.unwrap();
+
+    // A validation failure halfway through a batch poisons the producer
+    // transaction; callers cannot accidentally commit its earlier events.
+    let mut invalid_batch = outbox.begin_write().await.unwrap();
+    let invalid_events = vec![
+        PostgresOutboxEventInput {
+            event_id: Uuid::new_v4(),
+            operation: "index".into(),
+            document_id: "must-rollback".into(),
+            target_index: "batch-target".into(),
+            document: json!({"ordinal": 26}),
+        },
+        PostgresOutboxEventInput {
+            event_id: Uuid::new_v4(),
+            operation: "unsupported".into(),
+            document_id: "invalid".into(),
+            target_index: "batch-target".into(),
+            document: json!({"ordinal": 27}),
+        },
+    ];
+    assert!(invalid_batch.append_events(&invalid_events).await.is_err());
+    assert!(invalid_batch.commit().await.is_err());
+    assert_eq!(outbox.watermark().await.unwrap(), watermark_after_batch);
+
+    let stored = outbox.read_after(0, 100).await.unwrap();
+    assert_eq!(stored.len(), 25);
+    assert!(
+        stored
+            .windows(2)
+            .all(|pair| pair[0].sequence < pair[1].sequence)
+    );
+
+    let first = format!("batch-consumer-a-{stream}");
+    let second = format!("batch-consumer-b-{stream}");
+    outbox.register_consumer(&first).await.unwrap();
+    outbox.register_consumer(&second).await.unwrap();
+    let watermark = outbox.watermark().await.unwrap();
+    outbox
+        .record_consumer_checkpoints(&[(&first, watermark), (&second, watermark)])
+        .await
+        .unwrap();
+    assert_eq!(outbox.prune_consumed_events_batch(7).await.unwrap(), 7);
+    assert_eq!(outbox.read_after(0, 100).await.unwrap().len(), 18);
+    assert_eq!(outbox.prune_consumed_events_batch(7).await.unwrap(), 7);
+    assert_eq!(outbox.prune_consumed_events_batch(7).await.unwrap(), 7);
+    assert_eq!(outbox.prune_consumed_events_batch(7).await.unwrap(), 4);
+    assert!(outbox.read_after(0, 100).await.unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn postgres_ambiguous_commit_response_is_recovered_by_event_id() {
+    let _test_guard = POSTGRES_OUTBOX_TEST_LOCK.lock().await;
     use sqlx::Row;
     let stream = format!("outbox-ambiguous-{}", Uuid::new_v4());
     let direct = producer(&stream).await;
