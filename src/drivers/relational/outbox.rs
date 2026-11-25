@@ -17,6 +17,12 @@ use sqlx::postgres::{PgPool, PgPoolOptions};
 use sqlx::{Postgres, QueryBuilder, Row, Transaction};
 use std::time::Duration;
 
+const PARTITIONED_EVENT_ID_BUCKETS: i16 = 16;
+
+fn partitioned_event_id_bucket(event_id: uuid::Uuid) -> i16 {
+    i16::from(event_id.as_bytes()[0] % PARTITIONED_EVENT_ID_BUCKETS as u8)
+}
+
 fn db_error(context: &str, error: sqlx::Error) -> DatspoolError {
     DatspoolError::Driver(DriverError::DataError(format!("{context}: {error}")))
 }
@@ -612,11 +618,31 @@ impl PostgresPartitionedOutbox {
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS dataspool_cdc_outbox_partitioned (\
                 stream_key TEXT NOT NULL, partition_id INTEGER NOT NULL, local_sequence BIGINT NOT NULL,\
-                event_id TEXT NOT NULL UNIQUE, operation TEXT NOT NULL, document_id TEXT NOT NULL,\
+                event_id TEXT NOT NULL, event_id_bucket SMALLINT NOT NULL, operation TEXT NOT NULL, document_id TEXT NOT NULL,\
                 target_index TEXT NOT NULL, document JSONB NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),\
                 PRIMARY KEY (stream_key, partition_id, local_sequence),\
                 FOREIGN KEY (stream_key, partition_id) REFERENCES dataspool_cdc_outbox_partition_gates(stream_key, partition_id))",
         ).execute(&self.pool).await.map_err(|e| db_error("create partitioned Outbox events", e))?;
+        sqlx::query("ALTER TABLE dataspool_cdc_outbox_partitioned ADD COLUMN IF NOT EXISTS event_id_bucket SMALLINT")
+            .execute(&self.pool).await.map_err(|e| db_error("add partitioned event ID bucket", e))?;
+        sqlx::query("UPDATE dataspool_cdc_outbox_partitioned SET event_id_bucket = get_byte(decode(replace(event_id, '-', ''), 'hex'), 0) % 16 WHERE event_id_bucket IS NULL")
+            .execute(&self.pool).await.map_err(|e| db_error("backfill partitioned event ID buckets", e))?;
+        sqlx::query("ALTER TABLE dataspool_cdc_outbox_partitioned ALTER COLUMN event_id_bucket SET NOT NULL")
+            .execute(&self.pool).await.map_err(|e| db_error("require partitioned event ID bucket", e))?;
+        sqlx::query("ALTER TABLE dataspool_cdc_outbox_partitioned DROP CONSTRAINT IF EXISTS dataspool_cdc_outbox_partitioned_event_id_key")
+            .execute(&self.pool).await.map_err(|e| db_error("remove global event ID index", e))?;
+        sqlx::query("DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'dataspool_cdc_outbox_partitioned_event_id_bucket_check') THEN ALTER TABLE dataspool_cdc_outbox_partitioned ADD CONSTRAINT dataspool_cdc_outbox_partitioned_event_id_bucket_check CHECK (event_id_bucket = get_byte(decode(replace(event_id, '-', ''), 'hex'), 0) % 16); END IF; END $$")
+            .execute(&self.pool).await.map_err(|e| db_error("enforce deterministic event ID bucket", e))?;
+        for bucket in 0..PARTITIONED_EVENT_ID_BUCKETS {
+            let index = format!("dataspool_cdc_outbox_partitioned_event_id_{bucket:02}_uidx");
+            let ddl = format!(
+                "CREATE UNIQUE INDEX IF NOT EXISTS {index} ON dataspool_cdc_outbox_partitioned (event_id) WHERE event_id_bucket = {bucket}"
+            );
+            sqlx::query(&ddl)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| db_error("create bucketed event ID idempotency index", e))?;
+        }
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS dataspool_cdc_outbox_partition_consumers (\
                 stream_key TEXT NOT NULL, consumer_key TEXT NOT NULL, partition_id INTEGER NOT NULL,\
@@ -1049,6 +1075,169 @@ impl PostgresPartitionedOutboxWrite<'_> {
             .expect("transaction already committed or rolled back")
     }
 
+    /// Append a batch within this partition using one idempotency lookup,
+    /// one contiguous sequence reservation, and one multi-row INSERT.
+    /// Returned sequences preserve input order; replayed IDs retain their
+    /// original local sequence.
+    pub async fn append_events(&mut self, events: &[PostgresOutboxEventInput]) -> Result<Vec<u64>> {
+        let result = self.append_events_inner(events).await;
+        if result.is_err() {
+            self.failed = true;
+        } else {
+            self.event_appended = true;
+        }
+        result
+    }
+
+    async fn append_events_inner(
+        &mut self,
+        events: &[PostgresOutboxEventInput],
+    ) -> Result<Vec<u64>> {
+        if events.is_empty() || events.len() > 5_000 {
+            return Err(DatspoolError::Configuration(
+                "partitioned Outbox batches must contain 1..=5,000 events".into(),
+            ));
+        }
+        let mut seen = std::collections::HashSet::with_capacity(events.len());
+        for event in events {
+            if !seen.insert(event.event_id) {
+                return Err(DatspoolError::Configuration(format!(
+                    "duplicate event ID {} in one partitioned Outbox batch",
+                    event.event_id
+                )));
+            }
+            if !matches!(event.operation.as_str(), "index" | "delete")
+                || event.document_id.is_empty()
+                || event.target_index.is_empty()
+                || (event.operation == "index" && !event.document.is_object())
+            {
+                return Err(DatspoolError::Driver(DriverError::DataError(
+                    "invalid partitioned Outbox event".into(),
+                )));
+            }
+        }
+        let mut ids_by_bucket = std::collections::BTreeMap::<i16, Vec<String>>::new();
+        for event in events {
+            ids_by_bucket
+                .entry(partitioned_event_id_bucket(event.event_id))
+                .or_default()
+                .push(event.event_id.to_string());
+        }
+        let mut lookup = QueryBuilder::<Postgres>::new(
+            "SELECT partition_id, local_sequence, stream_key, event_id, operation, document_id, target_index, document FROM dataspool_cdc_outbox_partitioned WHERE ",
+        );
+        for (index, (bucket, bucket_ids)) in ids_by_bucket.iter().enumerate() {
+            if index > 0 {
+                lookup.push(" OR ");
+            }
+            lookup
+                .push("(event_id_bucket = ")
+                .push(*bucket)
+                .push(" AND event_id = ANY(")
+                .push_bind(bucket_ids)
+                .push("))");
+        }
+        let rows = lookup
+            .build()
+            .fetch_all(self.connection())
+            .await
+            .map_err(|error| db_error("resolve partitioned batch idempotency keys", error))?;
+        let mut existing = std::collections::HashMap::with_capacity(rows.len());
+        for row in rows {
+            let id: String = row
+                .try_get("event_id")
+                .map_err(|e| db_error("decode partitioned event ID", e))?;
+            let same = row.try_get::<String, _>("stream_key").ok().as_deref()
+                == Some(self.stream_key.as_str())
+                && row.try_get::<i32, _>("partition_id").ok() == Some(self.partition_id as i32);
+            if !same {
+                return Err(DatspoolError::Driver(DriverError::DataError(format!(
+                    "partitioned Outbox event ID {id} already belongs to another stream or partition"
+                ))));
+            }
+            existing.insert(id, row);
+        }
+        let mut sequences = vec![None; events.len()];
+        let mut new_indices = Vec::with_capacity(events.len());
+        for (index, event) in events.iter().enumerate() {
+            if let Some(row) = existing.get(&event.event_id.to_string()) {
+                let same = row.try_get::<String, _>("operation").ok().as_deref()
+                    == Some(event.operation.as_str())
+                    && row.try_get::<String, _>("document_id").ok().as_deref()
+                        == Some(event.document_id.as_str())
+                    && row.try_get::<String, _>("target_index").ok().as_deref()
+                        == Some(event.target_index.as_str())
+                    && row.try_get::<Value, _>("document").ok().as_ref() == Some(&event.document);
+                if !same {
+                    return Err(DatspoolError::Driver(DriverError::DataError(format!(
+                        "partitioned Outbox event ID {} was reused with different content",
+                        event.event_id
+                    ))));
+                }
+                let sequence: i64 = row
+                    .try_get("local_sequence")
+                    .map_err(|e| db_error("decode replayed partition sequence", e))?;
+                sequences[index] =
+                    Some(u64::try_from(sequence).map_err(|_| {
+                        DatspoolError::Internal("negative partition sequence".into())
+                    })?);
+            } else {
+                new_indices.push(index);
+            }
+        }
+        if !new_indices.is_empty() {
+            let count = i64::try_from(new_indices.len())
+                .map_err(|_| DatspoolError::Configuration("partition batch too large".into()))?;
+            let stream_key = self.stream_key.clone();
+            let partition_id = self.partition_id;
+            let gate = sqlx::query(
+                "UPDATE dataspool_cdc_outbox_partition_gates SET last_sequence = last_sequence + $3, updated_at = clock_timestamp() WHERE stream_key = $1 AND partition_id = $2 RETURNING last_sequence - $3 + 1 AS first_sequence",
+            ).bind(&stream_key).bind(partition_id as i32).bind(count)
+                .fetch_one(self.connection()).await
+                .map_err(|e| db_error("reserve partition sequence range", e))?;
+            let first: i64 = gate
+                .try_get("first_sequence")
+                .map_err(|e| db_error("decode partition sequence range", e))?;
+            let mut query = QueryBuilder::<Postgres>::new(
+                "INSERT INTO dataspool_cdc_outbox_partitioned (stream_key, partition_id, local_sequence, event_id, event_id_bucket, operation, document_id, target_index, document) ",
+            );
+            query.push_values(
+                new_indices.iter().enumerate(),
+                |mut row, (offset, index)| {
+                    let event = &events[*index];
+                    row.push_bind(&stream_key)
+                        .push_bind(partition_id as i32)
+                        .push_bind(first + offset as i64)
+                        .push_bind(event.event_id.to_string())
+                        .push_bind(partitioned_event_id_bucket(event.event_id))
+                        .push_bind(&event.operation)
+                        .push_bind(&event.document_id)
+                        .push_bind(&event.target_index)
+                        .push_bind(&event.document);
+                },
+            );
+            query
+                .build()
+                .execute(self.connection())
+                .await
+                .map_err(|e| db_error("bulk insert partitioned Outbox events", e))?;
+            for (offset, index) in new_indices.into_iter().enumerate() {
+                sequences[index] =
+                    Some(u64::try_from(first + offset as i64).map_err(|_| {
+                        DatspoolError::Internal("negative partition sequence".into())
+                    })?);
+            }
+        }
+        sequences
+            .into_iter()
+            .map(|value| {
+                value.ok_or_else(|| {
+                    DatspoolError::Internal("missing partition batch sequence".into())
+                })
+            })
+            .collect()
+    }
+
     pub async fn append_event(
         &mut self,
         event_id: uuid::Uuid,
@@ -1063,8 +1252,8 @@ impl PostgresPartitionedOutboxWrite<'_> {
             if !matches!(operation, "index" | "delete") || document_id.is_empty() || target_index.is_empty() || (operation == "index" && !document.is_object()) {
                 return Err(DatspoolError::Driver(DriverError::DataError("invalid partitioned Outbox event".into())));
             }
-            let existing = sqlx::query("SELECT partition_id, local_sequence, stream_key, operation, document_id, target_index, document FROM dataspool_cdc_outbox_partitioned WHERE event_id = $1")
-                .bind(event_id.to_string()).fetch_optional(self.connection()).await.map_err(|e| db_error("check partition event idempotency", e))?;
+            let existing = sqlx::query("SELECT partition_id, local_sequence, stream_key, operation, document_id, target_index, document FROM dataspool_cdc_outbox_partitioned WHERE event_id_bucket = $1 AND event_id = $2")
+                .bind(partitioned_event_id_bucket(event_id)).bind(event_id.to_string()).fetch_optional(self.connection()).await.map_err(|e| db_error("check partition event idempotency", e))?;
             if let Some(row) = existing {
                 let same = row.try_get::<String, _>("stream_key").ok().as_deref() == Some(self.stream_key.as_str())
                     && row.try_get::<i32, _>("partition_id").ok() == Some(self.partition_id as i32)
@@ -1079,8 +1268,8 @@ impl PostgresPartitionedOutboxWrite<'_> {
             let row = sqlx::query("UPDATE dataspool_cdc_outbox_partition_gates SET last_sequence = last_sequence + 1, updated_at = clock_timestamp() WHERE stream_key = $1 AND partition_id = $2 RETURNING last_sequence")
                 .bind(&stream_key).bind(partition_id as i32).fetch_one(self.connection()).await.map_err(|e| db_error("allocate partition-local sequence", e))?;
             let sequence: i64 = row.try_get("last_sequence").map_err(|e| db_error("decode partition-local sequence", e))?;
-            sqlx::query("INSERT INTO dataspool_cdc_outbox_partitioned (stream_key, partition_id, local_sequence, event_id, operation, document_id, target_index, document) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)")
-                .bind(&stream_key).bind(partition_id as i32).bind(sequence).bind(event_id.to_string()).bind(operation).bind(document_id).bind(target_index).bind(document)
+            sqlx::query("INSERT INTO dataspool_cdc_outbox_partitioned (stream_key, partition_id, local_sequence, event_id, event_id_bucket, operation, document_id, target_index, document) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)")
+                .bind(&stream_key).bind(partition_id as i32).bind(sequence).bind(event_id.to_string()).bind(partitioned_event_id_bucket(event_id)).bind(operation).bind(document_id).bind(target_index).bind(document)
                 .execute(self.connection()).await.map_err(|e| db_error("insert partitioned Outbox event", e))?;
             u64::try_from(sequence).map_err(|_| DatspoolError::Internal("negative local sequence".into()))
         }.await;

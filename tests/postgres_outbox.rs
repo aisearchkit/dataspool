@@ -4,8 +4,9 @@
 use dataspool::drivers::document::CdcWriteBarrier;
 use dataspool::drivers::factory::{SourceConfig, create_source};
 use dataspool::drivers::relational::{
-    PartitionedCdcWriteBarrier, PostgresOutboxConfig, PostgresOutboxSource,
-    PostgresPartitionedOutbox, PostgresPartitionedOutboxConfig, PostgresTransactionalOutbox,
+    PartitionedCdcWriteBarrier, PostgresOutboxConfig, PostgresOutboxEventInput,
+    PostgresOutboxSource, PostgresPartitionedOutbox, PostgresPartitionedOutboxConfig,
+    PostgresTransactionalOutbox,
 };
 use dataspool::pipeline::{OffsetValue, Source};
 use serde_json::json;
@@ -993,11 +994,42 @@ async fn postgres_partitioned_outbox_uses_vector_checkpoints_and_cutover_barrier
     let partition_sampling_flag = partition_sampling.clone();
     let partition_active_peak = Arc::new(AtomicI64::new(0));
     let partition_active = partition_active_peak.clone();
+    let partition_lock_wait_peak = Arc::new(AtomicI64::new(0));
+    let partition_lock_waits = partition_lock_wait_peak.clone();
+    let partition_lock_samples = Arc::new(tokio::sync::Mutex::new(std::collections::BTreeMap::<
+        String,
+        i64,
+    >::new()));
+    let partition_lock_samples_task = partition_lock_samples.clone();
+    let partition_wait_samples = Arc::new(tokio::sync::Mutex::new(std::collections::BTreeMap::<
+        String,
+        i64,
+    >::new()));
+    let partition_wait_samples_task = partition_wait_samples.clone();
     let partition_monitor = tokio::spawn(async move {
         while partition_sampling_flag.load(Ordering::Relaxed) {
             let (active,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM pg_stat_activity WHERE application_name = 'dataspool-outbox-partitioned' AND state = 'active'")
                 .fetch_one(&partition_monitor_pool).await.unwrap();
             partition_active.fetch_max(active, Ordering::Relaxed);
+            let (waiting,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM pg_stat_activity WHERE application_name = 'dataspool-outbox-partitioned' AND wait_event_type = 'Lock'")
+                .fetch_one(&partition_monitor_pool).await.unwrap();
+            partition_lock_waits.fetch_max(waiting, Ordering::Relaxed);
+            let waits = sqlx::query_as::<_, (String, i64)>("SELECT COALESCE(wait_event_type, 'CPU_OR_RUNNING') || ':' || COALESCE(wait_event, 'none'), COUNT(*) FROM pg_stat_activity WHERE application_name = 'dataspool-outbox-partitioned' GROUP BY 1")
+                .fetch_all(&partition_monitor_pool).await.unwrap();
+            {
+                let mut samples = partition_wait_samples_task.lock().await;
+                for (name, count) in waits {
+                    *samples.entry(name).or_default() += count;
+                }
+            }
+            let locks = sqlx::query_as::<_, (String, i64)>("SELECT COALESCE(c.relname, l.locktype) || ':' || l.mode || ':' || CASE WHEN l.granted THEN 'granted' ELSE 'waiting' END, COUNT(*) FROM pg_locks l JOIN pg_stat_activity a USING (pid) LEFT JOIN pg_class c ON c.oid = l.relation WHERE a.application_name = 'dataspool-outbox-partitioned' GROUP BY 1")
+                .fetch_all(&partition_monitor_pool).await.unwrap();
+            {
+                let mut samples = partition_lock_samples_task.lock().await;
+                for (name, count) in locks {
+                    *samples.entry(name).or_default() += count;
+                }
+            }
             tokio::time::sleep(Duration::from_millis(2)).await;
         }
         partition_monitor_pool.close().await;
@@ -1013,21 +1045,26 @@ async fn postgres_partitioned_outbox_uses_vector_checkpoints_and_cutover_barrier
                 let started = std::time::Instant::now();
                 let mut writer = partitioned.begin_write(partition_id).await.unwrap();
                 sqlx::query("SELECT pg_sleep(0.005)").execute(writer.connection()).await.unwrap();
-                sqlx::query("INSERT INTO dataspool_outbox_test_documents (stream_key, document_id, payload) VALUES ($1, $2, $3)")
-                    .bind(&stream_key).bind(&document_id).bind(json!({"partition":partition_id,"ordinal":ordinal}))
+                let events = (0..4u32).map(|batch_index| PostgresOutboxEventInput {
+                    event_id: Uuid::new_v4(), operation: "index".into(),
+                    document_id: format!("{document_id}-{batch_index}"), target_index: "partition-target".into(),
+                    document: json!({"partition":partition_id,"ordinal":ordinal,"batch":batch_index}),
+                }).collect::<Vec<_>>();
+                let source_ids = events.iter().map(|event| event.document_id.clone()).collect::<Vec<_>>();
+                sqlx::query("INSERT INTO dataspool_outbox_test_documents (stream_key, document_id, payload) SELECT $1, source_id, jsonb_build_object('partition', $2, 'ordinal', $3) FROM unnest($4::text[]) AS source_id")
+                    .bind(&stream_key).bind(partition_id as i64).bind(ordinal as i64).bind(&source_ids)
                     .execute(writer.connection()).await.unwrap();
-                let sequence = writer.append_event(
-                    Uuid::new_v4(), "index", &document_id, "partition-target",
-                    &json!({"partition":partition_id,"ordinal":ordinal}),
-                ).await.unwrap();
+                let sequences = writer.append_events(&events).await.unwrap();
                 writer.commit().await.unwrap();
-                (sequence, started.elapsed())
+                (sequences.len(), started.elapsed())
             }));
         }
     }
     let mut partitioned_latencies = Vec::new();
+    let mut partitioned_event_count = 0usize;
     for task in tasks {
-        let (_, latency) = task.await.unwrap();
+        let (count, latency) = task.await.unwrap();
+        partitioned_event_count += count;
         partitioned_latencies.push(latency);
     }
     partitioned_latencies.sort_unstable();
@@ -1035,11 +1072,13 @@ async fn postgres_partitioned_outbox_uses_vector_checkpoints_and_cutover_barrier
     partition_monitor.await.unwrap();
     let partitioned_elapsed = partition_started.elapsed();
     println!(
-        "POSTGRES_OUTBOX_PARTITIONED stream={} partitions=4 producer_tasks=32 pool_connections=32 active_connections_peak={} elapsed_ms={} throughput_ops_s={:.1} p50_ms={} p95_ms={} p99_ms={}",
+        "POSTGRES_OUTBOX_PARTITIONED stream={} partitions=4 producer_tasks=32 batch_events={} pool_connections=32 active_connections_peak={} peak_lock_wait_sessions={} elapsed_ms={} throughput_events_s={:.1} p50_transaction_ms={} p95_transaction_ms={} p99_transaction_ms={} wait_event_samples={:?} pg_locks_samples={:?}",
         stream,
+        partitioned_event_count,
         partition_active_peak.load(Ordering::Relaxed),
+        partition_lock_wait_peak.load(Ordering::Relaxed),
         partitioned_elapsed.as_millis(),
-        32.0 / partitioned_elapsed.as_secs_f64(),
+        partitioned_event_count as f64 / partitioned_elapsed.as_secs_f64(),
         partitioned_latencies[partitioned_latencies.len() / 2].as_millis(),
         partitioned_latencies
             [(partitioned_latencies.len() * 95 / 100).min(partitioned_latencies.len() - 1)]
@@ -1047,13 +1086,15 @@ async fn postgres_partitioned_outbox_uses_vector_checkpoints_and_cutover_barrier
         partitioned_latencies
             [(partitioned_latencies.len() * 99 / 100).min(partitioned_latencies.len() - 1)]
         .as_millis(),
+        *partition_wait_samples.lock().await,
+        *partition_lock_samples.lock().await,
     );
 
     let vector = partitioned.vector_watermark().await.unwrap();
-    assert_eq!(vector, (0..4u32).map(|partition| (partition, 8)).collect());
+    assert_eq!(vector, (0..4u32).map(|partition| (partition, 32)).collect());
     let offsets = (0..4u32).map(|partition| (partition, 0)).collect();
     let vector_batches = partitioned.read_vector_after(&offsets, 100).await.unwrap();
-    assert_eq!(vector_batches.values().map(Vec::len).sum::<usize>(), 32);
+    assert_eq!(vector_batches.values().map(Vec::len).sum::<usize>(), 128);
     let source_config = SourceConfig::PostgresPartitionedOutbox {
         config: PostgresPartitionedOutboxConfig {
             connection_env: "DATASPOOL_TEST_POSTGRES_URL".into(),
@@ -1064,10 +1105,10 @@ async fn postgres_partitioned_outbox_uses_vector_checkpoints_and_cutover_barrier
     let mut source = create_source(&source_config).unwrap();
     source.connect().await.unwrap();
     let (source_batch, source_checkpoint) = source
-        .read_batch(&OffsetValue::initial(), 100)
+        .read_batch(&OffsetValue::initial(), 200)
         .await
         .unwrap();
-    assert_eq!(source_batch.len(), 32);
+    assert_eq!(source_batch.len(), 128);
     let source_vector: std::collections::BTreeMap<u32, u64> = match &source_checkpoint {
         OffsetValue::Custom(value) => {
             serde_json::from_value(value["partition_watermarks"].clone()).unwrap()
@@ -1081,7 +1122,7 @@ async fn postgres_partitioned_outbox_uses_vector_checkpoints_and_cutover_barrier
             .iter()
             .filter(|record| record.get_metadata("_partition_id").is_some())
             .count(),
-        32
+        128
     );
     let (empty_batch, same_checkpoint) = source.read_batch(&source_checkpoint, 100).await.unwrap();
     assert!(empty_batch.is_empty());
@@ -1092,7 +1133,7 @@ async fn postgres_partitioned_outbox_uses_vector_checkpoints_and_cutover_barrier
             .read_partition_after(partition_id, 0, 100)
             .await
             .unwrap();
-        assert_eq!(events.len(), 8);
+        assert_eq!(events.len(), 32);
         assert!(
             events
                 .windows(2)
@@ -1149,7 +1190,7 @@ async fn postgres_partitioned_outbox_uses_vector_checkpoints_and_cutover_barrier
             .await
             .unwrap()
             .len(),
-        5
+        29
     );
 
     let mut barrier = partitioned.clone();
@@ -1189,6 +1230,46 @@ async fn postgres_partitioned_outbox_uses_vector_checkpoints_and_cutover_barrier
     );
     replay.commit().await.unwrap();
     assert_eq!(partitioned.vector_watermark().await.unwrap()[&2], 9);
+}
+
+#[tokio::test]
+async fn postgres_partitioned_outbox_batch_is_idempotent_across_partitions() {
+    let _test_guard = POSTGRES_OUTBOX_TEST_LOCK.lock().await;
+    let stream = format!("outbox-partitioned-batch-{}", Uuid::new_v4());
+    let base = producer(&stream).await;
+    let partitioned = PostgresPartitionedOutbox::new(base.pool().clone(), &stream, 4).unwrap();
+    partitioned.migrate().await.unwrap();
+    partitioned.migrate().await.unwrap();
+
+    let events = (0..3u32)
+        .map(|index| PostgresOutboxEventInput {
+            event_id: Uuid::new_v4(),
+            operation: "index".into(),
+            document_id: format!("batch-{index}"),
+            target_index: "batch-target".into(),
+            document: json!({"value":index}),
+        })
+        .collect::<Vec<_>>();
+    let mut writer = partitioned.begin_write(1).await.unwrap();
+    let first = writer.append_events(&events).await.unwrap();
+    let replay = writer.append_events(&events).await.unwrap();
+    assert_eq!(
+        first, replay,
+        "batch replay must return original local sequences"
+    );
+    writer.commit().await.unwrap();
+    assert_eq!(partitioned.vector_watermark().await.unwrap()[&1], 3);
+
+    let mut cross_partition_replay = partitioned.begin_write(2).await.unwrap();
+    assert!(
+        cross_partition_replay.append_events(&events).await.is_err(),
+        "event IDs must remain globally unique across logical partitions"
+    );
+    assert!(
+        cross_partition_replay.commit().await.is_err(),
+        "a failed idempotency check must poison and roll back the producer transaction"
+    );
+    assert_eq!(partitioned.vector_watermark().await.unwrap()[&2], 0);
 }
 
 #[tokio::test]
