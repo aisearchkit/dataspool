@@ -956,14 +956,27 @@ async fn postgres_partitioned_outbox_uses_vector_checkpoints_and_cutover_barrier
     let _test_guard = POSTGRES_OUTBOX_TEST_LOCK.lock().await;
     let stream = format!("outbox-partitioned-{}", Uuid::new_v4());
     let base = producer(&stream).await;
-    let partitioned = PostgresPartitionedOutbox::new(base.pool().clone(), &stream, 4).unwrap();
+    let mut partition_url = url::Url::parse(&database_url()).unwrap();
+    partition_url
+        .query_pairs_mut()
+        .append_pair("application_name", "dataspool-outbox-partitioned");
+    base.pool().close().await;
+    let partition_pool = PostgresTransactionalOutbox::connect_with_max_connections(
+        partition_url.as_str(),
+        &stream,
+        32,
+    )
+    .await
+    .unwrap();
+    let partitioned =
+        PostgresPartitionedOutbox::new(partition_pool.pool().clone(), &stream, 4).unwrap();
     partitioned.migrate().await.unwrap();
     assert_eq!(
         partitioned.partition_for_key(b"customer-42"),
         partitioned.partition_for_key(b"customer-42")
     );
     let incompatible_topology =
-        PostgresPartitionedOutbox::new(base.pool().clone(), &stream, 3).unwrap();
+        PostgresPartitionedOutbox::new(partition_pool.pool().clone(), &stream, 3).unwrap();
     assert!(
         incompatible_topology.migrate().await.is_err(),
         "partition topology cannot change in place"
@@ -971,6 +984,24 @@ async fn postgres_partitioned_outbox_uses_vector_checkpoints_and_cutover_barrier
 
     // Each partition has an independent gate and local sequence. Producers
     // on different partitions do not serialize behind one stream-wide row.
+    let partition_monitor_pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database_url())
+        .await
+        .unwrap();
+    let partition_sampling = Arc::new(AtomicBool::new(true));
+    let partition_sampling_flag = partition_sampling.clone();
+    let partition_active_peak = Arc::new(AtomicI64::new(0));
+    let partition_active = partition_active_peak.clone();
+    let partition_monitor = tokio::spawn(async move {
+        while partition_sampling_flag.load(Ordering::Relaxed) {
+            let (active,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM pg_stat_activity WHERE application_name = 'dataspool-outbox-partitioned' AND state = 'active'")
+                .fetch_one(&partition_monitor_pool).await.unwrap();
+            partition_active.fetch_max(active, Ordering::Relaxed);
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        partition_monitor_pool.close().await;
+    });
     let partition_started = std::time::Instant::now();
     let mut tasks = Vec::new();
     for partition_id in 0..4u32 {
@@ -1000,10 +1031,13 @@ async fn postgres_partitioned_outbox_uses_vector_checkpoints_and_cutover_barrier
         partitioned_latencies.push(latency);
     }
     partitioned_latencies.sort_unstable();
+    partition_sampling.store(false, Ordering::Relaxed);
+    partition_monitor.await.unwrap();
     let partitioned_elapsed = partition_started.elapsed();
     println!(
-        "POSTGRES_OUTBOX_PARTITIONED stream={} partitions=4 producer_tasks=32 elapsed_ms={} throughput_ops_s={:.1} p50_ms={} p95_ms={} p99_ms={}",
+        "POSTGRES_OUTBOX_PARTITIONED stream={} partitions=4 producer_tasks=32 pool_connections=32 active_connections_peak={} elapsed_ms={} throughput_ops_s={:.1} p50_ms={} p95_ms={} p99_ms={}",
         stream,
+        partition_active_peak.load(Ordering::Relaxed),
         partitioned_elapsed.as_millis(),
         32.0 / partitioned_elapsed.as_secs_f64(),
         partitioned_latencies[partitioned_latencies.len() / 2].as_millis(),
