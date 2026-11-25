@@ -201,28 +201,62 @@ async fn run_child_process() {
             staged.pending_identity_fingerprint.as_deref(),
             Some(NEW_FINGERPRINT)
         );
-        let completed = node
-            .propose(Command::CompleteFederatedCertificateRotation {
-                cluster_id: peer_id.into(),
-                new_fingerprint: NEW_FINGERPRINT.into(),
-                at_ms: staged.rotation_started_at_ms.unwrap() + 1,
-                request_id: format!("proof-process-{role}"),
-                actor: "new-certificate-possession-proof".into(),
-            })
-            .await
-            .unwrap();
-        assert!(completed.success, "{}", completed.message);
+        let cert_dir = root.join("proof-certs");
+        std::fs::create_dir_all(&cert_dir).unwrap();
+        let server_cert = cert_dir.join("server.pem");
+        let server_key = cert_dir.join("server.key.pem");
+        let ca = cert_dir.join("ca.pem");
+        let new_cert = cert_dir.join("new-client.pem");
+        let new_key = cert_dir.join("new-client.key.pem");
+        std::fs::write(&server_cert, ROTATION_SERVER_CERT).unwrap();
+        std::fs::write(&server_key, ROTATION_SERVER_KEY).unwrap();
+        std::fs::write(&ca, ROTATION_CA).unwrap();
+        std::fs::write(&new_cert, ROTATION_NEW_CERT).unwrap();
+        std::fs::write(&new_key, ROTATION_NEW_KEY).unwrap();
+        let dropped_ack = root.join("proof-ack-dropped");
+        let grpc = GrpcServer::new(
+            &grpc_addr,
+            std::sync::Arc::new(store.clone()),
+            Some(std::sync::Arc::new(node.clone())),
+        )
+        .await
+        .unwrap()
+        .with_mtls_files(&server_cert, &server_key, &ca)
+        .await
+        .unwrap()
+        .with_rotation_proof_ack_drop_marker(dropped_ack.clone());
+        tokio::spawn(async move {
+            grpc.serve()
+                .await
+                .expect("serve proof fault-injection mTLS endpoint");
+        });
+        let mut new_client =
+            connect_mtls_retry(&format!("https://{grpc_addr}"), &ca, &new_cert, &new_key).await;
+        let proof = new_client
+            .prove_federated_certificate_rotation(
+                peer_id,
+                NEW_FINGERPRINT,
+                &format!("proof-process-{role}"),
+            )
+            .await;
+        assert!(
+            proof.is_err(),
+            "fault proxy must hide the committed Proof response"
+        );
+        assert!(
+            dropped_ack.exists(),
+            "Proof handler must commit before ACK is dropped"
+        );
         let persisted = store.get_federated_cluster(peer_id).await.unwrap().unwrap();
         assert_eq!(persisted.identity_fingerprint, NEW_FINGERPRINT);
         assert_eq!(
             persisted.previous_identity_fingerprint.as_deref(),
             Some(OLD_FINGERPRINT)
         );
-        // This marker is deliberately emitted immediately after the durable
-        // Raft commit. The parent SIGKILLs this process before a client-facing
-        // acknowledgement can be emitted; the real gRPC ACK-drop/replay path
-        // is independently exercised by the mTLS federation E2E test.
-        std::fs::write(&marker, b"proof-committed-ack-not-observed").unwrap();
+        // The handler committed Proof, then the test-only gRPC middleware
+        // replaced its successful response with UNAVAILABLE. The parent now
+        // SIGKILLs this process before the client can retry.
+        std::fs::write(&marker, b"proof-committed-response-dropped").unwrap();
     } else if phase == "verify" {
         let active = store.get_federated_cluster(peer_id).await.unwrap().unwrap();
         assert_eq!(active.identity_fingerprint, NEW_FINGERPRINT);
