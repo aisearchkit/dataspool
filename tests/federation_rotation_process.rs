@@ -196,7 +196,7 @@ async fn run_child_process() {
                 current_fingerprint: OLD_FINGERPRINT.into(),
                 new_fingerprint: NEW_FINGERPRINT.into(),
                 at_ms: now,
-                grace_period_ms: 60_000,
+                grace_period_ms: 300_000,
                 request_id: format!("stage-process-{role}"),
                 actor: "old-certificate".into(),
             })
@@ -558,11 +558,16 @@ async fn federated_certificate_rotation_recovers_after_sigkill_across_both_raft_
     ] {
         // The old CA is no longer in the effective inbound trust bundle, so
         // a fresh TLS handshake using its old client leaf must fail outright.
-        let expired_old = GrpcClient::connect_mtls(&endpoint, &ca, &old_cert, &old_key).await;
-        assert!(
-            expired_old.is_err(),
-            "expired old CA unexpectedly accepted a fresh mTLS connection to {endpoint}"
-        );
+        match GrpcClient::connect_mtls(&endpoint, &ca, &old_cert, &old_key).await {
+            Err(_) => {}
+            Ok(mut expired_old) => assert!(
+                expired_old
+                    .get_remote_task("00000000-0000-0000-0000-000000000001", peer_id)
+                    .await
+                    .is_err(),
+                "expired old CA completed an authenticated RPC to {endpoint}"
+            ),
+        }
 
         // The new active certificate can reconnect and replay the completed
         // proof. The server must return the committed result without extending

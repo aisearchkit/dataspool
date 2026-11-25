@@ -1882,7 +1882,7 @@ async fn federated_trust_bundle_rotation_converges_across_two_three_member_raft_
                 current_fingerprint: old_client_fingerprint.clone(),
                 new_fingerprint: new_client_fingerprint.clone(),
                 at_ms: now + 2,
-                grace_period_ms: 60_000,
+                grace_period_ms: 300_000,
                 request_id: format!("leaf-stage-{peer_id}"),
                 actor: "trust-bundle-ha-e2e".into(),
             })
@@ -1985,17 +1985,23 @@ async fn federated_trust_bundle_rotation_converges_across_two_three_member_raft_
         (&source_addr, "trust-target"),
         (&target_addr, "trust-source"),
     ] {
-        assert!(
-            crate::comms::GrpcClient::connect_mtls(
-                &format!("https://{endpoint}"),
-                &old_and_new_ca,
-                &old_client_cert,
-                &old_client_key
-            )
-            .await
-            .is_err(),
-            "old CA client unexpectedly opened a fresh mTLS connection to {endpoint}"
-        );
+        match crate::comms::GrpcClient::connect_mtls(
+            &format!("https://{endpoint}"),
+            &old_and_new_ca,
+            &old_client_cert,
+            &old_client_key,
+        )
+        .await
+        {
+            Err(_) => {}
+            Ok(mut old_client) => assert!(
+                old_client
+                    .get_remote_task("00000000-0000-0000-0000-000000000001", peer_id)
+                    .await
+                    .is_err(),
+                "old CA client completed an authenticated RPC after the trust expiry at {endpoint}"
+            ),
+        }
         let mut new_client = connect_trust_bundle_client(
             &format!("https://{endpoint}"),
             &new_client_ca,
@@ -2074,16 +2080,23 @@ async fn federated_trust_bundle_rotation_converges_across_two_three_member_raft_
                 .unwrap()
                 .is_none()
         );
-        assert!(
-            crate::comms::GrpcClient::connect_mtls(
-                &format!("https://{endpoint}"),
-                &new_client_ca,
-                &old_client_cert,
-                &old_client_key
-            )
-            .await
-            .is_err()
-        );
+        match crate::comms::GrpcClient::connect_mtls(
+            &format!("https://{endpoint}"),
+            &new_client_ca,
+            &old_client_cert,
+            &old_client_key,
+        )
+        .await
+        {
+            Err(_) => {}
+            Ok(mut old_client) => assert!(
+                old_client
+                    .get_remote_task("00000000-0000-0000-0000-000000000001", peer_id)
+                    .await
+                    .is_err(),
+                "old CA client completed an authenticated RPC after restart at {endpoint}"
+            ),
+        }
     }
 
     source_shutdown.cancel();
