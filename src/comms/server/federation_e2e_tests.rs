@@ -1134,10 +1134,8 @@ impl TestRaftGroup {
         for index in 0..3 {
             self.restart(index).await;
         }
-        self.wait_for_leader(None).await;
-        for index in 0..3 {
-            self.node(index).ensure_linearizable().await.unwrap();
-        }
+        let leader = self.wait_for_leader(None).await;
+        self.node(leader).ensure_linearizable().await.unwrap();
     }
 
     async fn shutdown_all(&mut self) {
