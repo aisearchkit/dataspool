@@ -5,6 +5,7 @@
 //! This adapter consumes an append-only change index populated by an application
 //! outbox, database-log connector, or another CDC producer.
 
+use crate::drivers::relational::{PartitionedCdcWriteBarrier, PostgresOutboxVectorWatermark};
 use crate::error::{DatspoolError, DriverError, Result};
 use crate::pipeline::{OffsetValue, Record, RecordBatch, Source};
 use crate::raft::{Command, RaftNode};
@@ -309,6 +310,104 @@ impl Source for ElasticsearchCdcSource {
     fn source_type(&self) -> &str {
         "elasticsearch_cdc"
     }
+}
+
+/// Result of a partitioned CDC cutover. Watermarks are vectors, not scalar
+/// maxima; the maxima are used only for the existing alias API's diagnostic log.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CdcPartitionedCutoverResult {
+    pub final_watermarks: PostgresOutboxVectorWatermark,
+    pub applied_watermarks: PostgresOutboxVectorWatermark,
+}
+
+/// Cut over a partitioned stream only after every target partition reaches its
+/// corresponding source watermark. Raft persists the full vectors atomically.
+pub async fn cutover_partitioned_with_raft<B, F, Fut>(
+    client: &Client,
+    raft: &RaftNode,
+    config: &CdcCutoverConfig,
+    fence: &CdcRaftFence,
+    barrier: &mut B,
+    mut read_applied_watermarks: F,
+) -> Result<CdcPartitionedCutoverResult>
+where
+    B: PartitionedCdcWriteBarrier,
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<PostgresOutboxVectorWatermark>>,
+{
+    let final_watermarks = barrier.pause_and_capture_vector_watermark().await?;
+    let started = std::time::Instant::now();
+    let applied_watermarks = loop {
+        match read_applied_watermarks().await {
+            Ok(applied)
+                if !final_watermarks.is_empty()
+                    && applied.len() == final_watermarks.len()
+                    && final_watermarks.iter().all(|(partition, final_seq)| {
+                        applied
+                            .get(partition)
+                            .is_some_and(|applied_seq| applied_seq >= final_seq)
+                    }) =>
+            {
+                break applied;
+            }
+            Ok(_) if started.elapsed() < config.timeout => {
+                tokio::time::sleep(Duration::from_millis(100)).await
+            }
+            Err(error) => {
+                if let Err(resume_error) = barrier.resume_partitioned_writes().await {
+                    tracing::error!(%resume_error, "Failed to resume partitioned producer after catch-up read failure");
+                }
+                return Err(error);
+            }
+            Ok(applied) => {
+                let _ = barrier.resume_partitioned_writes().await;
+                return Err(DatspoolError::Internal(format!(
+                    "Partitioned CDC cutover timed out: target vector {applied:?} is behind final source vector {final_watermarks:?}"
+                )));
+            }
+        }
+    };
+
+    let final_max = *final_watermarks.values().max().unwrap_or(&0);
+    let applied_max = *applied_watermarks.values().max().unwrap_or(&0);
+    switch_alias_after_catchup(
+        client,
+        &config.target_base_url,
+        &config.alias,
+        config.old_index.as_deref(),
+        &config.new_index,
+        applied_max,
+        final_max,
+    )
+    .await?;
+
+    let response = raft
+        .propose(Command::RecordCdcPartitionedCutover {
+            task_id: fence.task_id.clone(),
+            alias: config.alias.clone(),
+            old_index: config.old_index.clone(),
+            new_index: config.new_index.clone(),
+            final_watermarks: final_watermarks.clone(),
+            applied_watermarks: applied_watermarks.clone(),
+            fencing_shard_id: fence.shard_id.clone(),
+            node_id: fence.node_id.clone(),
+            fencing_token: fence.fencing_token,
+            issued_at_ms: chrono::Utc::now().timestamp_millis(),
+        })
+        .await?;
+    if !response.success {
+        // Alias has changed but Raft has not committed the vector. Keep all
+        // partitions paused until an idempotent reconciliation succeeds.
+        return Err(DatspoolError::Internal(format!(
+            "Partitioned alias cutover succeeded but Raft rejected its vector record: {}",
+            response.message
+        )));
+    }
+    barrier.resume_partitioned_writes().await?;
+    Ok(CdcPartitionedCutoverResult {
+        final_watermarks,
+        applied_watermarks,
+    })
 }
 
 /// Producer-specific write barrier. Implementations must stop accepting source

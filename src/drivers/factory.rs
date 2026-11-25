@@ -43,6 +43,11 @@ pub enum SourceConfig {
         #[serde(flatten)]
         config: super::relational::PostgresOutboxConfig,
     },
+    /// Continuous CDC source backed by a partitioned PostgreSQL Outbox and vector checkpoints.
+    PostgresPartitionedOutbox {
+        #[serde(flatten)]
+        config: super::relational::PostgresPartitionedOutboxConfig,
+    },
     // Future drivers:
     // NoSql { config: NoSqlConfig }, // MongoDB, Redis, Cassandra
     // Streaming { config: StreamingConfig }, // Kafka, Pulsar, AutoMQ
@@ -88,7 +93,8 @@ pub fn create_source_with_license(
             SourceConfig::Relational { .. } => Feature::RelationalMigration,
             SourceConfig::ElasticsearchCdc { .. }
             | SourceConfig::ElasticsearchOnline { .. }
-            | SourceConfig::PostgresOutbox { .. } => Feature::StreamingMigration,
+            | SourceConfig::PostgresOutbox { .. }
+            | SourceConfig::PostgresPartitionedOutbox { .. } => Feature::StreamingMigration,
         };
 
         manager
@@ -124,6 +130,9 @@ pub fn create_source_with_license(
         }
         SourceConfig::PostgresOutbox { config } => Ok(Box::new(
             super::relational::PostgresOutboxSource::new(config.clone()),
+        )),
+        SourceConfig::PostgresPartitionedOutbox { config } => Ok(Box::new(
+            super::relational::PostgresPartitionedOutboxSource::new(config.clone())?,
         )),
     }
 }

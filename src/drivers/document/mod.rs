@@ -39,9 +39,9 @@ mod source;
 pub mod verification;
 
 pub use cdc::{
-    CdcConfig, CdcCutoverConfig, CdcCutoverResult, CdcRaftFence, CdcWriteBarrier,
-    ElasticsearchCdcSource, cutover_with_raft, cutover_with_write_barrier,
-    switch_alias_after_catchup,
+    CdcConfig, CdcCutoverConfig, CdcCutoverResult, CdcPartitionedCutoverResult, CdcRaftFence,
+    CdcWriteBarrier, ElasticsearchCdcSource, cutover_partitioned_with_raft, cutover_with_raft,
+    cutover_with_write_barrier, switch_alias_after_catchup,
 };
 pub use config::DocumentConfig;
 pub use online::ElasticsearchOnlineMigrationSource;

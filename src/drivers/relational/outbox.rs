@@ -12,8 +12,9 @@ use crate::error::{DatspoolError, DriverError, Result};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::Digest;
 use sqlx::postgres::{PgPool, PgPoolOptions};
-use sqlx::{Postgres, Row, Transaction};
+use sqlx::{Postgres, QueryBuilder, Row, Transaction};
 use std::time::Duration;
 
 fn db_error(context: &str, error: sqlx::Error) -> DatspoolError {
@@ -39,6 +40,19 @@ pub struct PostgresOutboxEventInput {
     pub document_id: String,
     pub target_index: String,
     pub document: Value,
+}
+
+/// PostgreSQL storage and maintenance counters for the Outbox table.
+#[derive(Debug, Clone)]
+pub struct PostgresOutboxRetentionStats {
+    pub live_rows_estimate: i64,
+    pub dead_rows_estimate: i64,
+    pub total_bytes: i64,
+    pub autovacuum_count: i64,
+    pub last_autovacuum: Option<String>,
+    /// Cluster-wide counter; isolate the PostgreSQL instance before attributing
+    /// this delta to one Outbox stream.
+    pub cluster_wal_bytes: Option<i64>,
 }
 
 /// PostgreSQL transactional Outbox for one logical CDC stream.
@@ -414,6 +428,12 @@ impl PostgresTransactionalOutbox {
     /// consumer watermark and gate lock are revalidated for
     /// every chunk, limiting WAL bursts and transaction/lock duration.
     pub async fn prune_consumed_events_batch(&self, batch_size: u32) -> Result<u64> {
+        let started = std::time::Instant::now();
+        let wal_before = sqlx::query("SELECT wal_bytes FROM pg_stat_wal")
+            .fetch_one(&self.pool)
+            .await
+            .ok()
+            .and_then(|row| row.try_get::<i64, _>("wal_bytes").ok());
         let batch_size = batch_size.clamp(1, 10_000) as i64;
         let mut tx = self
             .pool
@@ -447,7 +467,61 @@ impl PostgresTransactionalOutbox {
         tx.commit()
             .await
             .map_err(|e| db_error("commit bounded Outbox pruning", e))?;
+        let elapsed = started.elapsed();
+        let wal_after = sqlx::query("SELECT wal_bytes FROM pg_stat_wal")
+            .fetch_one(&self.pool)
+            .await
+            .ok()
+            .and_then(|row| row.try_get::<i64, _>("wal_bytes").ok());
+        let wal_delta = wal_before
+            .zip(wal_after)
+            .map(|(before, after)| (after - before).max(0));
+        tracing::info!(
+            stream_key = %self.stream_key,
+            deleted_rows = deleted,
+            batch_limit = batch_size,
+            elapsed_ms = elapsed.as_millis() as u64,
+            rows_per_second = deleted as f64 / elapsed.as_secs_f64().max(0.001),
+            wal_bytes_delta = ?wal_delta,
+            "PostgreSQL Outbox retention batch completed"
+        );
         Ok(deleted)
+    }
+
+    /// Observe table bloat/autovacuum counters and the optional cluster WAL
+    /// counter. `n_live_tup`/`n_dead_tup` are PostgreSQL estimates, not exact
+    /// counts; run ANALYZE/VACUUM before comparing them across long intervals.
+    pub async fn retention_stats(&self) -> Result<PostgresOutboxRetentionStats> {
+        let row = sqlx::query(
+            "SELECT n_live_tup, n_dead_tup, autovacuum_count, last_autovacuum::text AS last_autovacuum, pg_total_relation_size(relid) AS total_bytes              FROM pg_stat_user_tables WHERE schemaname = current_schema() AND relname = 'dataspool_cdc_outbox'",
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|error| db_error("read Outbox retention statistics", error))?
+        .ok_or_else(|| DatspoolError::Internal("Outbox table statistics are unavailable in the current schema".into()))?;
+        let cluster_wal_bytes = sqlx::query("SELECT wal_bytes FROM pg_stat_wal")
+            .fetch_one(&self.pool)
+            .await
+            .ok()
+            .and_then(|row| row.try_get::<i64, _>("wal_bytes").ok());
+        Ok(PostgresOutboxRetentionStats {
+            live_rows_estimate: row
+                .try_get("n_live_tup")
+                .map_err(|error| db_error("decode Outbox live tuple estimate", error))?,
+            dead_rows_estimate: row
+                .try_get("n_dead_tup")
+                .map_err(|error| db_error("decode Outbox dead tuple estimate", error))?,
+            total_bytes: row
+                .try_get("total_bytes")
+                .map_err(|error| db_error("decode Outbox table size", error))?,
+            autovacuum_count: row
+                .try_get("autovacuum_count")
+                .map_err(|error| db_error("decode Outbox autovacuum count", error))?,
+            last_autovacuum: row
+                .try_get("last_autovacuum")
+                .map_err(|error| db_error("decode Outbox last autovacuum", error))?,
+            cluster_wal_bytes,
+        })
     }
 
     pub async fn is_paused(&self) -> Result<bool> {
@@ -458,6 +532,578 @@ impl PostgresTransactionalOutbox {
             .map_err(|error| db_error("read Outbox pause state", error))?;
         row.try_get("paused")
             .map_err(|error| db_error("decode Outbox pause state", error))
+    }
+}
+
+/// Event identity in a partition-local ordering domain.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PostgresPartitionedOutboxEvent {
+    pub partition_id: u32,
+    pub local_sequence: i64,
+    pub event_id: String,
+    pub stream_key: String,
+    pub operation: String,
+    pub document_id: String,
+    pub target_index: String,
+    pub document: Value,
+}
+
+/// A vector watermark is a partial order: each partition advances independently.
+pub type PostgresOutboxVectorWatermark = std::collections::BTreeMap<u32, u64>;
+
+/// Write barrier for partitioned streams. The complete vector is captured while
+/// every partition gate is locked in ascending partition order.
+#[async_trait]
+pub trait PartitionedCdcWriteBarrier: Send {
+    async fn pause_and_capture_vector_watermark(&mut self)
+    -> Result<PostgresOutboxVectorWatermark>;
+    async fn resume_partitioned_writes(&mut self) -> Result<()>;
+}
+
+/// Experimental partitioned Outbox implementation. A logical stream is split
+/// into independently ordered partitions; there is deliberately no total order
+/// between different partitions.
+#[derive(Clone)]
+pub struct PostgresPartitionedOutbox {
+    pool: PgPool,
+    stream_key: String,
+    partition_count: u32,
+}
+
+impl PostgresPartitionedOutbox {
+    pub fn new(pool: PgPool, stream_key: impl Into<String>, partition_count: u32) -> Result<Self> {
+        if partition_count == 0 || partition_count > 4096 {
+            return Err(DatspoolError::Configuration(
+                "partition_count must be between 1 and 4096".into(),
+            ));
+        }
+        Ok(Self {
+            pool,
+            stream_key: stream_key.into(),
+            partition_count,
+        })
+    }
+
+    pub async fn migrate(&self) -> Result<()> {
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS dataspool_cdc_outbox_partition_streams (\
+                stream_key TEXT PRIMARY KEY, partition_count INTEGER NOT NULL CHECK (partition_count > 0),                created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp())",
+        ).execute(&self.pool).await.map_err(|e| db_error("create partitioned stream registry", e))?;
+        sqlx::query("INSERT INTO dataspool_cdc_outbox_partition_streams (stream_key, partition_count) VALUES ($1, $2) ON CONFLICT (stream_key) DO NOTHING")
+            .bind(&self.stream_key).bind(self.partition_count as i32).execute(&self.pool).await
+            .map_err(|e| db_error("register partition topology", e))?;
+        let registered: i32 = sqlx::query("SELECT partition_count FROM dataspool_cdc_outbox_partition_streams WHERE stream_key = $1")
+            .bind(&self.stream_key).fetch_one(&self.pool).await
+            .map_err(|e| db_error("read registered partition topology", e))?.try_get("partition_count")
+            .map_err(|e| db_error("decode registered partition topology", e))?;
+        if registered != self.partition_count as i32 {
+            return Err(DatspoolError::Configuration(format!(
+                "partition topology for stream '{}' is immutable: registered {}, requested {}",
+                self.stream_key, registered, self.partition_count
+            )));
+        }
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS dataspool_cdc_outbox_partition_gates (\
+                stream_key TEXT NOT NULL, partition_id INTEGER NOT NULL, paused BOOLEAN NOT NULL DEFAULT FALSE,\
+                last_sequence BIGINT NOT NULL DEFAULT 0, updated_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),\
+                PRIMARY KEY (stream_key, partition_id))",
+        ).execute(&self.pool).await.map_err(|e| db_error("create partitioned Outbox gates", e))?;
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS dataspool_cdc_outbox_partitioned (\
+                stream_key TEXT NOT NULL, partition_id INTEGER NOT NULL, local_sequence BIGINT NOT NULL,\
+                event_id TEXT NOT NULL UNIQUE, operation TEXT NOT NULL, document_id TEXT NOT NULL,\
+                target_index TEXT NOT NULL, document JSONB NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),\
+                PRIMARY KEY (stream_key, partition_id, local_sequence),\
+                FOREIGN KEY (stream_key, partition_id) REFERENCES dataspool_cdc_outbox_partition_gates(stream_key, partition_id))",
+        ).execute(&self.pool).await.map_err(|e| db_error("create partitioned Outbox events", e))?;
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS dataspool_cdc_outbox_partition_consumers (\
+                stream_key TEXT NOT NULL, consumer_key TEXT NOT NULL, partition_id INTEGER NOT NULL,\
+                last_sequence BIGINT NOT NULL DEFAULT 0, updated_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),\
+                PRIMARY KEY (stream_key, consumer_key, partition_id),\
+                FOREIGN KEY (stream_key, partition_id) REFERENCES dataspool_cdc_outbox_partition_gates(stream_key, partition_id))",
+        ).execute(&self.pool).await.map_err(|e| db_error("create partitioned consumer checkpoints", e))?;
+        sqlx::query(
+            "INSERT INTO dataspool_cdc_outbox_partition_gates (stream_key, partition_id) \
+             SELECT $1, generated.partition_id FROM generate_series(0, $2 - 1) AS generated(partition_id) \
+             ON CONFLICT (stream_key, partition_id) DO NOTHING",
+        )
+        .bind(&self.stream_key)
+        .bind(self.partition_count as i32)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| db_error("initialize partition gates", e))?;
+        Ok(())
+    }
+
+    pub async fn begin_write(
+        &self,
+        partition_id: u32,
+    ) -> Result<PostgresPartitionedOutboxWrite<'_>> {
+        self.validate_partition(partition_id)?;
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| db_error("begin partitioned source write", e))?;
+        let row = sqlx::query(
+            "SELECT paused FROM dataspool_cdc_outbox_partition_gates WHERE stream_key = $1 AND partition_id = $2 FOR UPDATE",
+        ).bind(&self.stream_key).bind(partition_id as i32)
+            .fetch_one(&mut *transaction).await.map_err(|e| db_error("lock partitioned Outbox gate", e))?;
+        let paused: bool = row
+            .try_get("paused")
+            .map_err(|e| db_error("read partition pause state", e))?;
+        if paused {
+            transaction
+                .rollback()
+                .await
+                .map_err(|e| db_error("rollback paused partition write", e))?;
+            return Err(DatspoolError::Internal(format!(
+                "CDC stream '{}' partition {partition_id} is paused",
+                self.stream_key
+            )));
+        }
+        sqlx::query("SELECT set_config('dataspool.outbox_stream_key', $1, TRUE)")
+            .bind(&self.stream_key)
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(|e| db_error("authorize partitioned source writes", e))?;
+        Ok(PostgresPartitionedOutboxWrite {
+            transaction: Some(transaction),
+            stream_key: self.stream_key.clone(),
+            partition_id,
+            event_appended: false,
+            failed: false,
+        })
+    }
+
+    /// Stable SHA-256 based assignment. The partition count is immutable for
+    /// a stream, so a key keeps its partition for the stream's lifetime.
+    pub fn partition_for_key(&self, key: &[u8]) -> u32 {
+        let digest = sha2::Sha256::digest(key);
+        let value = u32::from_be_bytes([digest[0], digest[1], digest[2], digest[3]]);
+        value % self.partition_count
+    }
+
+    fn validate_partition(&self, partition_id: u32) -> Result<()> {
+        if partition_id >= self.partition_count {
+            return Err(DatspoolError::Configuration(format!(
+                "partition_id {partition_id} is outside 0..{}",
+                self.partition_count
+            )));
+        }
+        Ok(())
+    }
+
+    pub async fn vector_watermark(&self) -> Result<PostgresOutboxVectorWatermark> {
+        let rows = sqlx::query("SELECT partition_id, last_sequence FROM dataspool_cdc_outbox_partition_gates WHERE stream_key = $1 ORDER BY partition_id")
+            .bind(&self.stream_key).fetch_all(&self.pool).await.map_err(|e| db_error("read partition watermark vector", e))?;
+        let mut vector = PostgresOutboxVectorWatermark::new();
+        for row in rows {
+            let partition: i32 = row
+                .try_get("partition_id")
+                .map_err(|e| db_error("decode partition id", e))?;
+            let sequence: i64 = row
+                .try_get("last_sequence")
+                .map_err(|e| db_error("decode partition sequence", e))?;
+            vector.insert(
+                partition as u32,
+                u64::try_from(sequence)
+                    .map_err(|_| DatspoolError::Internal("negative partition watermark".into()))?,
+            );
+        }
+        if vector.len() != self.partition_count as usize {
+            return Err(DatspoolError::Internal(
+                "partition watermark vector is incomplete".into(),
+            ));
+        }
+        Ok(vector)
+    }
+
+    pub async fn register_consumer(&self, consumer_key: &str) -> Result<()> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| db_error("begin partition consumer registration", e))?;
+        let gates = sqlx::query("SELECT partition_id FROM dataspool_cdc_outbox_partition_gates WHERE stream_key = $1 ORDER BY partition_id FOR UPDATE")
+            .bind(&self.stream_key).fetch_all(&mut *tx).await.map_err(|e| db_error("lock partitions for consumer registration", e))?;
+        if gates.len() != self.partition_count as usize {
+            return Err(DatspoolError::Internal(
+                "cannot register a consumer for an incomplete partition topology".into(),
+            ));
+        }
+        sqlx::query(
+            "INSERT INTO dataspool_cdc_outbox_partition_consumers (stream_key, consumer_key, partition_id, last_sequence) \
+             SELECT stream_key, $2, partition_id, 0 FROM dataspool_cdc_outbox_partition_gates WHERE stream_key = $1 \
+             ON CONFLICT (stream_key, consumer_key, partition_id) DO NOTHING",
+        ).bind(&self.stream_key).bind(consumer_key).execute(&mut *tx).await
+            .map_err(|e| db_error("register partitioned Outbox consumer", e))?;
+        tx.commit()
+            .await
+            .map_err(|e| db_error("commit partition consumer registration", e))
+    }
+
+    /// Atomically advance the complete vector for one consumer. Partial vectors
+    /// are rejected so a checkpoint always describes every partition.
+    pub async fn record_consumer_checkpoint_vector(
+        &self,
+        consumer_key: &str,
+        checkpoint: &PostgresOutboxVectorWatermark,
+    ) -> Result<()> {
+        if checkpoint.len() != self.partition_count as usize
+            || (0..self.partition_count).any(|partition| !checkpoint.contains_key(&partition))
+        {
+            return Err(DatspoolError::Configuration(
+                "consumer checkpoint must contain every partition exactly once".into(),
+            ));
+        }
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| db_error("begin vector checkpoint", e))?;
+        let gates = sqlx::query("SELECT partition_id, last_sequence FROM dataspool_cdc_outbox_partition_gates WHERE stream_key = $1 ORDER BY partition_id FOR UPDATE")
+            .bind(&self.stream_key).fetch_all(&mut *tx).await.map_err(|e| db_error("lock partitions for vector checkpoint", e))?;
+        for gate in gates {
+            let partition: i32 = gate
+                .try_get("partition_id")
+                .map_err(|e| db_error("decode checkpoint partition", e))?;
+            let current: i64 = gate
+                .try_get("last_sequence")
+                .map_err(|e| db_error("decode partition high watermark", e))?;
+            let requested = i64::try_from(checkpoint[&(partition as u32)]).map_err(|_| {
+                DatspoolError::Configuration("partition checkpoint exceeds BIGINT".into())
+            })?;
+            if requested > current {
+                return Err(DatspoolError::Internal(format!(
+                    "partition {partition} checkpoint {requested} exceeds committed watermark {current}"
+                )));
+            }
+            let previous = sqlx::query("SELECT last_sequence FROM dataspool_cdc_outbox_partition_consumers WHERE stream_key = $1 AND consumer_key = $2 AND partition_id = $3 FOR UPDATE")
+                .bind(&self.stream_key).bind(consumer_key).bind(partition)
+                .fetch_optional(&mut *tx).await.map_err(|e| db_error("read prior vector checkpoint", e))?
+                .ok_or_else(|| DatspoolError::Configuration(format!("consumer '{consumer_key}' is not registered for partition {partition}")))?;
+            let previous: i64 = previous
+                .try_get("last_sequence")
+                .map_err(|e| db_error("decode prior vector checkpoint", e))?;
+            if requested < previous {
+                return Err(DatspoolError::Internal(format!(
+                    "partition {partition} checkpoint regression: {requested} < {previous}"
+                )));
+            }
+            sqlx::query("UPDATE dataspool_cdc_outbox_partition_consumers SET last_sequence = $4, updated_at = clock_timestamp() WHERE stream_key = $1 AND consumer_key = $2 AND partition_id = $3")
+                .bind(&self.stream_key).bind(consumer_key).bind(partition).bind(requested)
+                .execute(&mut *tx).await.map_err(|e| db_error("advance vector checkpoint", e))?;
+        }
+        tx.commit()
+            .await
+            .map_err(|e| db_error("commit vector checkpoint", e))
+    }
+
+    /// Read a consumer's durable vector checkpoint after reconnect/restart.
+    pub async fn consumer_checkpoint_vector(
+        &self,
+        consumer_key: &str,
+    ) -> Result<PostgresOutboxVectorWatermark> {
+        let rows = sqlx::query("SELECT partition_id, last_sequence FROM dataspool_cdc_outbox_partition_consumers WHERE stream_key = $1 AND consumer_key = $2 ORDER BY partition_id")
+            .bind(&self.stream_key).bind(consumer_key).fetch_all(&self.pool).await
+            .map_err(|e| db_error("read durable partition checkpoint vector", e))?;
+        let mut vector = PostgresOutboxVectorWatermark::new();
+        for row in rows {
+            let partition: i32 = row
+                .try_get("partition_id")
+                .map_err(|e| db_error("decode durable checkpoint partition", e))?;
+            let sequence: i64 = row
+                .try_get("last_sequence")
+                .map_err(|e| db_error("decode durable checkpoint sequence", e))?;
+            vector.insert(
+                partition as u32,
+                u64::try_from(sequence).map_err(|_| {
+                    DatspoolError::Internal("negative durable partition checkpoint".into())
+                })?,
+            );
+        }
+        if vector.len() != self.partition_count as usize {
+            return Err(DatspoolError::Configuration(format!(
+                "consumer '{consumer_key}' is not registered across the complete partition topology"
+            )));
+        }
+        Ok(vector)
+    }
+
+    /// Read each partition independently from a complete vector offset. The
+    /// returned map preserves partition identity and local ordering domains.
+    pub async fn read_vector_after(
+        &self,
+        offsets: &PostgresOutboxVectorWatermark,
+        limit_per_partition: i64,
+    ) -> Result<std::collections::BTreeMap<u32, Vec<PostgresPartitionedOutboxEvent>>> {
+        if offsets.len() != self.partition_count as usize
+            || (0..self.partition_count).any(|partition| !offsets.contains_key(&partition))
+        {
+            return Err(DatspoolError::Configuration(
+                "partition offsets must contain every partition".into(),
+            ));
+        }
+        let mut result = std::collections::BTreeMap::new();
+        for (partition, sequence) in offsets {
+            result.insert(
+                *partition,
+                self.read_partition_after(*partition, *sequence, limit_per_partition)
+                    .await?,
+            );
+        }
+        Ok(result)
+    }
+
+    pub async fn read_partition_after(
+        &self,
+        partition_id: u32,
+        local_sequence: u64,
+        limit: i64,
+    ) -> Result<Vec<PostgresPartitionedOutboxEvent>> {
+        self.validate_partition(partition_id)?;
+        let local_sequence = i64::try_from(local_sequence).map_err(|_| {
+            DatspoolError::Configuration("partition offset exceeds PostgreSQL BIGINT".into())
+        })?;
+        let rows = sqlx::query("SELECT partition_id, local_sequence, event_id, stream_key, operation, document_id, target_index, document FROM dataspool_cdc_outbox_partitioned WHERE stream_key = $1 AND partition_id = $2 AND local_sequence > $3 ORDER BY local_sequence LIMIT $4")
+            .bind(&self.stream_key).bind(partition_id as i32).bind(local_sequence).bind(limit.clamp(1, 10_000))
+            .fetch_all(&self.pool).await.map_err(|e| db_error("read partitioned Outbox events", e))?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(PostgresPartitionedOutboxEvent {
+                    partition_id: row
+                        .try_get::<i32, _>("partition_id")
+                        .map_err(|e| db_error("decode event partition", e))?
+                        as u32,
+                    local_sequence: row
+                        .try_get("local_sequence")
+                        .map_err(|e| db_error("decode local sequence", e))?,
+                    event_id: row
+                        .try_get("event_id")
+                        .map_err(|e| db_error("decode partition event ID", e))?,
+                    stream_key: row
+                        .try_get("stream_key")
+                        .map_err(|e| db_error("decode partition stream", e))?,
+                    operation: row
+                        .try_get("operation")
+                        .map_err(|e| db_error("decode partition operation", e))?,
+                    document_id: row
+                        .try_get("document_id")
+                        .map_err(|e| db_error("decode partition document ID", e))?,
+                    target_index: row
+                        .try_get("target_index")
+                        .map_err(|e| db_error("decode partition target", e))?,
+                    document: row
+                        .try_get("document")
+                        .map_err(|e| db_error("decode partition document", e))?,
+                })
+            })
+            .collect()
+    }
+
+    /// Observe the partitioned event table's dead tuples, size, autovacuum,
+    /// and cluster-wide WAL counter (where supported by the PostgreSQL version).
+    pub async fn retention_stats(&self) -> Result<PostgresOutboxRetentionStats> {
+        let row = sqlx::query(
+            "SELECT n_live_tup, n_dead_tup, autovacuum_count, last_autovacuum::text AS last_autovacuum, pg_total_relation_size(relid) AS total_bytes FROM pg_stat_user_tables WHERE schemaname = current_schema() AND relname = 'dataspool_cdc_outbox_partitioned'",
+        ).fetch_optional(&self.pool).await.map_err(|e| db_error("read partitioned Outbox retention statistics", e))?
+            .ok_or_else(|| DatspoolError::Internal("partitioned Outbox table statistics are unavailable in the current schema".into()))?;
+        let cluster_wal_bytes = sqlx::query("SELECT wal_bytes FROM pg_stat_wal")
+            .fetch_one(&self.pool)
+            .await
+            .ok()
+            .and_then(|row| row.try_get::<i64, _>("wal_bytes").ok());
+        Ok(PostgresOutboxRetentionStats {
+            live_rows_estimate: row
+                .try_get("n_live_tup")
+                .map_err(|e| db_error("decode partitioned live tuple estimate", e))?,
+            dead_rows_estimate: row
+                .try_get("n_dead_tup")
+                .map_err(|e| db_error("decode partitioned dead tuple estimate", e))?,
+            total_bytes: row
+                .try_get("total_bytes")
+                .map_err(|e| db_error("decode partitioned table size", e))?,
+            autovacuum_count: row
+                .try_get("autovacuum_count")
+                .map_err(|e| db_error("decode partitioned autovacuum count", e))?,
+            last_autovacuum: row
+                .try_get("last_autovacuum")
+                .map_err(|e| db_error("decode partitioned last autovacuum", e))?,
+            cluster_wal_bytes,
+        })
+    }
+
+    pub async fn prune_partition_batch(&self, partition_id: u32, batch_size: u32) -> Result<u64> {
+        let started = std::time::Instant::now();
+        let wal_before = sqlx::query("SELECT wal_bytes FROM pg_stat_wal")
+            .fetch_one(&self.pool)
+            .await
+            .ok()
+            .and_then(|row| row.try_get::<i64, _>("wal_bytes").ok());
+        self.validate_partition(partition_id)?;
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| db_error("begin partition retention batch", e))?;
+        sqlx::query("SELECT partition_id FROM dataspool_cdc_outbox_partition_gates WHERE stream_key = $1 AND partition_id = $2 FOR UPDATE")
+            .bind(&self.stream_key).bind(partition_id as i32).fetch_one(&mut *tx).await.map_err(|e| db_error("lock partition for retention", e))?;
+        let row = sqlx::query("SELECT MIN(last_sequence) AS watermark FROM dataspool_cdc_outbox_partition_consumers WHERE stream_key = $1 AND partition_id = $2")
+            .bind(&self.stream_key).bind(partition_id as i32).fetch_one(&mut *tx).await.map_err(|e| db_error("read partition retention watermark", e))?;
+        let Some(watermark) = row
+            .try_get::<Option<i64>, _>("watermark")
+            .map_err(|e| db_error("decode partition retention watermark", e))?
+        else {
+            tx.rollback()
+                .await
+                .map_err(|e| db_error("rollback untracked partition retention", e))?;
+            return Ok(0);
+        };
+        let deleted = sqlx::query("WITH victims AS (SELECT ctid FROM dataspool_cdc_outbox_partitioned WHERE stream_key = $1 AND partition_id = $2 AND local_sequence <= $3 ORDER BY local_sequence LIMIT $4) DELETE FROM dataspool_cdc_outbox_partitioned events USING victims WHERE events.ctid = victims.ctid")
+            .bind(&self.stream_key).bind(partition_id as i32).bind(watermark).bind(batch_size.clamp(1, 10_000) as i64)
+            .execute(&mut *tx).await.map_err(|e| db_error("delete partition retention batch", e))?.rows_affected();
+        tx.commit()
+            .await
+            .map_err(|e| db_error("commit partition retention batch", e))?;
+        let elapsed = started.elapsed();
+        let wal_after = sqlx::query("SELECT wal_bytes FROM pg_stat_wal")
+            .fetch_one(&self.pool)
+            .await
+            .ok()
+            .and_then(|row| row.try_get::<i64, _>("wal_bytes").ok());
+        let wal_delta = wal_before
+            .zip(wal_after)
+            .map(|(before, after)| (after - before).max(0));
+        tracing::info!(stream_key = %self.stream_key, partition_id, deleted_rows = deleted,
+            elapsed_ms = elapsed.as_millis() as u64,
+            rows_per_second = deleted as f64 / elapsed.as_secs_f64().max(0.001),
+            wal_bytes_delta = ?wal_delta,
+            "PostgreSQL partitioned Outbox retention batch completed");
+        Ok(deleted)
+    }
+}
+
+#[async_trait]
+impl PartitionedCdcWriteBarrier for PostgresPartitionedOutbox {
+    async fn pause_and_capture_vector_watermark(
+        &mut self,
+    ) -> Result<PostgresOutboxVectorWatermark> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| db_error("begin partition vector cutover", e))?;
+        let rows = sqlx::query("SELECT partition_id, last_sequence FROM dataspool_cdc_outbox_partition_gates WHERE stream_key = $1 ORDER BY partition_id FOR UPDATE")
+            .bind(&self.stream_key).fetch_all(&mut *tx).await.map_err(|e| db_error("lock all partitions for cutover", e))?;
+        if rows.len() != self.partition_count as usize {
+            return Err(DatspoolError::Internal(
+                "cannot cut over an incomplete partition set".into(),
+            ));
+        }
+        let mut vector = PostgresOutboxVectorWatermark::new();
+        for row in rows {
+            let partition: i32 = row
+                .try_get("partition_id")
+                .map_err(|e| db_error("decode cutover partition", e))?;
+            let sequence: i64 = row
+                .try_get("last_sequence")
+                .map_err(|e| db_error("decode cutover local watermark", e))?;
+            vector.insert(
+                partition as u32,
+                u64::try_from(sequence).map_err(|_| {
+                    DatspoolError::Internal("negative partition cutover watermark".into())
+                })?,
+            );
+        }
+        sqlx::query("UPDATE dataspool_cdc_outbox_partition_gates SET paused = TRUE, updated_at = clock_timestamp() WHERE stream_key = $1")
+            .bind(&self.stream_key).execute(&mut *tx).await.map_err(|e| db_error("pause all Outbox partitions", e))?;
+        tx.commit()
+            .await
+            .map_err(|e| db_error("commit vector cutover barrier", e))?;
+        Ok(vector)
+    }
+
+    async fn resume_partitioned_writes(&mut self) -> Result<()> {
+        sqlx::query("UPDATE dataspool_cdc_outbox_partition_gates SET paused = FALSE, updated_at = clock_timestamp() WHERE stream_key = $1")
+            .bind(&self.stream_key).execute(&self.pool).await.map_err(|e| db_error("resume all Outbox partitions", e))?;
+        Ok(())
+    }
+}
+
+pub struct PostgresPartitionedOutboxWrite<'a> {
+    transaction: Option<Transaction<'a, Postgres>>,
+    stream_key: String,
+    partition_id: u32,
+    event_appended: bool,
+    failed: bool,
+}
+
+impl PostgresPartitionedOutboxWrite<'_> {
+    pub fn connection(&mut self) -> &mut sqlx::PgConnection {
+        self.transaction
+            .as_mut()
+            .expect("transaction already committed or rolled back")
+    }
+
+    pub async fn append_event(
+        &mut self,
+        event_id: uuid::Uuid,
+        operation: &str,
+        document_id: &str,
+        target_index: &str,
+        document: &Value,
+    ) -> Result<u64> {
+        let stream_key = self.stream_key.clone();
+        let partition_id = self.partition_id;
+        let result = async {
+            if !matches!(operation, "index" | "delete") || document_id.is_empty() || target_index.is_empty() || (operation == "index" && !document.is_object()) {
+                return Err(DatspoolError::Driver(DriverError::DataError("invalid partitioned Outbox event".into())));
+            }
+            let existing = sqlx::query("SELECT partition_id, local_sequence, stream_key, operation, document_id, target_index, document FROM dataspool_cdc_outbox_partitioned WHERE event_id = $1")
+                .bind(event_id.to_string()).fetch_optional(self.connection()).await.map_err(|e| db_error("check partition event idempotency", e))?;
+            if let Some(row) = existing {
+                let same = row.try_get::<String, _>("stream_key").ok().as_deref() == Some(self.stream_key.as_str())
+                    && row.try_get::<i32, _>("partition_id").ok() == Some(self.partition_id as i32)
+                    && row.try_get::<String, _>("operation").ok().as_deref() == Some(operation)
+                    && row.try_get::<String, _>("document_id").ok().as_deref() == Some(document_id)
+                    && row.try_get::<String, _>("target_index").ok().as_deref() == Some(target_index)
+                    && row.try_get::<Value, _>("document").ok().as_ref() == Some(document);
+                if !same { return Err(DatspoolError::Driver(DriverError::DataError("partitioned Outbox event ID reused with different content or partition".into()))); }
+                let sequence: i64 = row.try_get("local_sequence").map_err(|e| db_error("decode idempotent local sequence", e))?;
+                return u64::try_from(sequence).map_err(|_| DatspoolError::Internal("negative local sequence".into()));
+            }
+            let row = sqlx::query("UPDATE dataspool_cdc_outbox_partition_gates SET last_sequence = last_sequence + 1, updated_at = clock_timestamp() WHERE stream_key = $1 AND partition_id = $2 RETURNING last_sequence")
+                .bind(&stream_key).bind(partition_id as i32).fetch_one(self.connection()).await.map_err(|e| db_error("allocate partition-local sequence", e))?;
+            let sequence: i64 = row.try_get("last_sequence").map_err(|e| db_error("decode partition-local sequence", e))?;
+            sqlx::query("INSERT INTO dataspool_cdc_outbox_partitioned (stream_key, partition_id, local_sequence, event_id, operation, document_id, target_index, document) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)")
+                .bind(&stream_key).bind(partition_id as i32).bind(sequence).bind(event_id.to_string()).bind(operation).bind(document_id).bind(target_index).bind(document)
+                .execute(self.connection()).await.map_err(|e| db_error("insert partitioned Outbox event", e))?;
+            u64::try_from(sequence).map_err(|_| DatspoolError::Internal("negative local sequence".into()))
+        }.await;
+        if result.is_err() {
+            self.failed = true;
+        } else {
+            self.event_appended = true;
+        }
+        result
+    }
+
+    pub async fn commit(mut self) -> Result<()> {
+        let tx = self
+            .transaction
+            .take()
+            .expect("transaction already committed");
+        if self.failed || !self.event_appended {
+            tx.rollback()
+                .await
+                .map_err(|e| db_error("rollback failed or empty partition write", e))?;
+            return Err(DatspoolError::Internal("partitioned source transaction requires at least one successful Outbox event and no failed append".into()));
+        }
+        tx.commit()
+            .await
+            .map_err(|e| db_error("commit partitioned source and Outbox event", e))
     }
 }
 
@@ -481,25 +1127,157 @@ impl PostgresOutboxWrite<'_> {
     /// this once, then commits once. Sequence allocation remains serialized by
     /// the stream gate and follows input order.
     pub async fn append_events(&mut self, events: &[PostgresOutboxEventInput]) -> Result<Vec<u64>> {
+        let result = self.append_events_inner(events).await;
+        if result.is_err() {
+            self.failed = true;
+        }
+        result
+    }
+
+    async fn append_events_inner(
+        &mut self,
+        events: &[PostgresOutboxEventInput],
+    ) -> Result<Vec<u64>> {
         if events.is_empty() {
             return Err(DatspoolError::Configuration(
                 "a batch must contain at least one Outbox event".into(),
             ));
         }
-        let mut sequences = Vec::with_capacity(events.len());
-        for event in events {
-            sequences.push(
-                self.append_event(
-                    event.event_id,
-                    &event.operation,
-                    &event.document_id,
-                    &event.target_index,
-                    &event.document,
-                )
-                .await?,
-            );
+        if events.len() > 5_000 {
+            return Err(DatspoolError::Configuration(
+                "Outbox batches are limited to 5,000 events per transaction".into(),
+            ));
         }
-        Ok(sequences)
+
+        let mut event_ids = std::collections::HashSet::with_capacity(events.len());
+        for event in events {
+            if !event_ids.insert(event.event_id) {
+                return Err(DatspoolError::Configuration(format!(
+                    "duplicate event ID {} in one Outbox batch",
+                    event.event_id
+                )));
+            }
+            if !matches!(event.operation.as_str(), "index" | "delete")
+                || event.document_id.is_empty()
+                || event.target_index.is_empty()
+                || (event.operation == "index" && !event.document.is_object())
+            {
+                return Err(DatspoolError::Driver(DriverError::DataError(
+                    "Outbox events require operation index/delete, non-empty document/target identifiers, and object documents for index operations".into(),
+                )));
+            }
+        }
+
+        // Resolve all idempotency keys with one round trip. Existing rows must
+        // match byte-for-byte JSON semantics and all routing fields.
+        let ids = events
+            .iter()
+            .map(|event| event.event_id.to_string())
+            .collect::<Vec<_>>();
+        let existing_rows = sqlx::query(
+            "SELECT sequence, event_id, stream_key, operation, document_id, target_index, document              FROM dataspool_cdc_outbox WHERE event_id = ANY($1)",
+        )
+        .bind(&ids)
+        .fetch_all(self.connection())
+        .await
+        .map_err(|error| db_error("resolve batched Outbox idempotency keys", error))?;
+        let mut existing = std::collections::HashMap::with_capacity(existing_rows.len());
+        for row in existing_rows {
+            let event_id: String = row
+                .try_get("event_id")
+                .map_err(|error| db_error("decode existing batch event ID", error))?;
+            let same = row.try_get::<String, _>("stream_key").ok().as_deref()
+                == Some(self.stream_key.as_str());
+            if !same {
+                return Err(DatspoolError::Driver(DriverError::DataError(format!(
+                    "Outbox event ID {event_id} already belongs to another stream"
+                ))));
+            }
+            existing.insert(event_id, row);
+        }
+
+        let mut sequences = vec![None; events.len()];
+        let mut new_indices = Vec::with_capacity(events.len());
+        for (index, event) in events.iter().enumerate() {
+            if let Some(row) = existing.get(&event.event_id.to_string()) {
+                let same_event = row.try_get::<String, _>("operation").ok().as_deref()
+                    == Some(event.operation.as_str())
+                    && row.try_get::<String, _>("document_id").ok().as_deref()
+                        == Some(event.document_id.as_str())
+                    && row.try_get::<String, _>("target_index").ok().as_deref()
+                        == Some(event.target_index.as_str())
+                    && row.try_get::<Value, _>("document").ok().as_ref() == Some(&event.document);
+                if !same_event {
+                    return Err(DatspoolError::Driver(DriverError::DataError(format!(
+                        "Outbox event ID {} was reused with different event content",
+                        event.event_id
+                    ))));
+                }
+                let sequence: i64 = row
+                    .try_get("sequence")
+                    .map_err(|error| db_error("decode existing batch sequence", error))?;
+                sequences[index] = Some(u64::try_from(sequence).map_err(|_| {
+                    DatspoolError::Internal("negative PostgreSQL Outbox sequence".into())
+                })?);
+            } else {
+                new_indices.push(index);
+            }
+        }
+
+        if !new_indices.is_empty() {
+            let stream_key = self.stream_key.clone();
+            let new_count = i64::try_from(new_indices.len())
+                .map_err(|_| DatspoolError::Configuration("Outbox batch is too large".into()))?;
+            let gate = sqlx::query(
+                "UPDATE dataspool_cdc_outbox_gate SET last_sequence = last_sequence + $2, updated_at = clock_timestamp() WHERE stream_key = $1 RETURNING last_sequence - $2 + 1 AS first_sequence",
+            )
+            .bind(&stream_key)
+            .bind(new_count)
+            .fetch_one(self.connection())
+            .await
+            .map_err(|error| db_error("reserve contiguous Outbox sequence range", error))?;
+            let first_sequence: i64 = gate
+                .try_get("first_sequence")
+                .map_err(|error| db_error("decode first reserved Outbox sequence", error))?;
+
+            let mut query = QueryBuilder::<Postgres>::new(
+                "INSERT INTO dataspool_cdc_outbox (sequence, event_id, stream_key, operation, document_id, target_index, document) ",
+            );
+            query.push_values(
+                new_indices.iter().enumerate(),
+                |mut row, (offset, index)| {
+                    let event = &events[*index];
+                    row.push_bind(first_sequence + offset as i64)
+                        .push_bind(event.event_id.to_string())
+                        .push_bind(&stream_key)
+                        .push_bind(&event.operation)
+                        .push_bind(&event.document_id)
+                        .push_bind(&event.target_index)
+                        .push_bind(&event.document);
+                },
+            );
+            query
+                .build()
+                .execute(self.connection())
+                .await
+                .map_err(|error| db_error("bulk insert transactional Outbox events", error))?;
+
+            for (offset, index) in new_indices.into_iter().enumerate() {
+                sequences[index] =
+                    Some(u64::try_from(first_sequence + offset as i64).map_err(|_| {
+                        DatspoolError::Internal("negative PostgreSQL Outbox sequence".into())
+                    })?);
+            }
+        }
+        self.event_appended = true;
+        sequences
+            .into_iter()
+            .map(|sequence| {
+                sequence.ok_or_else(|| {
+                    DatspoolError::Internal("missing allocated Outbox batch sequence".into())
+                })
+            })
+            .collect()
     }
 
     pub async fn append_event(
@@ -802,5 +1580,174 @@ impl crate::pipeline::Source for PostgresOutboxSource {
 
     fn source_type(&self) -> &str {
         "postgres_outbox"
+    }
+}
+
+/// Configuration for the partitioned PostgreSQL Outbox pipeline source.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PostgresPartitionedOutboxConfig {
+    pub connection_env: String,
+    pub stream_key: String,
+    pub partition_count: u32,
+}
+
+/// Continuous pipeline source with a vector checkpoint, one local offset per
+/// partition. Records are interleaved fairly; their metadata retains partition
+/// identity because local sequence values are not comparable across partitions.
+pub struct PostgresPartitionedOutboxSource {
+    config: PostgresPartitionedOutboxConfig,
+    pool: Option<PgPool>,
+    outbox: Option<PostgresPartitionedOutbox>,
+    offsets: PostgresOutboxVectorWatermark,
+}
+
+impl PostgresPartitionedOutboxSource {
+    pub fn new(config: PostgresPartitionedOutboxConfig) -> Result<Self> {
+        if config.partition_count == 0 || config.partition_count > 4096 {
+            return Err(DatspoolError::Configuration(
+                "partition_count must be between 1 and 4096".into(),
+            ));
+        }
+        Ok(Self {
+            config,
+            pool: None,
+            outbox: None,
+            offsets: PostgresOutboxVectorWatermark::new(),
+        })
+    }
+
+    fn restore_offset(&mut self, offset: &crate::pipeline::OffsetValue) -> Result<()> {
+        match offset {
+            crate::pipeline::OffsetValue::Custom(value)
+                if value["driver"].as_str() == Some("postgres_partitioned_outbox") =>
+            {
+                let offsets: PostgresOutboxVectorWatermark =
+                    serde_json::from_value(value["partition_watermarks"].clone()).map_err(|e| {
+                        DatspoolError::Internal(format!(
+                            "invalid partitioned Outbox vector checkpoint: {e}"
+                        ))
+                    })?;
+                if offsets.len() != self.config.partition_count as usize
+                    || (0..self.config.partition_count)
+                        .any(|partition| !offsets.contains_key(&partition))
+                {
+                    return Err(DatspoolError::Internal(
+                        "partitioned Outbox checkpoint is incomplete".into(),
+                    ));
+                }
+                self.offsets = offsets;
+            }
+            crate::pipeline::OffsetValue::DocumentCount(0)
+            | crate::pipeline::OffsetValue::ByteOffset(0) => {
+                self.offsets = (0..self.config.partition_count)
+                    .map(|partition| (partition, 0))
+                    .collect();
+            }
+            _ => {
+                return Err(DatspoolError::Internal(
+                    "offset does not belong to the partitioned PostgreSQL Outbox source".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl crate::pipeline::Source for PostgresPartitionedOutboxSource {
+    async fn connect(&mut self) -> Result<()> {
+        let connection_url = std::env::var(&self.config.connection_env).map_err(|_| {
+            DatspoolError::Configuration(format!(
+                "PostgreSQL Outbox connection environment variable '{}' is not set",
+                self.config.connection_env
+            ))
+        })?;
+        let pool = PgPoolOptions::new()
+            .max_connections(8)
+            .acquire_timeout(Duration::from_secs(15))
+            .connect(&connection_url)
+            .await
+            .map_err(|e| db_error("connect partitioned PostgreSQL Outbox source", e))?;
+        let outbox = PostgresPartitionedOutbox::new(
+            pool.clone(),
+            self.config.stream_key.clone(),
+            self.config.partition_count,
+        )?;
+        outbox.vector_watermark().await?;
+        self.offsets = (0..self.config.partition_count)
+            .map(|partition| (partition, 0))
+            .collect();
+        self.pool = Some(pool);
+        self.outbox = Some(outbox);
+        Ok(())
+    }
+
+    async fn read_batch(
+        &mut self,
+        offset: &crate::pipeline::OffsetValue,
+        batch_size: usize,
+    ) -> Result<(crate::pipeline::RecordBatch, crate::pipeline::OffsetValue)> {
+        self.restore_offset(offset)?;
+        let outbox = self.outbox.as_ref().ok_or_else(|| {
+            DatspoolError::Internal("partitioned PostgreSQL Outbox source is not connected".into())
+        })?;
+        let batch_size = batch_size.clamp(1, 10_000);
+        let batches = outbox
+            .read_vector_after(&self.offsets, batch_size as i64)
+            .await?;
+        let mut queues = batches
+            .into_iter()
+            .map(|(partition, events)| (partition, events, 0usize))
+            .collect::<Vec<_>>();
+        let mut batch = crate::pipeline::RecordBatch::with_capacity(batch_size);
+        while batch.len() < batch_size {
+            let mut progressed = false;
+            for (partition, events, cursor) in &mut queues {
+                if batch.len() >= batch_size {
+                    break;
+                }
+                if let Some(event) = events.get(*cursor) {
+                    let mut record = crate::pipeline::Record::with_id(
+                        event.document_id.clone(),
+                        "postgres_partitioned_outbox",
+                        event.document.clone(),
+                    );
+                    record.add_metadata("_cdc_event_id", event.event_id.clone());
+                    record.add_metadata("_op", event.operation.clone());
+                    record.add_metadata("_target_index", event.target_index.clone());
+                    record.add_metadata("_partition_id", partition.to_string());
+                    record.add_metadata("_sequence", event.local_sequence.to_string());
+                    self.offsets.insert(*partition, event.local_sequence as u64);
+                    batch.push(record);
+                    *cursor += 1;
+                    progressed = true;
+                }
+            }
+            if !progressed {
+                break;
+            }
+        }
+        let next = crate::pipeline::OffsetValue::Custom(serde_json::json!({
+            "driver": "postgres_partitioned_outbox",
+            "partition_watermarks": self.offsets,
+        }));
+        Ok((batch, next))
+    }
+
+    fn is_continuous(&self) -> bool {
+        true
+    }
+    async fn estimate_count(&self) -> Result<Option<u64>> {
+        Ok(None)
+    }
+    async fn close(&mut self) -> Result<()> {
+        self.outbox = None;
+        if let Some(pool) = self.pool.take() {
+            pool.close().await;
+        }
+        Ok(())
+    }
+    fn source_type(&self) -> &str {
+        "postgres_partitioned_outbox"
     }
 }

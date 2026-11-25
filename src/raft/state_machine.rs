@@ -49,6 +49,19 @@ struct BatchDeliveryRequest {
     bytes_written: u64,
 }
 
+struct CdcPartitionedCutoverRequest {
+    task_id: String,
+    alias: String,
+    old_index: Option<String>,
+    new_index: String,
+    final_watermarks: std::collections::BTreeMap<u32, u64>,
+    applied_watermarks: std::collections::BTreeMap<u32, u64>,
+    fencing_shard_id: String,
+    node_id: String,
+    fencing_token: u64,
+    issued_at_ms: i64,
+}
+
 struct CdcCutoverRequest {
     task_id: String,
     alias: String,
@@ -286,6 +299,32 @@ impl<S: KvStore + Clone> MetaStateMachine<S> {
                     new_index,
                     final_watermark,
                     applied_watermark,
+                    fencing_shard_id,
+                    node_id,
+                    fencing_token,
+                    issued_at_ms,
+                })
+                .await
+            }
+            Command::RecordCdcPartitionedCutover {
+                task_id,
+                alias,
+                old_index,
+                new_index,
+                final_watermarks,
+                applied_watermarks,
+                fencing_shard_id,
+                node_id,
+                fencing_token,
+                issued_at_ms,
+            } => {
+                self.apply_record_cdc_partitioned_cutover(CdcPartitionedCutoverRequest {
+                    task_id,
+                    alias,
+                    old_index,
+                    new_index,
+                    final_watermarks,
+                    applied_watermarks,
                     fencing_shard_id,
                     node_id,
                     fencing_token,
@@ -1573,6 +1612,7 @@ impl<S: KvStore + Clone> MetaStateMachine<S> {
                     source,
                     crate::drivers::factory::SourceConfig::ElasticsearchOnline { .. }
                         | crate::drivers::factory::SourceConfig::PostgresOutbox { .. }
+                        | crate::drivers::factory::SourceConfig::PostgresPartitionedOutbox { .. }
                 )
             })
         {
@@ -2463,6 +2503,14 @@ impl<S: KvStore + Clone> MetaStateMachine<S> {
         };
         if task
             .metadata
+            .contains_key("_dataspool_cdc_partition_final_watermarks")
+        {
+            return Ok(rejected(
+                "Cannot replace a committed partitioned CDC vector cutover with a scalar watermark",
+            ));
+        }
+        if task
+            .metadata
             .get("_dataspool_cdc_cutover_committed")
             .is_some_and(|value| value == "true")
         {
@@ -2522,6 +2570,149 @@ impl<S: KvStore + Clone> MetaStateMachine<S> {
         ))
     }
 
+    async fn apply_record_cdc_partitioned_cutover(
+        &self,
+        request: CdcPartitionedCutoverRequest,
+    ) -> Result<CommandResponse> {
+        let CdcPartitionedCutoverRequest {
+            task_id,
+            alias,
+            old_index,
+            new_index,
+            final_watermarks,
+            applied_watermarks,
+            fencing_shard_id,
+            node_id,
+            fencing_token,
+            issued_at_ms,
+        } = request;
+        if alias.trim().is_empty()
+            || new_index.trim().is_empty()
+            || final_watermarks.is_empty()
+            || final_watermarks.len() != applied_watermarks.len()
+            || final_watermarks.iter().any(|(partition, final_seq)| {
+                applied_watermarks
+                    .get(partition)
+                    .is_none_or(|applied| applied < final_seq)
+            })
+        {
+            return Ok(rejected(
+                "Partitioned CDC cutover vector is incomplete or target partition is behind",
+            ));
+        }
+        let shard_id = parse_shard_id(&fencing_shard_id)?;
+        let Some(shard) = self.task_store.get_shard(&shard_id).await? else {
+            return Ok(rejected("CDC cutover fencing shard not found"));
+        };
+        if shard.task_id.to_string() != task_id
+            || !lease_matches(
+                &shard,
+                &node_id,
+                fencing_token,
+                chrono::DateTime::from_timestamp_millis(issued_at_ms).ok_or_else(|| {
+                    DatspoolError::Serialization("Invalid partitioned cutover timestamp".into())
+                })?,
+            )
+        {
+            return Ok(rejected(
+                "Partitioned CDC cutover rejected by task identity or fencing token",
+            ));
+        }
+        let Some(mut task) = self.task_store.get_task(&shard.task_id).await? else {
+            return Ok(rejected("CDC cutover task not found"));
+        };
+        if task
+            .metadata
+            .get("_dataspool_cdc_cutover_committed")
+            .is_some_and(|v| v == "true")
+        {
+            if let Some(previous) = task
+                .metadata
+                .get("_dataspool_cdc_partition_final_watermarks")
+            {
+                let previous: std::collections::BTreeMap<u32, u64> = serde_json::from_str(previous)
+                    .map_err(|e| {
+                        DatspoolError::Serialization(format!(
+                            "Invalid prior partition final watermark vector: {e}"
+                        ))
+                    })?;
+                let previous_applied: std::collections::BTreeMap<u32, u64> = task
+                    .metadata
+                    .get("_dataspool_cdc_partition_applied_watermarks")
+                    .map(|value| serde_json::from_str(value))
+                    .transpose()
+                    .map_err(|e| {
+                        DatspoolError::Serialization(format!(
+                            "Invalid prior partition applied watermark vector: {e}"
+                        ))
+                    })?
+                    .unwrap_or_default();
+                let alias_changed = task
+                    .metadata
+                    .get("_dataspool_cdc_alias")
+                    .is_some_and(|value| value != &alias);
+                let index_changed = task
+                    .metadata
+                    .get("_dataspool_cdc_new_index")
+                    .is_some_and(|value| value != &new_index);
+                let final_regressed = previous.len() != final_watermarks.len()
+                    || previous.iter().any(|(partition, sequence)| {
+                        final_watermarks
+                            .get(partition)
+                            .is_none_or(|next| next < sequence)
+                    });
+                let applied_regressed = previous_applied.len() != applied_watermarks.len()
+                    || previous_applied.iter().any(|(partition, sequence)| {
+                        applied_watermarks
+                            .get(partition)
+                            .is_none_or(|next| next < sequence)
+                    });
+                if final_regressed || applied_regressed || alias_changed || index_changed {
+                    return Ok(rejected(
+                        "Partitioned CDC cutover cannot regress vectors or change its committed alias destination",
+                    ));
+                }
+            } else if task.metadata.contains_key("_dataspool_cdc_final_watermark") {
+                return Ok(rejected(
+                    "Cannot change an already committed scalar CDC cutover into a partitioned vector",
+                ));
+            }
+        }
+        task.metadata
+            .insert("_dataspool_cdc_cutover_required".into(), "true".into());
+        task.metadata.insert("_dataspool_cdc_alias".into(), alias);
+        task.metadata
+            .insert("_dataspool_cdc_new_index".into(), new_index);
+        task.metadata.insert(
+            "_dataspool_cdc_partition_final_watermarks".into(),
+            serde_json::to_string(&final_watermarks)
+                .map_err(|e| DatspoolError::Serialization(e.to_string()))?,
+        );
+        task.metadata.insert(
+            "_dataspool_cdc_partition_applied_watermarks".into(),
+            serde_json::to_string(&applied_watermarks)
+                .map_err(|e| DatspoolError::Serialization(e.to_string()))?,
+        );
+        task.metadata
+            .insert("_dataspool_cdc_cutover_committed".into(), "true".into());
+        task.metadata.insert(
+            "_dataspool_cdc_cutover_at_ms".into(),
+            issued_at_ms.to_string(),
+        );
+        if let Some(old_index) = old_index {
+            task.metadata
+                .insert("_dataspool_cdc_old_index".into(), old_index);
+        }
+        self.task_store.save_task(&task).await?;
+        Ok(accepted(
+            "Partitioned CDC vector cutover committed in Raft",
+            serde_json::json!({
+                "final_watermarks": final_watermarks, "applied_watermarks": applied_watermarks,
+                "alias": task.metadata.get("_dataspool_cdc_alias")
+            }),
+        ))
+    }
+
     async fn apply_complete(
         &self,
         shard_id: String,
@@ -2550,36 +2741,80 @@ impl<S: KvStore + Clone> MetaStateMachine<S> {
                 .get("_dataspool_cdc_cutover_required")
                 .is_some_and(|value| value == "true")
         {
-            let final_watermark = task
-                .metadata
-                .get("_dataspool_cdc_final_watermark")
-                .and_then(|value| value.parse::<u64>().ok());
-            let applied_watermark = task
-                .metadata
-                .get("_dataspool_cdc_applied_watermark")
-                .and_then(|value| value.parse::<u64>().ok());
-            let committed = task
-                .metadata
-                .get("_dataspool_cdc_cutover_committed")
-                .is_some_and(|value| value == "true");
-            let alias = task
-                .metadata
-                .get("_dataspool_cdc_alias")
-                .is_some_and(|value| !value.trim().is_empty());
-            let new_index = task
-                .metadata
-                .get("_dataspool_cdc_new_index")
-                .is_some_and(|value| !value.trim().is_empty());
-            if !committed
-                || !alias
-                || !new_index
-                || final_watermark.is_none()
-                || applied_watermark
-                    .is_none_or(|applied| applied < final_watermark.unwrap_or(u64::MAX))
-            {
-                return Ok(rejected(
-                    "Online shard completion requires a committed CDC cutover at or beyond the final source watermark",
-                ));
+            if let (Some(final_vector), Some(applied_vector)) = (
+                task.metadata
+                    .get("_dataspool_cdc_partition_final_watermarks"),
+                task.metadata
+                    .get("_dataspool_cdc_partition_applied_watermarks"),
+            ) {
+                let final_vector: std::collections::BTreeMap<u32, u64> =
+                    serde_json::from_str(final_vector).map_err(|e| {
+                        DatspoolError::Serialization(format!(
+                            "Invalid partition final watermark vector: {e}"
+                        ))
+                    })?;
+                let applied_vector: std::collections::BTreeMap<u32, u64> =
+                    serde_json::from_str(applied_vector).map_err(|e| {
+                        DatspoolError::Serialization(format!(
+                            "Invalid partition applied watermark vector: {e}"
+                        ))
+                    })?;
+                let committed = task
+                    .metadata
+                    .get("_dataspool_cdc_cutover_committed")
+                    .is_some_and(|v| v == "true");
+                let alias = task
+                    .metadata
+                    .get("_dataspool_cdc_alias")
+                    .is_some_and(|v| !v.trim().is_empty());
+                let new_index = task
+                    .metadata
+                    .get("_dataspool_cdc_new_index")
+                    .is_some_and(|v| !v.trim().is_empty());
+                let caught_up = !final_vector.is_empty()
+                    && final_vector.len() == applied_vector.len()
+                    && final_vector.iter().all(|(partition, final_seq)| {
+                        applied_vector
+                            .get(partition)
+                            .is_some_and(|applied| applied >= final_seq)
+                    });
+                if !committed || !alias || !new_index || !caught_up {
+                    return Ok(rejected(
+                        "Online shard completion requires a committed partitioned CDC cutover with every partition caught up",
+                    ));
+                }
+            } else {
+                let final_watermark = task
+                    .metadata
+                    .get("_dataspool_cdc_final_watermark")
+                    .and_then(|value| value.parse::<u64>().ok());
+                let applied_watermark = task
+                    .metadata
+                    .get("_dataspool_cdc_applied_watermark")
+                    .and_then(|value| value.parse::<u64>().ok());
+                let committed = task
+                    .metadata
+                    .get("_dataspool_cdc_cutover_committed")
+                    .is_some_and(|value| value == "true");
+                let alias = task
+                    .metadata
+                    .get("_dataspool_cdc_alias")
+                    .is_some_and(|value| !value.trim().is_empty());
+                let new_index = task
+                    .metadata
+                    .get("_dataspool_cdc_new_index")
+                    .is_some_and(|value| !value.trim().is_empty());
+                if !committed
+                    || !alias
+                    || !new_index
+                    || final_watermark.is_none()
+                    || applied_watermark
+                        .is_none_or(|applied| applied < final_watermark.unwrap_or(u64::MAX))
+                {
+                    return Ok(rejected(
+                        "Online shard completion requires a committed CDC cutover at or beyond the final source watermark",
+                    ));
+                }
             }
         }
         if matches!(&shard.state, ShardState::Completed { .. })
@@ -3994,6 +4229,103 @@ mod tests {
             "Raft must reject cutover watermark regression"
         );
         assert!(sm.apply_command(complete()).await.unwrap().success);
+    }
+
+    #[tokio::test]
+    async fn partitioned_cdc_cutover_requires_complete_monotonic_vector() {
+        let dir = tempdir().unwrap();
+        let db = RocksDbStore::open(dir.path()).unwrap();
+        let store = TaskStore::new(db);
+        let online_source = crate::drivers::factory::SourceConfig::ElasticsearchOnline {
+            snapshot: crate::drivers::document::DocumentConfig::local("source-index"),
+            change_log_connection: crate::drivers::document::DocumentConfig::local("change-log"),
+            cdc: crate::drivers::document::CdcConfig::default(),
+        };
+        let task = TaskMeta::new(
+            "partitioned-cutover-gate".into(),
+            serde_json::to_string(&online_source).unwrap(),
+            "{}".into(),
+        );
+        let task_id = task.task_id;
+        let shard = ShardMeta::new(task_id, 0, "{}".into());
+        let shard_id = shard.shard_id;
+        let mut sm = MetaStateMachine::new(store.kv_store().clone());
+        let now = chrono::Utc::now().timestamp_millis();
+        assert!(
+            sm.apply_command(Command::CreateTask {
+                request_id: format!("create:{task_id}"),
+                actor: "test".into(),
+                task: Box::new(task),
+                shards: vec![shard],
+            })
+            .await
+            .unwrap()
+            .success
+        );
+        assert!(
+            sm.apply_command(Command::ClaimShard {
+                shard_id: shard_id.to_string(),
+                node_id: "worker-vector".into(),
+                claim_id: "claim-vector".into(),
+                issued_at_ms: now,
+                lease_expires_at_ms: now + 60_000,
+            })
+            .await
+            .unwrap()
+            .success
+        );
+        let fencing_token = crate::task::shard::FENCING_TOKEN_BASE + 1;
+        let final_watermarks = [(0, 4), (1, 9)]
+            .into_iter()
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let behind = [(0, 4), (1, 8)]
+            .into_iter()
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let make_command =
+            |applied_watermarks, issued_at_ms| Command::RecordCdcPartitionedCutover {
+                task_id: task_id.to_string(),
+                alias: "live".into(),
+                old_index: Some("source-v1".into()),
+                new_index: "target-v2".into(),
+                final_watermarks: final_watermarks.clone(),
+                applied_watermarks,
+                fencing_shard_id: shard_id.to_string(),
+                node_id: "worker-vector".into(),
+                fencing_token,
+                issued_at_ms,
+            };
+        let rejected = sm
+            .apply_command(make_command(behind, now + 1))
+            .await
+            .unwrap();
+        assert!(
+            !rejected.success,
+            "every partition must reach its own final watermark"
+        );
+        let complete_vector = final_watermarks.clone();
+        let recorded = sm
+            .apply_command(make_command(complete_vector.clone(), now + 2))
+            .await
+            .unwrap();
+        assert!(recorded.success, "{}", recorded.message);
+        let regressed = [(0, 3), (1, 9)].into_iter().collect();
+        assert!(
+            !sm.apply_command(make_command(regressed, now + 3))
+                .await
+                .unwrap()
+                .success
+        );
+        let completed = sm
+            .apply_command(Command::CompleteShard {
+                shard_id: shard_id.to_string(),
+                node_id: "worker-vector".into(),
+                fencing_token,
+                issued_at_ms: now + 4,
+                total_records: 0,
+            })
+            .await
+            .unwrap();
+        assert!(completed.success, "{}", completed.message);
     }
 
     #[tokio::test]

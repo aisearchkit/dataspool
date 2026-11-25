@@ -2,8 +2,10 @@
 //! Live PostgreSQL tests for transactional source writes and durable CDC barrier.
 
 use dataspool::drivers::document::CdcWriteBarrier;
+use dataspool::drivers::factory::{SourceConfig, create_source};
 use dataspool::drivers::relational::{
-    PostgresOutboxConfig, PostgresOutboxSource, PostgresTransactionalOutbox,
+    PartitionedCdcWriteBarrier, PostgresOutboxConfig, PostgresOutboxSource,
+    PostgresPartitionedOutbox, PostgresPartitionedOutboxConfig, PostgresTransactionalOutbox,
 };
 use dataspool::pipeline::{OffsetValue, Source};
 use serde_json::json;
@@ -348,23 +350,36 @@ async fn postgres_outbox_is_atomic_ordered_and_barrier_survives_restart() {
         .unwrap();
     let max_lock_wait_sessions = Arc::new(AtomicI64::new(0));
     let monitor_max = max_lock_wait_sessions.clone();
+    let baseline_active_peak = Arc::new(AtomicI64::new(0));
+    let baseline_active = baseline_active_peak.clone();
     let monitor = tokio::spawn(async move {
         for _ in 0..120 {
             let (waiting,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock'")
                 .fetch_one(&monitor_pool).await.unwrap();
             monitor_max.fetch_max(waiting, Ordering::Relaxed);
+            let (active,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM pg_stat_activity WHERE application_name = 'dataspool-outbox-load-32' AND state = 'active'")
+                .fetch_one(&monitor_pool).await.unwrap();
+            baseline_active.fetch_max(active, Ordering::Relaxed);
             tokio::time::sleep(Duration::from_millis(2)).await;
         }
         monitor_pool.close().await;
     });
     // Eight independent application pools emulate multiple producer
     // processes; each is capped at four PostgreSQL connections.
+    let mut baseline_url = url::Url::parse(&database_url()).unwrap();
+    baseline_url
+        .query_pairs_mut()
+        .append_pair("application_name", "dataspool-outbox-load-32");
     let mut application_instances = Vec::new();
     for _ in 0..8 {
         application_instances.push(
-            PostgresTransactionalOutbox::connect_with_max_connections(&database_url(), &stream, 4)
-                .await
-                .unwrap(),
+            PostgresTransactionalOutbox::connect_with_max_connections(
+                baseline_url.as_str(),
+                &stream,
+                4,
+            )
+            .await
+            .unwrap(),
         );
     }
     let started = std::time::Instant::now();
@@ -423,8 +438,9 @@ async fn postgres_outbox_is_atomic_ordered_and_barrier_survives_restart() {
             .unwrap();
     let max_lock_waits = max_lock_wait_sessions.load(Ordering::Relaxed);
     println!(
-        "POSTGRES_OUTBOX_LOAD stream={} writers=32 elapsed_ms={} throughput_ops_s={:.1} p50_transaction_ms={} p95_transaction_ms={} p99_transaction_ms={} deadlocks_delta={} max_sampled_lock_wait_sessions={} wal_bytes_delta={}",
+        "POSTGRES_OUTBOX_LOAD stream={} producer_tasks=32 pool_connections=32 active_connections_peak={} elapsed_ms={} throughput_ops_s={:.1} p50_transaction_ms={} p95_transaction_ms={} p99_transaction_ms={} deadlocks_delta={} max_sampled_lock_wait_sessions={} wal_bytes_delta={}",
         stream,
+        baseline_active_peak.load(Ordering::Relaxed),
         elapsed.as_millis(),
         32.0 / elapsed.as_secs_f64(),
         p50.as_millis(),
@@ -510,10 +526,35 @@ async fn postgres_outbox_is_atomic_ordered_and_barrier_survives_restart() {
             .unwrap();
     }
 
-    // Scale the single-stream load profile to the requested concurrency
-    // levels. Pool count remains eight; each pool is capped at four sessions,
-    // so 512 tasks exercise both pool queueing and the per-stream gate.
-    for concurrency in [128usize, 256, 512] {
+    // Release the initial 8 x 4 pools. The next matrix separates producer
+    // task concurrency from actual PostgreSQL connection concurrency.
+    for app in &application_instances {
+        app.pool().close().await;
+    }
+
+    // Increase database concurrency independently from producer task count:
+    // 128/256/512 tasks use 16/32/64 actual pool connections respectively.
+    // This remains within the stock PostgreSQL service connection budget while
+    // exposing pool queueing separately from gate-lock contention.
+    for (concurrency, total_pool_connections) in [(128usize, 16usize), (256, 32), (512, 64)] {
+        let per_pool_connections = (total_pool_connections / 8) as u32;
+        let mut scale_instances = Vec::with_capacity(8);
+        for _ in 0..8 {
+            let pool = sqlx::postgres::PgPoolOptions::new()
+                .max_connections(per_pool_connections)
+                .after_connect(|connection, _| {
+                    Box::pin(async move {
+                        sqlx::query("SET application_name = 'dataspool-outbox-load'")
+                            .execute(connection)
+                            .await?;
+                        Ok(())
+                    })
+                })
+                .connect(&database_url())
+                .await
+                .unwrap();
+            scale_instances.push(PostgresTransactionalOutbox::new(pool, stream.clone()));
+        }
         sqlx::query("SELECT pg_stat_force_next_flush()")
             .execute(outbox.pool())
             .await
@@ -537,11 +578,16 @@ async fn postgres_outbox_is_atomic_ordered_and_barrier_survives_restart() {
         let sampling_flag = sampling.clone();
         let sampled_lock_waits = Arc::new(AtomicI64::new(0));
         let sampled_max = sampled_lock_waits.clone();
+        let active_connections_peak = Arc::new(AtomicI64::new(0));
+        let active_peak = active_connections_peak.clone();
         let lock_monitor = tokio::spawn(async move {
             while sampling_flag.load(Ordering::Relaxed) {
                 let (waiting,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock'")
                     .fetch_one(&scale_monitor_pool).await.unwrap();
                 sampled_max.fetch_max(waiting, Ordering::Relaxed);
+                let (active,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM pg_stat_activity WHERE application_name = 'dataspool-outbox-load' AND state = 'active'")
+                    .fetch_one(&scale_monitor_pool).await.unwrap();
+                active_peak.fetch_max(active, Ordering::Relaxed);
                 tokio::time::sleep(Duration::from_millis(2)).await;
             }
             scale_monitor_pool.close().await;
@@ -549,7 +595,7 @@ async fn postgres_outbox_is_atomic_ordered_and_barrier_survives_restart() {
         let scale_started = std::time::Instant::now();
         let mut scale_tasks = Vec::with_capacity(concurrency);
         for index in 0..concurrency {
-            let producer = application_instances[index % application_instances.len()].clone();
+            let producer = scale_instances[index % scale_instances.len()].clone();
             let id = format!("scale-{concurrency}-{index}");
             scale_tasks.push(tokio::spawn(async move {
                 let started = std::time::Instant::now();
@@ -596,9 +642,11 @@ async fn postgres_outbox_is_atomic_ordered_and_barrier_survives_restart() {
         .await
         .unwrap();
         println!(
-            "POSTGRES_OUTBOX_LOAD stream={} writers={} elapsed_ms={} throughput_ops_s={:.1} p50_ms={} p95_ms={} p99_ms={} max_lock_wait_sessions={} deadlocks_delta={} wal_bytes_delta={}",
+            "POSTGRES_OUTBOX_LOAD stream={} producer_tasks={} pool_connections={} active_connections_peak={} elapsed_ms={} throughput_ops_s={:.1} p50_ms={} p95_ms={} p99_ms={} max_lock_wait_sessions={} deadlocks_delta={} wal_bytes_delta={}",
             stream,
             concurrency,
+            total_pool_connections,
+            active_connections_peak.load(Ordering::Relaxed),
             elapsed.as_millis(),
             concurrency as f64 / elapsed.as_secs_f64(),
             percentile(50).as_millis(),
@@ -608,6 +656,9 @@ async fn postgres_outbox_is_atomic_ordered_and_barrier_survives_restart() {
             deadlocks_after_scale.0 - deadlocks_before_scale.0,
             (wal_after.0 - wal_before.0).max(0),
         );
+        for app in &scale_instances {
+            app.pool().close().await;
+        }
     }
 
     // Retention is coordinated with all registered consumers. No consumer
@@ -832,6 +883,13 @@ async fn postgres_outbox_batches_are_atomic_ordered_and_bounded() {
     writer.commit().await.unwrap();
     let watermark_after_batch = outbox.watermark().await.unwrap();
 
+    // Replaying the complete batch after an ambiguous COMMIT must return the
+    // original sequence vector without reserving a second sequence range.
+    let mut retry = outbox.begin_write().await.unwrap();
+    assert_eq!(retry.append_events(&events).await.unwrap(), sequences);
+    retry.commit().await.unwrap();
+    assert_eq!(outbox.watermark().await.unwrap(), watermark_after_batch);
+
     // A validation failure halfway through a batch poisons the producer
     // transaction; callers cannot accidentally commit its earlier events.
     let mut invalid_batch = outbox.begin_write().await.unwrap();
@@ -878,6 +936,225 @@ async fn postgres_outbox_batches_are_atomic_ordered_and_bounded() {
     assert_eq!(outbox.prune_consumed_events_batch(7).await.unwrap(), 7);
     assert_eq!(outbox.prune_consumed_events_batch(7).await.unwrap(), 4);
     assert!(outbox.read_after(0, 100).await.unwrap().is_empty());
+    let retention_stats = outbox.retention_stats().await.unwrap();
+    assert!(retention_stats.total_bytes > 0);
+    assert!(retention_stats.autovacuum_count >= 0);
+    println!(
+        "POSTGRES_OUTBOX_RETENTION stream={} live_rows_estimate={} dead_rows_estimate={} table_bytes={} autovacuum_count={} last_autovacuum={:?} cluster_wal_bytes={:?}",
+        stream,
+        retention_stats.live_rows_estimate,
+        retention_stats.dead_rows_estimate,
+        retention_stats.total_bytes,
+        retention_stats.autovacuum_count,
+        retention_stats.last_autovacuum,
+        retention_stats.cluster_wal_bytes,
+    );
+}
+
+#[tokio::test]
+async fn postgres_partitioned_outbox_uses_vector_checkpoints_and_cutover_barrier() {
+    let _test_guard = POSTGRES_OUTBOX_TEST_LOCK.lock().await;
+    let stream = format!("outbox-partitioned-{}", Uuid::new_v4());
+    let base = producer(&stream).await;
+    let partitioned = PostgresPartitionedOutbox::new(base.pool().clone(), &stream, 4).unwrap();
+    partitioned.migrate().await.unwrap();
+    assert_eq!(
+        partitioned.partition_for_key(b"customer-42"),
+        partitioned.partition_for_key(b"customer-42")
+    );
+    let incompatible_topology =
+        PostgresPartitionedOutbox::new(base.pool().clone(), &stream, 3).unwrap();
+    assert!(
+        incompatible_topology.migrate().await.is_err(),
+        "partition topology cannot change in place"
+    );
+
+    // Each partition has an independent gate and local sequence. Producers
+    // on different partitions do not serialize behind one stream-wide row.
+    let partition_started = std::time::Instant::now();
+    let mut tasks = Vec::new();
+    for partition_id in 0..4u32 {
+        for ordinal in 0..8u32 {
+            let partitioned = partitioned.clone();
+            let stream_key = stream.clone();
+            tasks.push(tokio::spawn(async move {
+                let document_id = format!("p{partition_id}-{ordinal}");
+                let started = std::time::Instant::now();
+                let mut writer = partitioned.begin_write(partition_id).await.unwrap();
+                sqlx::query("SELECT pg_sleep(0.005)").execute(writer.connection()).await.unwrap();
+                sqlx::query("INSERT INTO dataspool_outbox_test_documents (stream_key, document_id, payload) VALUES ($1, $2, $3)")
+                    .bind(&stream_key).bind(&document_id).bind(json!({"partition":partition_id,"ordinal":ordinal}))
+                    .execute(writer.connection()).await.unwrap();
+                let sequence = writer.append_event(
+                    Uuid::new_v4(), "index", &document_id, "partition-target",
+                    &json!({"partition":partition_id,"ordinal":ordinal}),
+                ).await.unwrap();
+                writer.commit().await.unwrap();
+                (sequence, started.elapsed())
+            }));
+        }
+    }
+    let mut partitioned_latencies = Vec::new();
+    for task in tasks {
+        let (_, latency) = task.await.unwrap();
+        partitioned_latencies.push(latency);
+    }
+    partitioned_latencies.sort_unstable();
+    let partitioned_elapsed = partition_started.elapsed();
+    println!(
+        "POSTGRES_OUTBOX_PARTITIONED stream={} partitions=4 producer_tasks=32 elapsed_ms={} throughput_ops_s={:.1} p50_ms={} p95_ms={} p99_ms={}",
+        stream,
+        partitioned_elapsed.as_millis(),
+        32.0 / partitioned_elapsed.as_secs_f64(),
+        partitioned_latencies[partitioned_latencies.len() / 2].as_millis(),
+        partitioned_latencies
+            [(partitioned_latencies.len() * 95 / 100).min(partitioned_latencies.len() - 1)]
+        .as_millis(),
+        partitioned_latencies
+            [(partitioned_latencies.len() * 99 / 100).min(partitioned_latencies.len() - 1)]
+        .as_millis(),
+    );
+
+    let vector = partitioned.vector_watermark().await.unwrap();
+    assert_eq!(vector, (0..4u32).map(|partition| (partition, 8)).collect());
+    let offsets = (0..4u32).map(|partition| (partition, 0)).collect();
+    let vector_batches = partitioned.read_vector_after(&offsets, 100).await.unwrap();
+    assert_eq!(vector_batches.values().map(Vec::len).sum::<usize>(), 32);
+    let source_config = SourceConfig::PostgresPartitionedOutbox {
+        config: PostgresPartitionedOutboxConfig {
+            connection_env: "DATASPOOL_TEST_POSTGRES_URL".into(),
+            stream_key: stream.clone(),
+            partition_count: 4,
+        },
+    };
+    let mut source = create_source(&source_config).unwrap();
+    source.connect().await.unwrap();
+    let (source_batch, source_checkpoint) = source
+        .read_batch(&OffsetValue::initial(), 100)
+        .await
+        .unwrap();
+    assert_eq!(source_batch.len(), 32);
+    let source_vector: std::collections::BTreeMap<u32, u64> = match &source_checkpoint {
+        OffsetValue::Custom(value) => {
+            serde_json::from_value(value["partition_watermarks"].clone()).unwrap()
+        }
+        other => panic!("expected vector checkpoint, got {other:?}"),
+    };
+    assert_eq!(source_vector, vector);
+    assert_eq!(
+        source_batch
+            .records()
+            .iter()
+            .filter(|record| record.get_metadata("_partition_id").is_some())
+            .count(),
+        32
+    );
+    let (empty_batch, same_checkpoint) = source.read_batch(&source_checkpoint, 100).await.unwrap();
+    assert!(empty_batch.is_empty());
+    assert_eq!(same_checkpoint, source_checkpoint);
+    source.close().await.unwrap();
+    for partition_id in 0..4u32 {
+        let events = partitioned
+            .read_partition_after(partition_id, 0, 100)
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 8);
+        assert!(
+            events
+                .windows(2)
+                .all(|pair| pair[0].local_sequence < pair[1].local_sequence)
+        );
+        assert!(
+            events
+                .iter()
+                .all(|event| event.partition_id == partition_id)
+        );
+    }
+
+    let consumer = format!("partition-consumer-{stream}");
+    partitioned.register_consumer(&consumer).await.unwrap();
+    let mut incomplete = vector.clone();
+    incomplete.remove(&3);
+    assert!(
+        partitioned
+            .record_consumer_checkpoint_vector(&consumer, &incomplete)
+            .await
+            .is_err()
+    );
+    partitioned
+        .record_consumer_checkpoint_vector(&consumer, &vector)
+        .await
+        .unwrap();
+    let regressed_vector = (0..4u32)
+        .map(|partition| (partition, if partition == 0 { 7 } else { 8 }))
+        .collect();
+    assert!(
+        partitioned
+            .record_consumer_checkpoint_vector(&consumer, &regressed_vector)
+            .await
+            .is_err()
+    );
+    let restarted_pool = PostgresTransactionalOutbox::connect(&database_url(), &stream)
+        .await
+        .unwrap();
+    let restarted_partitioned =
+        PostgresPartitionedOutbox::new(restarted_pool.pool().clone(), &stream, 4).unwrap();
+    assert_eq!(
+        restarted_partitioned
+            .consumer_checkpoint_vector(&consumer)
+            .await
+            .unwrap(),
+        vector
+    );
+    assert_eq!(partitioned.prune_partition_batch(0, 3).await.unwrap(), 3);
+    let partition_retention = partitioned.retention_stats().await.unwrap();
+    assert!(partition_retention.total_bytes > 0);
+    assert_eq!(
+        partitioned
+            .read_partition_after(0, 0, 100)
+            .await
+            .unwrap()
+            .len(),
+        5
+    );
+
+    let mut barrier = partitioned.clone();
+    let final_vector = barrier.pause_and_capture_vector_watermark().await.unwrap();
+    assert_eq!(final_vector, vector);
+    for partition_id in 0..4u32 {
+        assert!(partitioned.begin_write(partition_id).await.is_err());
+    }
+    barrier.resume_partitioned_writes().await.unwrap();
+    let replay_id = Uuid::new_v4();
+    let replay_payload = json!({"ok":true});
+    let mut resumed = partitioned.begin_write(2).await.unwrap();
+    let allocated = resumed
+        .append_event(
+            replay_id,
+            "index",
+            "after-resume",
+            "partition-target",
+            &replay_payload,
+        )
+        .await
+        .unwrap();
+    resumed.commit().await.unwrap();
+    let mut replay = partitioned.begin_write(2).await.unwrap();
+    assert_eq!(
+        replay
+            .append_event(
+                replay_id,
+                "index",
+                "after-resume",
+                "partition-target",
+                &replay_payload
+            )
+            .await
+            .unwrap(),
+        allocated
+    );
+    replay.commit().await.unwrap();
+    assert_eq!(partitioned.vector_watermark().await.unwrap()[&2], 9);
 }
 
 #[tokio::test]

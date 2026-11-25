@@ -165,6 +165,21 @@ pub enum Command {
         issued_at_ms: i64,
     },
 
+    /// Persist a vector-watermarked partitioned CDC cutover. Each partition
+    /// has an independent local sequence; maps must contain identical keys.
+    RecordCdcPartitionedCutover {
+        task_id: String,
+        alias: String,
+        old_index: Option<String>,
+        new_index: String,
+        final_watermarks: std::collections::BTreeMap<u32, u64>,
+        applied_watermarks: std::collections::BTreeMap<u32, u64>,
+        fencing_shard_id: String,
+        node_id: String,
+        fencing_token: u64,
+        issued_at_ms: i64,
+    },
+
     /// Mark shard as completed
     CompleteShard {
         shard_id: String,
@@ -360,6 +375,17 @@ impl Command {
                 ..
             } => {
                 format!("RecordCdcCutover({task_id}, {applied_watermark}/{final_watermark})")
+            }
+            Command::RecordCdcPartitionedCutover {
+                task_id,
+                final_watermarks,
+                applied_watermarks,
+                ..
+            } => {
+                format!(
+                    "RecordCdcPartitionedCutover({task_id}, partitions={})",
+                    final_watermarks.len().min(applied_watermarks.len())
+                )
             }
             Command::CompleteShard {
                 shard_id,
