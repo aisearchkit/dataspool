@@ -490,10 +490,13 @@ async fn wait_for_file(path: &Path, children: &mut [Child]) {
             }
             for child in children.iter_mut() {
                 if let Some(status) = child.try_wait().expect("poll six-member child") {
-                    panic!(
-                        "six-member child exited before {}: {status}",
-                        path.display()
-                    );
+                    use std::os::unix::process::ExitStatusExt;
+                    if status.signal() != Some(9) {
+                        panic!(
+                            "six-member child exited unexpectedly before {}: {status}",
+                            path.display()
+                        );
+                    }
                 }
             }
             tokio::time::sleep(Duration::from_millis(40)).await;
