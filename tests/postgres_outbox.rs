@@ -640,6 +640,10 @@ async fn postgres_drop_commit_response_proxy(
             backend_read.read_exact(&mut body).await?;
             if tag[0] == b'Z' && backend_commit.load(std::sync::atomic::Ordering::SeqCst) {
                 let _ = dropped.send(());
+                // Explicitly half-close the client-facing socket. The frontend
+                // task still owns the read half, so dropping this write half
+                // alone would not reliably deliver EOF to the SQL client.
+                client_write.shutdown().await?;
                 break;
             }
             client_write.write_all(&tag).await?;
@@ -699,8 +703,11 @@ async fn postgres_ambiguous_commit_response_is_recovered_by_event_id() {
         .append_event(event_id, "index", "acct-1", "accounts", &payload)
         .await
         .unwrap();
+    let commit_result = tokio::time::timeout(Duration::from_secs(10), writer.commit())
+        .await
+        .expect("producer must observe the dropped COMMIT response promptly");
     assert!(
-        writer.commit().await.is_err(),
+        commit_result.is_err(),
         "client must observe a lost COMMIT response"
     );
     tokio::time::timeout(Duration::from_secs(5), dropped_rx)
