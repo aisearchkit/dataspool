@@ -825,8 +825,11 @@ impl<S: KvStore + Clone> MetaStateMachine<S> {
                 (current.state, operation.state),
                 (
                     crate::federation::FederatedRemoteOperationState::Prepared,
-                    crate::federation::FederatedRemoteOperationState::Committed
-                        | crate::federation::FederatedRemoteOperationState::Compensated
+                    crate::federation::FederatedRemoteOperationState::Compensating
+                        | crate::federation::FederatedRemoteOperationState::Committed
+                ) | (
+                    crate::federation::FederatedRemoteOperationState::Compensating,
+                    crate::federation::FederatedRemoteOperationState::Compensated
                 )
             ) || current.state == operation.state;
             if !allowed {
@@ -837,15 +840,25 @@ impl<S: KvStore + Clone> MetaStateMachine<S> {
             {
                 return Ok(rejected("committed remote operation is immutable"));
             }
+            if current.state == crate::federation::FederatedRemoteOperationState::Compensating
+                && operation.state != crate::federation::FederatedRemoteOperationState::Compensating
+                && operation.state != crate::federation::FederatedRemoteOperationState::Compensated
+            {
+                return Ok(rejected(
+                    "compensating remote operation cannot be committed",
+                ));
+            }
             if current.state == crate::federation::FederatedRemoteOperationState::Compensated
                 && operation.state != crate::federation::FederatedRemoteOperationState::Compensated
             {
                 return Ok(rejected("compensated remote operation is immutable"));
             }
         } else if operation.state != crate::federation::FederatedRemoteOperationState::Prepared
-            && operation.state != crate::federation::FederatedRemoteOperationState::Compensated
+            && operation.state != crate::federation::FederatedRemoteOperationState::Compensating
         {
-            return Ok(rejected("remote operation must be prepared before commit"));
+            return Ok(rejected(
+                "remote operation must be prepared or compensating before commit",
+            ));
         }
         let audit = self.audit_event(
             &actor,
@@ -3365,6 +3378,90 @@ mod tests {
         assert_eq!(
             saved.state,
             crate::federation::FederatedRemoteOperationState::Committed
+        );
+    }
+
+    #[tokio::test]
+    async fn federated_compensation_fence_excludes_commit_and_is_replayable() {
+        let dir = tempdir().unwrap();
+        let store = TaskStore::new(RocksDbStore::open(dir.path()).unwrap());
+        let mut sm = MetaStateMachine::new(store.kv_store().clone());
+        assert!(
+            sm.apply_command(Command::UpsertFederatedCluster {
+                cluster: federated_cluster("source"),
+                request_id: "register-source-compensation".into(),
+                actor: "operator".into(),
+            })
+            .await
+            .unwrap()
+            .success
+        );
+        let operation = |state| crate::federation::FederatedRemoteOperation {
+            migration_id: "migration-compensation-fence".into(),
+            source_cluster: "source".into(),
+            generation: 4,
+            task_id: "remote-task".into(),
+            state,
+            checkpoint_digest: Some("checkpoint-4".into()),
+            updated_at_ms: 10,
+        };
+        let propose = |operation, request_id: &str| Command::RecordFederatedRemoteOperation {
+            operation: Box::new(operation),
+            request_id: request_id.into(),
+            actor: "peer".into(),
+        };
+        assert!(
+            sm.apply_command(propose(
+                operation(crate::federation::FederatedRemoteOperationState::Prepared),
+                "prepare-fence",
+            ))
+            .await
+            .unwrap()
+            .success
+        );
+
+        let intent = propose(
+            operation(crate::federation::FederatedRemoteOperationState::Compensating),
+            "begin-compensation-fence",
+        );
+        assert!(sm.apply_command(intent.clone()).await.unwrap().success);
+        assert!(sm.apply_command(intent).await.unwrap().success);
+
+        let concurrent_commit = sm
+            .apply_command(propose(
+                operation(crate::federation::FederatedRemoteOperationState::Committed),
+                "commit-after-compensation-start",
+            ))
+            .await
+            .unwrap();
+        assert!(!concurrent_commit.success);
+        assert!(concurrent_commit.message.contains("compensating"));
+
+        assert!(
+            sm.apply_command(propose(
+                operation(crate::federation::FederatedRemoteOperationState::Compensated),
+                "finish-compensation-fence",
+            ))
+            .await
+            .unwrap()
+            .success
+        );
+        let late_commit = sm
+            .apply_command(propose(
+                operation(crate::federation::FederatedRemoteOperationState::Committed),
+                "late-commit-after-compensation",
+            ))
+            .await
+            .unwrap();
+        assert!(!late_commit.success);
+        assert_eq!(
+            store
+                .get_federated_remote_operation("migration-compensation-fence", 4)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            crate::federation::FederatedRemoteOperationState::Compensated
         );
     }
 

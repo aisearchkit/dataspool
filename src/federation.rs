@@ -44,6 +44,8 @@ pub enum MigrationState {
 #[serde(rename_all = "snake_case")]
 pub enum FederatedRemoteOperationState {
     Prepared,
+    /// Durable fence written before any destructive compensation side effect.
+    Compensating,
     Committed,
     Compensated,
 }

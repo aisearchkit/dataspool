@@ -746,6 +746,13 @@ impl task::task_service_server::TaskService for Arc<RwLock<TaskServiceImpl>> {
                 "Federated operation identity does not match the authenticated peer",
             ));
         }
+        if operation.state == crate::federation::FederatedRemoteOperationState::Compensating
+            || operation.state == crate::federation::FederatedRemoteOperationState::Compensated
+        {
+            return Err(Status::failed_precondition(
+                "Remote migration compensation has started; commit is fenced",
+            ));
+        }
         operation.state = crate::federation::FederatedRemoteOperationState::Committed;
         operation.updated_at_ms = chrono::Utc::now().timestamp_millis();
         let result = raft
@@ -794,7 +801,7 @@ impl task::task_service_server::TaskService for Arc<RwLock<TaskServiceImpl>> {
             .task_id
             .parse()
             .map_err(|e| Status::invalid_argument(format!("Invalid task_id: {e}")))?;
-        let existing = store
+        let mut existing = store
             .get_federated_remote_operation(&req.migration_id, req.generation)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
@@ -818,7 +825,8 @@ impl task::task_service_server::TaskService for Arc<RwLock<TaskServiceImpl>> {
                         message: "Compensation already committed".into(),
                     }));
                 }
-                crate::federation::FederatedRemoteOperationState::Prepared => {}
+                crate::federation::FederatedRemoteOperationState::Prepared
+                | crate::federation::FederatedRemoteOperationState::Compensating => {}
             }
         }
         let (remote_task, mut shards) = store
@@ -837,6 +845,37 @@ impl task::task_service_server::TaskService for Arc<RwLock<TaskServiceImpl>> {
                 "Target task is not tagged for this migration generation",
             ));
         }
+
+        // Commit and compensation are mutually exclusive Raft state transitions.
+        // Persist the compensation fence before cancelling workers or deleting sink
+        // documents, so a concurrent/replayed Commit cannot win after deletion starts.
+        let intent = crate::federation::FederatedRemoteOperation {
+            migration_id: req.migration_id.clone(),
+            source_cluster: peer.clone(),
+            generation: req.generation,
+            task_id: task_id.to_string(),
+            state: crate::federation::FederatedRemoteOperationState::Compensating,
+            checkpoint_digest: existing
+                .as_ref()
+                .and_then(|value| value.checkpoint_digest.clone()),
+            updated_at_ms: chrono::Utc::now().timestamp_millis(),
+        };
+        let intent_result = raft
+            .propose(crate::raft::Command::RecordFederatedRemoteOperation {
+                operation: Box::new(intent.clone()),
+                request_id: format!(
+                    "federation-compensation-begin:{:x}",
+                    Sha256::digest(req.request_id.as_bytes())
+                ),
+                actor: "federation-compensation".into(),
+            })
+            .await
+            .map_err(raft_status)?;
+        if !intent_result.success {
+            return Err(Status::failed_precondition(intent_result.message));
+        }
+        existing = Some(intent);
+
         if !matches!(
             remote_task.state,
             TaskState::Completed { .. } | TaskState::Cancelled { .. } | TaskState::Failed { .. }
