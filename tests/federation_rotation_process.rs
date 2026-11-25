@@ -98,6 +98,10 @@ fn assert_sigkill(child: &mut Child, reason: &str) {
 }
 
 async fn run_child_process() {
+    // This binary enables both rustls ring and aws-lc through its dependency
+    // graph; child processes must select the same provider explicitly as the
+    // existing in-process mTLS federation tests do.
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let role = std::env::var("DATASPOOL_ROTATION_PROCESS_ROLE").unwrap();
     let phase = std::env::var("DATASPOOL_ROTATION_PROCESS_PHASE").unwrap();
     let root = PathBuf::from(std::env::var("DATASPOOL_ROTATION_PROCESS_ROOT").unwrap());
