@@ -204,23 +204,34 @@ impl PostgresTransactionalOutbox {
         let table_ident = ident(table)?;
         let trigger_ident = ident(&format!("dataspool_outbox_guard_{}", table))?;
         sqlx::query(
-            "CREATE OR REPLACE FUNCTION public.dataspool_require_outbox_write() RETURNS trigger\
-             LANGUAGE plpgsql SECURITY INVOKER AS $$\
-             BEGIN\
-               IF current_setting('dataspool.outbox_stream_key', TRUE) IS DISTINCT FROM TG_ARGV[0] THEN\
-                 RAISE EXCEPTION 'source table write requires Dataspool transactional Outbox stream %', TG_ARGV[0]\
-                   USING ERRCODE = '42501';\
-               END IF;\
-               IF TG_OP = 'DELETE' THEN RETURN OLD; ELSE RETURN NEW; END IF;\
-             END; $$",
+            r#"
+            CREATE OR REPLACE FUNCTION public.dataspool_require_outbox_write()
+            RETURNS trigger
+            LANGUAGE plpgsql SECURITY INVOKER
+            AS $$
+            BEGIN
+              IF current_setting('dataspool.outbox_stream_key', TRUE) IS DISTINCT FROM TG_ARGV[0] THEN
+                RAISE EXCEPTION 'source table write requires Dataspool transactional Outbox stream %', TG_ARGV[0]
+                  USING ERRCODE = '42501';
+              END IF;
+              IF TG_OP = 'DELETE' THEN
+                RETURN OLD;
+              END IF;
+              RETURN NEW;
+            END;
+            $$
+            "#,
         )
         .execute(&self.pool)
         .await
         .map_err(|error| db_error("create Outbox write guard function", error))?;
         let ddl = format!(
-            "DROP TRIGGER IF EXISTS {trigger_ident} ON {schema_ident}.{table_ident};\
-             CREATE TRIGGER {trigger_ident} BEFORE INSERT OR UPDATE OR DELETE ON {schema_ident}.{table_ident}\
-             FOR EACH ROW EXECUTE FUNCTION public.dataspool_require_outbox_write('{}')",
+            r#"
+            DROP TRIGGER IF EXISTS {trigger_ident} ON {schema_ident}.{table_ident};
+            CREATE TRIGGER {trigger_ident}
+            BEFORE INSERT OR UPDATE OR DELETE ON {schema_ident}.{table_ident}
+            FOR EACH ROW EXECUTE FUNCTION public.dataspool_require_outbox_write('{}');
+            "#,
             self.stream_key.replace('\'', "''")
         );
         sqlx::raw_sql(&ddl)
