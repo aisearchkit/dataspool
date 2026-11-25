@@ -6,15 +6,14 @@
 //! gRPC server implementation
 
 use sha2::{Digest, Sha256};
-use std::sync::Arc;
 #[cfg(feature = "test-fault-injection")]
 use std::{
     future::Future,
-    path::PathBuf,
     pin::Pin,
     sync::atomic::{AtomicBool, Ordering},
     task::{Context, Poll},
 };
+use std::{path::PathBuf, sync::Arc};
 use tokio::sync::RwLock;
 use tonic::{
     Request, Response, Status,
