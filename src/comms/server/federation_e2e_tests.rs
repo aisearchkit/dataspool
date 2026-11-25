@@ -560,9 +560,13 @@ struct TcpFaultProxy {
 
 impl TcpFaultProxy {
     async fn start(backend: String) -> Self {
+        Self::start_with_tls_host(backend, "localhost").await
+    }
+
+    async fn start_with_tls_host(backend: String, tls_host: &str) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!(
-            "https://localhost:{}",
+            "https://{tls_host}:{}",
             listener.local_addr().unwrap().port()
         );
         let blocked = Arc::new(AtomicBool::new(false));
@@ -1288,8 +1292,9 @@ async fn federated_certificate_rotation_recovers_across_independent_raft_failove
             .await
             .unwrap();
     });
-    let source_proxy = TcpFaultProxy::start(source_backend).await;
-    let target_proxy = TcpFaultProxy::start(target_backend).await;
+    // The rotation test server certificate is intentionally IP-SAN-only.
+    let source_proxy = TcpFaultProxy::start_with_tls_host(source_backend, "127.0.0.1").await;
+    let target_proxy = TcpFaultProxy::start_with_tls_host(target_backend, "127.0.0.1").await;
     let source_endpoint = source_proxy.endpoint.clone();
     let target_endpoint = target_proxy.endpoint.clone();
 
