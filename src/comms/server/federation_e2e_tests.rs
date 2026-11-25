@@ -212,8 +212,12 @@ impl TestRaftCluster {
 struct AckFaults {
     prepare: Arc<AtomicBool>,
     commit: Arc<AtomicBool>,
+    rotation_stage: Arc<AtomicBool>,
+    rotation_proof: Arc<AtomicBool>,
     prepare_dropped: Arc<AtomicBool>,
     commit_dropped: Arc<AtomicBool>,
+    rotation_stage_dropped: Arc<AtomicBool>,
+    rotation_proof_dropped: Arc<AtomicBool>,
     observed_paths: Arc<Mutex<Vec<String>>>,
 }
 
@@ -222,8 +226,12 @@ impl Default for AckFaults {
         Self {
             prepare: Arc::new(AtomicBool::new(false)),
             commit: Arc::new(AtomicBool::new(false)),
+            rotation_stage: Arc::new(AtomicBool::new(false)),
+            rotation_proof: Arc::new(AtomicBool::new(false)),
             prepare_dropped: Arc::new(AtomicBool::new(false)),
             commit_dropped: Arc::new(AtomicBool::new(false)),
+            rotation_stage_dropped: Arc::new(AtomicBool::new(false)),
+            rotation_proof_dropped: Arc::new(AtomicBool::new(false)),
             observed_paths: Arc::new(Mutex::new(Vec::new())),
         }
     }
@@ -288,6 +296,18 @@ where
                 let drop = faults.commit.swap(false, Ordering::SeqCst);
                 if drop {
                     faults.commit_dropped.store(true, Ordering::SeqCst);
+                }
+                drop
+            } else if lowered.contains("stagefederatedcertificaterotation") {
+                let drop = faults.rotation_stage.swap(false, Ordering::SeqCst);
+                if drop {
+                    faults.rotation_stage_dropped.store(true, Ordering::SeqCst);
+                }
+                drop
+            } else if lowered.contains("provefederatedcertificaterotation") {
+                let drop = faults.rotation_proof.swap(false, Ordering::SeqCst);
+                if drop {
+                    faults.rotation_proof_dropped.store(true, Ordering::SeqCst);
                 }
                 drop
             } else {
@@ -1166,6 +1186,336 @@ impl TestRaftGroup {
         .await
         .expect("remote operation did not replicate to every Raft member");
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn federated_certificate_rotation_recovers_across_independent_raft_failover_and_lost_acks() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let mut source = TestRaftGroup::start("federation-rotation-source-ha").await;
+    let mut target = TestRaftGroup::start("federation-rotation-target-ha").await;
+    let source_leader = source.wait_for_leader(None).await;
+    let target_leader = target.wait_for_leader(None).await;
+    let old_fingerprint = rotation_old_client_fingerprint();
+    let new_fingerprint = rotation_new_client_fingerprint();
+
+    for (group, leader, peer_id) in [
+        (&source, source_leader, "rotation-target-ha"),
+        (&target, target_leader, "rotation-source-ha"),
+    ] {
+        let now = chrono::Utc::now().timestamp_millis();
+        let result = group
+            .node(leader)
+            .propose(Command::UpsertFederatedCluster {
+                cluster: FederatedCluster {
+                    cluster_id: peer_id.into(),
+                    endpoint: "https://127.0.0.1:1".into(),
+                    identity_fingerprint: old_fingerprint.clone(),
+                    previous_identity_fingerprint: None,
+                    previous_identity_expires_at_ms: None,
+                    pending_identity_fingerprint: None,
+                    rotation_started_at_ms: None,
+                    pending_rotation_grace_period_ms: None,
+                    version: env!("CARGO_PKG_VERSION").into(),
+                    capabilities: BTreeSet::new(),
+                    status: FederatedClusterStatus::Healthy,
+                    last_seen_at_ms: now,
+                    updated_at_ms: now,
+                },
+                request_id: format!("register:{peer_id}"),
+                actor: "rotation-ha-e2e".into(),
+            })
+            .await
+            .unwrap();
+        assert!(result.success, "{}", result.message);
+    }
+
+    let tls = ServerTlsConfig::new()
+        .identity(Identity::from_pem(
+            ROTATION_SERVER_CERT,
+            ROTATION_SERVER_KEY,
+        ))
+        .client_ca_root(Certificate::from_pem(ROTATION_CA));
+    let source_service = Arc::new(RwLock::new(TaskServiceImpl {
+        task_store: source.task_store(source_leader),
+        raft_node: Some(Arc::new(source.node(source_leader).clone())),
+    }));
+    let target_service = Arc::new(RwLock::new(TaskServiceImpl {
+        task_store: target.task_store(target_leader),
+        raft_node: Some(Arc::new(target.node(target_leader).clone())),
+    }));
+    let source_faults = AckFaults::default();
+    let target_faults = AckFaults::default();
+    let source_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let source_backend = source_listener.local_addr().unwrap().to_string();
+    let target_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let target_backend = target_listener.local_addr().unwrap().to_string();
+    let source_shutdown = ShutdownToken::new();
+    let target_shutdown = ShutdownToken::new();
+    let source_server_shutdown = source_shutdown.clone();
+    let target_server_shutdown = target_shutdown.clone();
+    let source_server_service = source_service.clone();
+    let target_server_service = target_service.clone();
+    let source_server_faults = source_faults.clone();
+    let target_server_faults = target_faults.clone();
+    let source_tls = tls.clone();
+    let source_server = tokio::spawn(async move {
+        Server::builder()
+            .layer(DropFederationAckLayer(source_server_faults))
+            .tls_config(source_tls)
+            .unwrap()
+            .add_service(task::task_service_server::TaskServiceServer::new(
+                source_server_service,
+            ))
+            .serve_with_incoming_shutdown(
+                tokio_stream::wrappers::TcpListenerStream::new(source_listener),
+                source_server_shutdown.cancelled_owned(),
+            )
+            .await
+            .unwrap();
+    });
+    let target_server = tokio::spawn(async move {
+        Server::builder()
+            .layer(DropFederationAckLayer(target_server_faults))
+            .tls_config(tls)
+            .unwrap()
+            .add_service(task::task_service_server::TaskServiceServer::new(
+                target_server_service,
+            ))
+            .serve_with_incoming_shutdown(
+                tokio_stream::wrappers::TcpListenerStream::new(target_listener),
+                target_server_shutdown.cancelled_owned(),
+            )
+            .await
+            .unwrap();
+    });
+    let source_proxy = TcpFaultProxy::start(source_backend).await;
+    let target_proxy = TcpFaultProxy::start(target_backend).await;
+    let source_endpoint = source_proxy.endpoint.clone();
+    let target_endpoint = target_proxy.endpoint.clone();
+
+    let directory = tempfile::tempdir().unwrap();
+    let write = |name: &str, bytes: &[u8]| {
+        let path = directory.path().join(name);
+        std::fs::write(&path, bytes).unwrap();
+        path
+    };
+    let ca = write("ca.pem", ROTATION_CA);
+    let old_cert = write("old-client.pem", ROTATION_OLD_CLIENT_CERT);
+    let old_key = write("old-client.key.pem", ROTATION_OLD_CLIENT_KEY);
+    let new_cert = write("new-client.pem", ROTATION_NEW_CLIENT_CERT);
+    let new_key = write("new-client.key.pem", ROTATION_NEW_CLIENT_KEY);
+
+    // Both independent clusters stage the peer's replacement leaf certificate
+    // using the currently trusted identity. A lost Stage response is retried
+    // with the same request ID and must not create a second transition.
+    let mut old_to_target =
+        crate::comms::client::GrpcClient::connect_mtls(&target_endpoint, &ca, &old_cert, &old_key)
+            .await
+            .unwrap();
+    target_faults.rotation_stage.store(true, Ordering::SeqCst);
+    assert!(
+        old_to_target
+            .stage_federated_certificate_rotation(
+                "rotation-source-ha",
+                &new_fingerprint,
+                "target-stage-ha",
+                120_000,
+            )
+            .await
+            .is_err()
+    );
+    assert!(target_faults.rotation_stage_dropped.load(Ordering::SeqCst));
+    let staged_target = old_to_target
+        .stage_federated_certificate_rotation(
+            "rotation-source-ha",
+            &new_fingerprint,
+            "target-stage-ha",
+            120_000,
+        )
+        .await
+        .unwrap();
+    assert!(staged_target.accepted, "{}", staged_target.message);
+
+    let mut old_to_source =
+        crate::comms::client::GrpcClient::connect_mtls(&source_endpoint, &ca, &old_cert, &old_key)
+            .await
+            .unwrap();
+    let staged_source = old_to_source
+        .stage_federated_certificate_rotation(
+            "rotation-target-ha",
+            &new_fingerprint,
+            "source-stage-ha",
+            120_000,
+        )
+        .await
+        .unwrap();
+    assert!(staged_source.accepted, "{}", staged_source.message);
+
+    // Break both inter-cluster TCP paths while each side elects a new Raft
+    // leader. The registry must remain locally durable and no proof can pass
+    // until the independent links are restored.
+    source_proxy.set_partitioned(true);
+    target_proxy.set_partitioned(true);
+
+    // Stop each current leader while the staged state is durable, elect new
+    // leaders independently, then restart the old leaders from their Raft logs.
+    source.stop(source_leader).await;
+    target.stop(target_leader).await;
+    let source_leader_2 = source.wait_for_leader(Some(source_leader)).await;
+    let target_leader_2 = target.wait_for_leader(Some(target_leader)).await;
+    *source_service.write().await = TaskServiceImpl {
+        task_store: source.task_store(source_leader_2),
+        raft_node: Some(Arc::new(source.node(source_leader_2).clone())),
+    };
+    *target_service.write().await = TaskServiceImpl {
+        task_store: target.task_store(target_leader_2),
+        raft_node: Some(Arc::new(target.node(target_leader_2).clone())),
+    };
+    source.restart(source_leader).await;
+    target.restart(target_leader).await;
+    source_proxy.set_partitioned(false);
+    target_proxy.set_partitioned(false);
+
+    for (group, peer_id) in [
+        (&source, "rotation-target-ha"),
+        (&target, "rotation-source-ha"),
+    ] {
+        for member in 0..3 {
+            let cluster = group
+                .task_store(member)
+                .get_federated_cluster(peer_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                cluster.pending_identity_fingerprint.as_deref(),
+                Some(new_fingerprint.as_str())
+            );
+            assert_eq!(cluster.identity_fingerprint, old_fingerprint);
+        }
+    }
+
+    // The new certificate proves possession against both clusters. On the
+    // target, deliberately lose the Proof response after the Raft commit.
+    let mut new_to_target =
+        crate::comms::client::GrpcClient::connect_mtls(&target_endpoint, &ca, &new_cert, &new_key)
+            .await
+            .unwrap();
+    target_faults.rotation_proof.store(true, Ordering::SeqCst);
+    assert!(
+        new_to_target
+            .prove_federated_certificate_rotation(
+                "rotation-source-ha",
+                &new_fingerprint,
+                "target-proof-ha",
+            )
+            .await
+            .is_err()
+    );
+    assert!(target_faults.rotation_proof_dropped.load(Ordering::SeqCst));
+    let committed_target = target
+        .task_store(target_leader_2)
+        .get_federated_cluster("rotation-source-ha")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(committed_target.identity_fingerprint, new_fingerprint);
+    let target_expiry = committed_target.previous_identity_expires_at_ms.unwrap();
+
+    // Restart the target leader after the commit but before the client sees an
+    // ACK. Retrying the exact proof request must return the original deadline.
+    target.stop(target_leader_2).await;
+    let target_leader_3 = target.wait_for_leader(Some(target_leader_2)).await;
+    *target_service.write().await = TaskServiceImpl {
+        task_store: target.task_store(target_leader_3),
+        raft_node: Some(Arc::new(target.node(target_leader_3).clone())),
+    };
+    target.restart(target_leader_2).await;
+    let replay_target = new_to_target
+        .prove_federated_certificate_rotation(
+            "rotation-source-ha",
+            &new_fingerprint,
+            "target-proof-ha",
+        )
+        .await
+        .unwrap();
+    assert!(replay_target.accepted, "{}", replay_target.message);
+    assert_eq!(
+        replay_target.previous_fingerprint_expires_at_ms,
+        target_expiry
+    );
+
+    let mut new_to_source =
+        crate::comms::client::GrpcClient::connect_mtls(&source_endpoint, &ca, &new_cert, &new_key)
+            .await
+            .unwrap();
+    let proved_source = new_to_source
+        .prove_federated_certificate_rotation(
+            "rotation-target-ha",
+            &new_fingerprint,
+            "source-proof-ha",
+        )
+        .await
+        .unwrap();
+    assert!(proved_source.accepted, "{}", proved_source.message);
+
+    // Verify both registries have converged on every replica. The previous
+    // fingerprint remains valid only until the committed deadline; pending
+    // state is cleared and replay cannot move that deadline forward.
+    for (group, peer_id) in [
+        (&source, "rotation-target-ha"),
+        (&target, "rotation-source-ha"),
+    ] {
+        for member in 0..3 {
+            let cluster = group
+                .task_store(member)
+                .get_federated_cluster(peer_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(cluster.identity_fingerprint, new_fingerprint);
+            assert_eq!(
+                cluster.previous_identity_fingerprint.as_deref(),
+                Some(old_fingerprint.as_str())
+            );
+            assert!(cluster.pending_identity_fingerprint.is_none());
+            assert!(cluster.previous_identity_expires_at_ms.is_some());
+            assert!(
+                cluster
+                    .accepts_fingerprint(&old_fingerprint, chrono::Utc::now().timestamp_millis())
+            );
+            assert!(
+                cluster
+                    .accepts_fingerprint(&new_fingerprint, chrono::Utc::now().timestamp_millis())
+            );
+            assert!(!cluster.accepts_fingerprint(
+                &old_fingerprint,
+                cluster.previous_identity_expires_at_ms.unwrap()
+            ));
+        }
+    }
+
+    // A late old-certificate request is still within the overlap TLS window,
+    // but cannot stage another rotation because it is no longer the active pin.
+    let late_old_stage = old_to_target
+        .stage_federated_certificate_rotation(
+            "rotation-source-ha",
+            &"d".repeat(64),
+            "old-cert-stale-stage",
+            120_000,
+        )
+        .await
+        .unwrap();
+    assert!(!late_old_stage.accepted);
+
+    source_shutdown.cancel();
+    target_shutdown.cancel();
+    source_proxy.task.abort();
+    target_proxy.task.abort();
+    source_server.await.unwrap();
+    target_server.await.unwrap();
+    source.shutdown_all().await;
+    target.shutdown_all().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
