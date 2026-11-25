@@ -1197,7 +1197,24 @@ async fn postgres_partitioned_outbox_uses_vector_checkpoints_and_cutover_barrier
     let final_vector = barrier.pause_and_capture_vector_watermark().await.unwrap();
     assert_eq!(final_vector, vector);
     for partition_id in 0..4u32 {
-        assert!(partitioned.begin_write(partition_id).await.is_err());
+        let mut paused_writer = partitioned.begin_write(partition_id).await.unwrap();
+        assert!(
+            paused_writer
+                .append_event(
+                    Uuid::new_v4(),
+                    "index",
+                    "paused-write",
+                    "partition-target",
+                    &json!({"paused":true})
+                )
+                .await
+                .is_err(),
+            "paused gates must reject append even when the transaction began before checking the gate"
+        );
+        assert!(
+            paused_writer.commit().await.is_err(),
+            "a rejected paused append must roll back the source transaction"
+        );
     }
     barrier.resume_partitioned_writes().await.unwrap();
     let replay_id = Uuid::new_v4();
