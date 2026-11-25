@@ -1233,6 +1233,82 @@ async fn postgres_partitioned_outbox_uses_vector_checkpoints_and_cutover_barrier
 }
 
 #[tokio::test]
+async fn postgres_partitioned_delayed_gate_lock_preserves_cutover_atomicity() {
+    let _test_guard = POSTGRES_OUTBOX_TEST_LOCK.lock().await;
+    let stream = format!("outbox-delayed-gate-{}", Uuid::new_v4());
+    let base = producer(&stream).await;
+    let partitioned = PostgresPartitionedOutbox::new(base.pool().clone(), &stream, 4).unwrap();
+    partitioned.migrate().await.unwrap();
+
+    // A source transaction that has not appended its Outbox event is not yet
+    // admitted by the gate. Cutover may pause first; the append must then fail
+    // and roll the source mutation back with the same PostgreSQL transaction.
+    let mut not_yet_admitted = partitioned.begin_write(0).await.unwrap();
+    sqlx::query("INSERT INTO dataspool_outbox_test_documents (stream_key, document_id, payload) VALUES ($1, $2, $3)")
+        .bind(&stream).bind("must-rollback").bind(json!({"value":1}))
+        .execute(not_yet_admitted.connection()).await.unwrap();
+    let mut barrier = partitioned.clone();
+    let empty_vector = barrier.pause_and_capture_vector_watermark().await.unwrap();
+    assert_eq!(empty_vector[&0], 0);
+    assert!(
+        not_yet_admitted
+            .append_event(
+                Uuid::new_v4(),
+                "index",
+                "must-rollback",
+                "target",
+                &json!({"value":1})
+            )
+            .await
+            .is_err()
+    );
+    assert!(not_yet_admitted.commit().await.is_err());
+    let (remaining,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM dataspool_outbox_test_documents WHERE stream_key = $1 AND document_id = 'must-rollback'")
+        .bind(&stream).fetch_one(base.pool()).await.unwrap();
+    assert_eq!(
+        remaining, 0,
+        "source mutation must roll back if cutover wins the gate race"
+    );
+
+    barrier.resume_partitioned_writes().await.unwrap();
+    let mut admitted = partitioned.begin_write(0).await.unwrap();
+    sqlx::query("INSERT INTO dataspool_outbox_test_documents (stream_key, document_id, payload) VALUES ($1, $2, $3)")
+        .bind(&stream).bind("must-commit").bind(json!({"value":2}))
+        .execute(admitted.connection()).await.unwrap();
+    admitted
+        .append_event(
+            Uuid::new_v4(),
+            "index",
+            "must-commit",
+            "target",
+            &json!({"value":2}),
+        )
+        .await
+        .unwrap();
+    let mut waiting_barrier = partitioned.clone();
+    let barrier_task = tokio::spawn(async move {
+        waiting_barrier
+            .pause_and_capture_vector_watermark()
+            .await
+            .unwrap()
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        !barrier_task.is_finished(),
+        "cutover must wait for an admitted transaction holding the gate"
+    );
+    admitted.commit().await.unwrap();
+    let final_vector = tokio::time::timeout(Duration::from_secs(5), barrier_task)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(final_vector[&0], 1);
+    let (committed,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM dataspool_outbox_test_documents WHERE stream_key = $1 AND document_id = 'must-commit'")
+        .bind(&stream).fetch_one(base.pool()).await.unwrap();
+    assert_eq!(committed, 1);
+}
+
+#[tokio::test]
 async fn postgres_partitioned_outbox_batch_is_idempotent_across_partitions() {
     let _test_guard = POSTGRES_OUTBOX_TEST_LOCK.lock().await;
     let stream = format!("outbox-partitioned-batch-{}", Uuid::new_v4());

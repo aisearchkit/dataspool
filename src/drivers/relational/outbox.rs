@@ -673,23 +673,6 @@ impl PostgresPartitionedOutbox {
             .begin()
             .await
             .map_err(|e| db_error("begin partitioned source write", e))?;
-        let row = sqlx::query(
-            "SELECT paused FROM dataspool_cdc_outbox_partition_gates WHERE stream_key = $1 AND partition_id = $2 FOR UPDATE",
-        ).bind(&self.stream_key).bind(partition_id as i32)
-            .fetch_one(&mut *transaction).await.map_err(|e| db_error("lock partitioned Outbox gate", e))?;
-        let paused: bool = row
-            .try_get("paused")
-            .map_err(|e| db_error("read partition pause state", e))?;
-        if paused {
-            transaction
-                .rollback()
-                .await
-                .map_err(|e| db_error("rollback paused partition write", e))?;
-            return Err(DatspoolError::Internal(format!(
-                "CDC stream '{}' partition {partition_id} is paused",
-                self.stream_key
-            )));
-        }
         sqlx::query("SELECT set_config('dataspool.outbox_stream_key', $1, TRUE)")
             .bind(&self.stream_key)
             .fetch_one(&mut *transaction)
@@ -699,6 +682,7 @@ impl PostgresPartitionedOutbox {
             transaction: Some(transaction),
             stream_key: self.stream_key.clone(),
             partition_id,
+            gate_locked: false,
             event_appended: false,
             failed: false,
         })
@@ -1064,11 +1048,39 @@ pub struct PostgresPartitionedOutboxWrite<'a> {
     transaction: Option<Transaction<'a, Postgres>>,
     stream_key: String,
     partition_id: u32,
+    gate_locked: bool,
     event_appended: bool,
     failed: bool,
 }
 
 impl PostgresPartitionedOutboxWrite<'_> {
+    async fn lock_write_gate(&mut self) -> Result<()> {
+        if self.gate_locked {
+            return Ok(());
+        }
+        let stream_key = self.stream_key.clone();
+        let partition_id = self.partition_id;
+        let row = sqlx::query(
+            "SELECT paused FROM dataspool_cdc_outbox_partition_gates WHERE stream_key = $1 AND partition_id = $2 FOR UPDATE",
+        )
+        .bind(&stream_key)
+        .bind(partition_id as i32)
+        .fetch_one(self.connection())
+        .await
+        .map_err(|e| db_error("lock partitioned Outbox gate", e))?;
+        let paused: bool = row
+            .try_get("paused")
+            .map_err(|e| db_error("read partition pause state", e))?;
+        if paused {
+            return Err(DatspoolError::Internal(format!(
+                "CDC stream '{}' partition {} is paused",
+                self.stream_key, self.partition_id
+            )));
+        }
+        self.gate_locked = true;
+        Ok(())
+    }
+
     pub fn connection(&mut self) -> &mut sqlx::PgConnection {
         self.transaction
             .as_mut()
@@ -1093,6 +1105,7 @@ impl PostgresPartitionedOutboxWrite<'_> {
         &mut self,
         events: &[PostgresOutboxEventInput],
     ) -> Result<Vec<u64>> {
+        self.lock_write_gate().await?;
         if events.is_empty() || events.len() > 5_000 {
             return Err(DatspoolError::Configuration(
                 "partitioned Outbox batches must contain 1..=5,000 events".into(),
@@ -1249,6 +1262,7 @@ impl PostgresPartitionedOutboxWrite<'_> {
         let stream_key = self.stream_key.clone();
         let partition_id = self.partition_id;
         let result = async {
+            self.lock_write_gate().await?;
             if !matches!(operation, "index" | "delete") || document_id.is_empty() || target_index.is_empty() || (operation == "index" && !document.is_object()) {
                 return Err(DatspoolError::Driver(DriverError::DataError("invalid partitioned Outbox event".into())));
             }
