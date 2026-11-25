@@ -7,6 +7,10 @@ use dataspool::drivers::relational::{
 };
 use dataspool::pipeline::{OffsetValue, Source};
 use serde_json::json;
+use std::sync::{
+    Arc,
+    atomic::{AtomicI64, Ordering},
+};
 use std::time::Duration;
 use uuid::Uuid;
 
@@ -111,13 +115,51 @@ async fn postgres_outbox_is_atomic_ordered_and_barrier_survives_restart() {
     let missing_event: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM dataspool_outbox_test_documents WHERE stream_key = $1 AND document_id = 'missing-event'")
         .bind(&stream).fetch_one(outbox.pool()).await.unwrap();
     assert_eq!(missing_event.0, 0);
+
+    // Kill a backend while a producer transaction is open. The failed
+    // transaction must not leak a source mutation or Outbox event, and the
+    // pool must establish a fresh connection for the next write.
+    let mut disconnected = outbox.begin_write().await.unwrap();
+    let backend_pid: (i32,) = sqlx::query_as("SELECT pg_backend_pid()")
+        .fetch_one(disconnected.connection())
+        .await
+        .unwrap();
+    let terminated: (bool,) = sqlx::query_as("SELECT pg_terminate_backend($1)")
+        .bind(backend_pid.0)
+        .fetch_one(outbox.pool())
+        .await
+        .unwrap();
+    assert!(
+        terminated.0,
+        "test must terminate the active producer backend"
+    );
+    assert!(
+        sqlx::query("SELECT 1")
+            .execute(disconnected.connection())
+            .await
+            .is_err()
+    );
+    drop(disconnected);
+    let mut after_disconnect = outbox.begin_write().await.unwrap();
+    let recovery_sequence = after_disconnect
+        .append_event(
+            Uuid::new_v4(),
+            "index",
+            "after-disconnect",
+            "target-index",
+            &json!({"recovered":true}),
+        )
+        .await
+        .unwrap();
+    after_disconnect.commit().await.unwrap();
+
     assert_eq!(
         outbox
             .read_after(first_sequence as i64, 100)
             .await
             .unwrap()
             .len(),
-        0
+        1
     );
     let mut cdc_source = PostgresOutboxSource::new(PostgresOutboxConfig {
         connection_env: "DATASPOOL_TEST_POSTGRES_URL".into(),
@@ -128,12 +170,12 @@ async fn postgres_outbox_is_atomic_ordered_and_barrier_survives_restart() {
         .read_batch(&OffsetValue::initial(), 100)
         .await
         .unwrap();
-    assert_eq!(batch.len(), 1);
+    assert_eq!(batch.len(), 2);
     assert_eq!(batch.records()[0].get_metadata("_op"), Some("index"));
     assert!(batch.records()[0].get_metadata("_cdc_event_id").is_some());
     assert_eq!(
         checkpoint,
-        OffsetValue::Custom(json!({"driver":"postgres_outbox","last_sequence":first_sequence}))
+        OffsetValue::Custom(json!({"driver":"postgres_outbox","last_sequence":recovery_sequence}))
     );
     cdc_source.close().await.unwrap();
 
@@ -171,7 +213,7 @@ async fn postgres_outbox_is_atomic_ordered_and_barrier_survives_restart() {
     assert_eq!(final_watermark, in_flight_sequence);
     assert_eq!(
         in_flight_sequence,
-        first_sequence + 1,
+        recovery_sequence + 1,
         "rolled-back Outbox writes must not consume a stream sequence"
     );
 
@@ -188,7 +230,7 @@ async fn postgres_outbox_is_atomic_ordered_and_barrier_survives_restart() {
         .read_after(first_sequence as i64 - 1, 100)
         .await
         .unwrap();
-    assert_eq!(events.len(), 2);
+    assert_eq!(events.len(), 3);
     assert!(
         events
             .windows(2)
@@ -216,26 +258,83 @@ async fn postgres_outbox_is_atomic_ordered_and_barrier_survives_restart() {
     resumed_writer.commit().await.unwrap();
     assert!(third_sequence > final_watermark);
 
-    // Concurrent producer transactions are serialized by the per-stream gate,
-    // so sequence order is also commit order and cannot skip an earlier event.
+    // Database trigger guard rejects direct source-table writes that bypass
+    // the producer API, while writes through begin_write are accepted.
+    sqlx::query("CREATE TABLE IF NOT EXISTS dataspool_outbox_guard_test (stream_key TEXT NOT NULL, document_id TEXT PRIMARY KEY, payload JSONB NOT NULL)")
+        .execute(outbox.pool()).await.unwrap();
+    outbox
+        .install_write_guard("public", "dataspool_outbox_guard_test")
+        .await
+        .unwrap();
+    let direct_write = sqlx::query("INSERT INTO dataspool_outbox_guard_test(stream_key, document_id, payload) VALUES ($1, 'bypass', '{}'::jsonb)")
+        .bind(&stream).execute(outbox.pool()).await;
+    assert!(
+        direct_write.is_err(),
+        "direct DML must be rejected by the installed trigger"
+    );
+    let mut guarded = outbox.begin_write().await.unwrap();
+    sqlx::query("INSERT INTO dataspool_outbox_guard_test(stream_key, document_id, payload) VALUES ($1, 'guarded', '{}'::jsonb)")
+        .bind(&stream).execute(guarded.connection()).await.unwrap();
+    guarded
+        .append_event(
+            Uuid::new_v4(),
+            "index",
+            "guarded",
+            "target-index",
+            &json!({}),
+        )
+        .await
+        .unwrap();
+    guarded.commit().await.unwrap();
+
+    // Concurrent producer transactions are serialized by the per-stream gate.
+    // Record real throughput and latency instead of asserting a machine-specific
+    // performance threshold; the output is the CI baseline for capacity work.
+    let deadlocks_before: (i64,) =
+        sqlx::query_as("SELECT deadlocks FROM pg_stat_database WHERE datname = current_database()")
+            .fetch_one(outbox.pool())
+            .await
+            .unwrap();
+    let monitor_pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&database_url())
+        .await
+        .unwrap();
+    let max_lock_wait_sessions = Arc::new(AtomicI64::new(0));
+    let monitor_max = max_lock_wait_sessions.clone();
+    let monitor = tokio::spawn(async move {
+        for _ in 0..120 {
+            let (waiting,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock'")
+                .fetch_one(&monitor_pool).await.unwrap();
+            monitor_max.fetch_max(waiting, Ordering::Relaxed);
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        monitor_pool.close().await;
+    });
+    let started = std::time::Instant::now();
     let mut tasks = Vec::new();
-    for index in 0..8 {
+    for index in 0..32 {
         let producer = resumed.clone();
         let stream_key = stream.clone();
         tasks.push(tokio::spawn(async move {
             let id = format!("concurrent-{index}");
+            let transaction_started = std::time::Instant::now();
             let mut writer = producer.begin_write().await.unwrap();
+            sqlx::query("SELECT pg_sleep(0.005)").execute(writer.connection()).await.unwrap();
             sqlx::query("INSERT INTO dataspool_outbox_test_documents (stream_key, document_id, payload) VALUES ($1, $2, $3)")
                 .bind(&stream_key).bind(&id).bind(json!({"value":index}))
                 .execute(writer.connection()).await.unwrap();
             let sequence = writer.append_event(Uuid::new_v4(), "index", &id, "target-index", &json!({"value":index})).await.unwrap();
             writer.commit().await.unwrap();
-            sequence
+            (sequence, transaction_started.elapsed())
         }));
     }
     let mut concurrent_sequences = Vec::new();
+    let mut transaction_latencies = Vec::new();
     for task in tasks {
-        concurrent_sequences.push(task.await.unwrap());
+        let (sequence, latency) = task.await.unwrap();
+        concurrent_sequences.push(sequence);
+        transaction_latencies.push(latency);
     }
     concurrent_sequences.sort_unstable();
     assert!(
@@ -243,7 +342,99 @@ async fn postgres_outbox_is_atomic_ordered_and_barrier_survives_restart() {
             .windows(2)
             .all(|pair| pair[0] < pair[1])
     );
+    monitor.await.unwrap();
+    transaction_latencies.sort_unstable();
+    let percentile = |percent: usize| {
+        transaction_latencies
+            [(transaction_latencies.len() * percent / 100).min(transaction_latencies.len() - 1)]
+    };
+    let p50 = percentile(50);
+    let p95 = percentile(95);
+    let p99 = percentile(99);
+    let elapsed = started.elapsed();
+    let deadlocks_after: (i64,) =
+        sqlx::query_as("SELECT deadlocks FROM pg_stat_database WHERE datname = current_database()")
+            .fetch_one(outbox.pool())
+            .await
+            .unwrap();
+    let max_lock_waits = max_lock_wait_sessions.load(Ordering::Relaxed);
+    println!(
+        "POSTGRES_OUTBOX_LOAD stream={} writers=32 elapsed_ms={} throughput_ops_s={:.1} p50_transaction_ms={} p95_transaction_ms={} p99_transaction_ms={} deadlocks_delta={} max_sampled_lock_wait_sessions={}",
+        stream,
+        elapsed.as_millis(),
+        32.0 / elapsed.as_secs_f64(),
+        p50.as_millis(),
+        p95.as_millis(),
+        p99.as_millis(),
+        deadlocks_after.0 - deadlocks_before.0,
+        max_lock_waits
+    );
 
+    // Retention is coordinated with all registered consumers. No consumer
+    // checkpoint may be skipped, and a lagging consumer pins the safe watermark.
+    let consumer_a = format!("consumer-a-{stream}");
+    let consumer_b = format!("consumer-b-{stream}");
+    outbox.register_consumer(&consumer_a).await.unwrap();
+    outbox.register_consumer(&consumer_b).await.unwrap();
+    assert_eq!(
+        outbox.prune_consumed_events().await.unwrap(),
+        0,
+        "unstarted consumer pins the log at zero"
+    );
+    let highest = outbox.watermark().await.unwrap();
+    assert!(
+        outbox
+            .record_consumer_checkpoint(&consumer_a, highest + 1)
+            .await
+            .is_err(),
+        "a consumer cannot checkpoint beyond the committed stream watermark"
+    );
+    outbox
+        .record_consumer_checkpoint(&consumer_a, highest)
+        .await
+        .unwrap();
+    outbox
+        .record_consumer_checkpoint(&consumer_b, 5)
+        .await
+        .unwrap();
+    assert!(
+        outbox
+            .record_consumer_checkpoint(&consumer_b, 4)
+            .await
+            .is_err(),
+        "consumer checkpoints must be monotonic"
+    );
+    let pruned = outbox.prune_consumed_events().await.unwrap();
+    assert_eq!(
+        pruned, 5,
+        "only events through the slowest consumer checkpoint can be pruned"
+    );
+    assert_eq!(
+        outbox.watermark().await.unwrap(),
+        highest,
+        "pruning must not rewind the durable sequence watermark"
+    );
+    let remaining = outbox.read_after(0, 100).await.unwrap();
+    assert!(remaining.iter().all(|event| event.sequence > 5));
+    outbox
+        .record_consumer_checkpoint(&consumer_b, highest)
+        .await
+        .unwrap();
+    let remaining_pruned = outbox.prune_consumed_events().await.unwrap();
+    assert_eq!(remaining_pruned, highest as u64 - 5);
+    assert!(outbox.read_after(0, 100).await.unwrap().is_empty());
+
+    sqlx::query("DELETE FROM dataspool_cdc_outbox_consumers WHERE stream_key = $1")
+        .bind(&stream)
+        .execute(outbox.pool())
+        .await
+        .unwrap();
+    sqlx::query("DROP TRIGGER IF EXISTS dataspool_outbox_guard_dataspool_outbox_guard_test ON public.dataspool_outbox_guard_test")
+        .execute(outbox.pool()).await.unwrap();
+    sqlx::query("DELETE FROM dataspool_outbox_guard_test WHERE document_id = 'guarded'")
+        .execute(outbox.pool())
+        .await
+        .unwrap();
     sqlx::query("DELETE FROM dataspool_outbox_test_documents WHERE stream_key = $1")
         .bind(&stream)
         .execute(outbox.pool())

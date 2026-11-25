@@ -85,6 +85,17 @@ impl PostgresTransactionalOutbox {
         .map_err(|error| db_error("create Outbox events", error))?;
         sqlx::query("INSERT INTO dataspool_cdc_outbox_gate (stream_key) VALUES ($1) ON CONFLICT (stream_key) DO NOTHING")
             .bind(&self.stream_key).execute(&self.pool).await.map_err(|error| db_error("initialize Outbox gate", error))?;
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS dataspool_cdc_outbox_consumers (\
+                stream_key TEXT NOT NULL REFERENCES dataspool_cdc_outbox_gate(stream_key),\
+                consumer_key TEXT NOT NULL, last_sequence BIGINT NOT NULL DEFAULT 0,\
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),\
+                PRIMARY KEY (stream_key, consumer_key)\
+            )",
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|error| db_error("create Outbox consumer checkpoints", error))?;
         Ok(())
     }
 
@@ -118,6 +129,11 @@ impl PostgresTransactionalOutbox {
                 self.stream_key
             )));
         }
+        sqlx::query("SELECT set_config('dataspool.outbox_stream_key', $1, TRUE)")
+            .bind(&self.stream_key)
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(|error| db_error("authorize guarded source writes", error))?;
         Ok(PostgresOutboxWrite {
             transaction: Some(transaction),
             stream_key: self.stream_key.clone(),
@@ -169,6 +185,173 @@ impl PostgresTransactionalOutbox {
             .map_err(|error| db_error("decode Outbox watermark", error))?;
         u64::try_from(watermark)
             .map_err(|_| DatspoolError::Internal("negative PostgreSQL Outbox watermark".into()))
+    }
+
+    /// Install a trigger that rejects direct DML unless the transaction was
+    /// opened through `begin_write()` for this stream. Run as the table owner.
+    /// The application role must not own the protected table or have privileges
+    /// to disable/drop triggers.
+    pub async fn install_write_guard(&self, schema: &str, table: &str) -> Result<()> {
+        fn ident(value: &str) -> Result<String> {
+            if value.is_empty() || value.contains('\0') {
+                return Err(DatspoolError::Configuration(
+                    "invalid PostgreSQL identifier".into(),
+                ));
+            }
+            Ok(format!("\"{}\"", value.replace('\"', "\"\"")))
+        }
+        let schema_ident = ident(schema)?;
+        let table_ident = ident(table)?;
+        let trigger_ident = ident(&format!("dataspool_outbox_guard_{}", table))?;
+        sqlx::query(
+            "CREATE OR REPLACE FUNCTION public.dataspool_require_outbox_write() RETURNS trigger\
+             LANGUAGE plpgsql SECURITY INVOKER AS $$\
+             BEGIN\
+               IF current_setting('dataspool.outbox_stream_key', TRUE) IS DISTINCT FROM TG_ARGV[0] THEN\
+                 RAISE EXCEPTION 'source table write requires Dataspool transactional Outbox stream %', TG_ARGV[0]\
+                   USING ERRCODE = '42501';\
+               END IF;\
+               IF TG_OP = 'DELETE' THEN RETURN OLD; ELSE RETURN NEW; END IF;\
+             END; $$",
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|error| db_error("create Outbox write guard function", error))?;
+        let ddl = format!(
+            "DROP TRIGGER IF EXISTS {trigger_ident} ON {schema_ident}.{table_ident};\
+             CREATE TRIGGER {trigger_ident} BEFORE INSERT OR UPDATE OR DELETE ON {schema_ident}.{table_ident}\
+             FOR EACH ROW EXECUTE FUNCTION public.dataspool_require_outbox_write('{}')",
+            self.stream_key.replace('\'', "''")
+        );
+        sqlx::raw_sql(&ddl)
+            .execute(&self.pool)
+            .await
+            .map_err(|error| db_error("install Outbox source write guard", error))?;
+        Ok(())
+    }
+
+    /// Register a consumer before it starts reading. A new consumer begins at
+    /// sequence zero so pruning cannot discard its backlog.
+    pub async fn register_consumer(&self, consumer_key: &str) -> Result<()> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| db_error("begin consumer registration", e))?;
+        sqlx::query(
+            "SELECT stream_key FROM dataspool_cdc_outbox_gate WHERE stream_key = $1 FOR UPDATE",
+        )
+        .bind(&self.stream_key)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| db_error("lock stream for consumer registration", e))?;
+        sqlx::query("INSERT INTO dataspool_cdc_outbox_consumers (stream_key, consumer_key, last_sequence) VALUES ($1, $2, 0) ON CONFLICT (stream_key, consumer_key) DO NOTHING")
+            .bind(&self.stream_key).bind(consumer_key).execute(&mut *tx).await.map_err(|e| db_error("register Outbox consumer", e))?;
+        tx.commit()
+            .await
+            .map_err(|e| db_error("commit consumer registration", e))
+    }
+
+    /// Persist a monotonic consumer checkpoint. Registration is explicit to
+    /// prevent an untracked consumer from silently falling behind retention.
+    pub async fn record_consumer_checkpoint(
+        &self,
+        consumer_key: &str,
+        sequence: u64,
+    ) -> Result<()> {
+        let sequence = i64::try_from(sequence).map_err(|_| {
+            DatspoolError::Internal("consumer checkpoint exceeds PostgreSQL BIGINT".into())
+        })?;
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| db_error("begin consumer checkpoint", e))?;
+        let gate = sqlx::query(
+            "SELECT last_sequence FROM dataspool_cdc_outbox_gate WHERE stream_key = $1 FOR UPDATE",
+        )
+        .bind(&self.stream_key)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| db_error("lock stream for checkpoint", e))?;
+        let committed_watermark: i64 = gate
+            .try_get("last_sequence")
+            .map_err(|e| db_error("decode committed Outbox watermark", e))?;
+        if sequence > committed_watermark {
+            tx.rollback()
+                .await
+                .map_err(|e| db_error("rollback checkpoint beyond Outbox watermark", e))?;
+            return Err(DatspoolError::Internal(format!(
+                "consumer checkpoint {sequence} exceeds committed Outbox watermark {committed_watermark}"
+            )));
+        }
+        let current = sqlx::query("SELECT last_sequence FROM dataspool_cdc_outbox_consumers WHERE stream_key = $1 AND consumer_key = $2 FOR UPDATE")
+            .bind(&self.stream_key).bind(consumer_key).fetch_optional(&mut *tx).await.map_err(|e| db_error("read consumer checkpoint", e))?;
+        let Some(current) = current else {
+            tx.rollback()
+                .await
+                .map_err(|e| db_error("rollback unregistered consumer checkpoint", e))?;
+            return Err(DatspoolError::Configuration(format!(
+                "Outbox consumer '{consumer_key}' is not registered"
+            )));
+        };
+        let previous: i64 = current
+            .try_get("last_sequence")
+            .map_err(|e| db_error("decode consumer checkpoint", e))?;
+        if sequence < previous {
+            tx.rollback()
+                .await
+                .map_err(|e| db_error("rollback regressing consumer checkpoint", e))?;
+            return Err(DatspoolError::Internal(format!(
+                "consumer checkpoint regression: {sequence} < {previous}"
+            )));
+        }
+        sqlx::query("UPDATE dataspool_cdc_outbox_consumers SET last_sequence = $3, updated_at = clock_timestamp() WHERE stream_key = $1 AND consumer_key = $2")
+            .bind(&self.stream_key).bind(consumer_key).bind(sequence).execute(&mut *tx).await.map_err(|e| db_error("advance consumer checkpoint", e))?;
+        tx.commit()
+            .await
+            .map_err(|e| db_error("commit consumer checkpoint", e))
+    }
+
+    /// Delete only events at or below the slowest registered consumer's
+    /// checkpoint. With no registered consumers, nothing is eligible.
+    pub async fn prune_consumed_events(&self) -> Result<u64> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| db_error("begin safe Outbox pruning", e))?;
+        sqlx::query(
+            "SELECT stream_key FROM dataspool_cdc_outbox_gate WHERE stream_key = $1 FOR UPDATE",
+        )
+        .bind(&self.stream_key)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| db_error("lock stream for Outbox pruning", e))?;
+        let minimum = sqlx::query("SELECT MIN(last_sequence) AS minimum FROM dataspool_cdc_outbox_consumers WHERE stream_key = $1")
+            .bind(&self.stream_key).fetch_one(&mut *tx).await.map_err(|e| db_error("read minimum consumer checkpoint", e))?;
+        let Some(watermark) = minimum
+            .try_get::<Option<i64>, _>("minimum")
+            .map_err(|e| db_error("decode minimum consumer checkpoint", e))?
+        else {
+            tx.rollback()
+                .await
+                .map_err(|e| db_error("rollback pruning without consumers", e))?;
+            return Ok(0);
+        };
+        let deleted = sqlx::query(
+            "DELETE FROM dataspool_cdc_outbox WHERE stream_key = $1 AND sequence <= $2",
+        )
+        .bind(&self.stream_key)
+        .bind(watermark)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| db_error("prune consumed Outbox events", e))?
+        .rows_affected();
+        tx.commit()
+            .await
+            .map_err(|e| db_error("commit safe Outbox pruning", e))?;
+        Ok(deleted)
     }
 
     pub async fn is_paused(&self) -> Result<bool> {

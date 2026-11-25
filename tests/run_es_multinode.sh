@@ -21,13 +21,24 @@ TARGET_CONTAINER="dataspool-e2e-target-${VERSION}"
 export ES_WORKER_TARGET_URL="http://127.0.0.1:19402"
 export ES_CDC_SOURCE_URL="${ES_CDC_SOURCE_URL:-${ES_7102_URL:-${ES_717_URL:-${ES_8X_URL:-${ES_9X_URL:-}}}}}"
 export ES_CDC_TARGET_URL="$ES_WORKER_TARGET_URL"
+POSTGRES_CONTAINER="dataspool-e2e-postgres-${VERSION}"
+export DATASPOOL_TEST_POSTGRES_URL="${DATASPOOL_TEST_POSTGRES_URL:-postgres://postgres:postgres@127.0.0.1:15432/dataspool_test}"
 cleanup() {
-  docker rm -f "$TARGET_CONTAINER" >/dev/null 2>&1 || true
+  docker rm -f "$TARGET_CONTAINER" "$POSTGRES_CONTAINER" >/dev/null 2>&1 || true
   "${COMPOSE[@]}" down -v
 }
 trap cleanup EXIT
 sudo sysctl -w vm.max_map_count=262144
 "${COMPOSE[@]}" up -d --wait
+docker rm -f "$POSTGRES_CONTAINER" >/dev/null 2>&1 || true
+docker run -d --name "$POSTGRES_CONTAINER" -p 15432:5432 \
+  -e POSTGRES_USER=postgres -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=dataspool_test \
+  postgres:16 >/dev/null
+for attempt in $(seq 1 60); do
+  if docker exec "$POSTGRES_CONTAINER" pg_isready -U postgres -d dataspool_test >/dev/null 2>&1; then break; fi
+  if [ "$attempt" -eq 60 ]; then docker logs "$POSTGRES_CONTAINER"; exit 1; fi
+  sleep 1
+done
 docker rm -f "$TARGET_CONTAINER" >/dev/null 2>&1 || true
 docker run -d --name "$TARGET_CONTAINER" -p 19402:9200 \
   -e discovery.type=single-node -e xpack.security.enabled=false \

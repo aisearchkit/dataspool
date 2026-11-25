@@ -5,8 +5,14 @@
 #![cfg(feature = "test-fault-injection")]
 
 use dataspool::agent::ShardClaimer;
-use dataspool::drivers::document::{CdcConfig, DocumentConfig, ElasticsearchCdcSource};
+use dataspool::drivers::document::{
+    CdcConfig, CdcCutoverConfig, CdcRaftFence, DocumentConfig, ElasticsearchCdcSource,
+    cutover_with_raft,
+};
 use dataspool::drivers::factory::{SinkConfig, SourceConfig};
+use dataspool::drivers::relational::{
+    PostgresOutboxConfig, PostgresOutboxSource, PostgresTransactionalOutbox,
+};
 use dataspool::pipeline::{OffsetValue, Source};
 use dataspool::raft::{Command, RaftNode, raft_config};
 use dataspool::storage::RocksDbStore;
@@ -134,6 +140,76 @@ async fn apply_cdc_batch(
     }
 }
 
+async fn apply_postgres_outbox_batch(
+    target_url: &str,
+    stream_key: &str,
+    marker: Option<&std::path::Path>,
+) -> OffsetValue {
+    let mut source = PostgresOutboxSource::new(PostgresOutboxConfig {
+        connection_env: "DATASPOOL_TEST_POSTGRES_URL".into(),
+        stream_key: stream_key.to_string(),
+    });
+    source.connect().await.unwrap();
+    let (batch, checkpoint) = source
+        .read_batch(&OffsetValue::initial(), 100)
+        .await
+        .unwrap();
+    assert_eq!(
+        batch.len(),
+        1,
+        "PostgreSQL Outbox crash E2E expects one event"
+    );
+    let record = batch.records().first().unwrap();
+    let event_id = record.get_metadata("_cdc_event_id").unwrap();
+    let document_id = record.id.as_deref().unwrap();
+    let target_index = record.get_metadata("_target_index").unwrap();
+    assert_eq!(record.get_metadata("_op"), Some("index"));
+    let value = record.payload["value"].as_i64().unwrap();
+    let bulk = format!(
+        "{}\n{}\n",
+        serde_json::to_string(&json!({"update":{"_index":target_index,"_id":document_id}})).unwrap(),
+        serde_json::to_string(&json!({
+            "script": {
+                "lang": "painless",
+                "source": "if (ctx._source.applied_events == null) { ctx._source.applied_events = []; } if (!ctx._source.applied_events.contains(params.event_id)) { ctx._source.applied_events.add(params.event_id); ctx._source.effect_count = (ctx._source.effect_count == null ? 0 : ctx._source.effect_count) + 1; ctx._source.value = params.value; }",
+                "params": {"event_id":event_id,"value":value}
+            },
+            "upsert": {"applied_events":[],"effect_count":0,"value":value},
+            "scripted_upsert": true
+        })).unwrap()
+    );
+    let response = reqwest::Client::new()
+        .post(format!("{target_url}/_bulk"))
+        .header("content-type", "application/x-ndjson")
+        .body(bulk)
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    let body: Value = response.json().await.unwrap();
+    assert!(
+        status.is_success(),
+        "PostgreSQL CDC target Bulk failed: {body}"
+    );
+    assert_eq!(
+        body["errors"], false,
+        "PostgreSQL CDC target item failed: {body}"
+    );
+    source.close().await.unwrap();
+    if let Some(marker) = marker {
+        let sequence = match &checkpoint {
+            OffsetValue::Custom(value) => value["last_sequence"].as_u64().unwrap(),
+            _ => panic!("PostgreSQL Outbox returned a non-custom checkpoint"),
+        };
+        std::fs::write(
+            marker,
+            serde_json::to_vec(&json!({"last_sequence":sequence})).unwrap(),
+        )
+        .unwrap();
+    }
+    checkpoint
+}
+
 async fn run_worker_process(phase: &str) {
     let source = env_required("DATASPOOL_CDC_FAILOVER_SOURCE");
     let target = env_required("DATASPOOL_CDC_FAILOVER_TARGET");
@@ -196,15 +272,13 @@ async fn run_worker_process(phase: &str) {
             .unwrap(),
         )
         .unwrap();
-        apply_cdc_batch(
-            &source,
-            &target,
-            &outbox,
-            Some(std::path::Path::new(&env_required(
-                "DATASPOOL_CDC_FAILOVER_BULK_MARKER",
-            ))),
-        )
-        .await;
+        let marker_path = env_required("DATASPOOL_CDC_FAILOVER_BULK_MARKER");
+        let marker = Some(std::path::Path::new(&marker_path));
+        if std::env::var("DATASPOOL_TEST_POSTGRES_URL").is_ok() {
+            apply_postgres_outbox_batch(&target, &outbox, marker).await;
+        } else {
+            apply_cdc_batch(&source, &target, &outbox, marker).await;
+        }
         loop {
             tokio::time::sleep(Duration::from_secs(60)).await;
         }
@@ -218,7 +292,17 @@ async fn run_worker_process(phase: &str) {
         lease.fencing_token > first["fencing_token"].as_u64().unwrap(),
         "restarted worker must claim a higher fencing generation"
     );
-    let watermark = apply_cdc_batch(&source, &target, &outbox, None).await;
+    let postgres_mode = std::env::var("DATASPOOL_TEST_POSTGRES_URL").is_ok();
+    let checkpoint = if postgres_mode {
+        apply_postgres_outbox_batch(&target, &outbox, None).await
+    } else {
+        let watermark = apply_cdc_batch(&source, &target, &outbox, None).await;
+        OffsetValue::Custom(json!({"driver":"elasticsearch_cdc","last_sequence":watermark}))
+    };
+    let watermark = match &checkpoint {
+        OffsetValue::Custom(value) => value["last_sequence"].as_u64().unwrap(),
+        _ => panic!("CDC recovery returned an unsupported checkpoint"),
+    };
     let progress = node
         .propose(Command::UpdateShardProgress {
             shard_id: lease.shard_id.to_string(),
@@ -227,10 +311,7 @@ async fn run_worker_process(phase: &str) {
             issued_at_ms: chrono::Utc::now().timestamp_millis(),
             processed_records: 1,
             processed_bytes: 0,
-            offset: serde_json::to_string(&OffsetValue::Custom(
-                json!({"driver":"elasticsearch_cdc","last_sequence":watermark}),
-            ))
-            .unwrap(),
+            offset: serde_json::to_string(&checkpoint).unwrap(),
             batch_id: None,
         })
         .await
@@ -260,40 +341,80 @@ async fn run_worker_process(phase: &str) {
     let old_index = env_required("DATASPOOL_CDC_FAILOVER_OLD_INDEX");
     let new_index = env_required("DATASPOOL_CDC_FAILOVER_NEW_INDEX");
     let http = reqwest::Client::new();
-    let switched = http
-        .post(format!("{target}/_aliases"))
-        .json(&json!({"actions":[
-            {"remove":{"index":old_index,"alias":alias}},
-            {"add":{"index":new_index,"alias":alias}}
-        ]}))
-        .send()
-        .await
-        .unwrap();
-    assert!(
-        switched.status().is_success(),
-        "alias switch failed: {}",
-        switched.text().await.unwrap_or_default()
-    );
-    let cutover = node
-        .propose(Command::RecordCdcCutover {
+    if postgres_mode {
+        let database_url = env_required("DATASPOOL_TEST_POSTGRES_URL");
+        let mut barrier = PostgresTransactionalOutbox::connect(&database_url, &outbox)
+            .await
+            .unwrap();
+        let config = CdcCutoverConfig {
+            target_base_url: target.clone(),
+            alias: alias.clone(),
+            old_index: Some(old_index.clone()),
+            new_index: new_index.clone(),
+            timeout: Duration::from_secs(10),
+        };
+        let fence = CdcRaftFence {
             task_id: task_id.to_string(),
-            alias,
-            old_index: Some(old_index),
-            new_index,
-            final_watermark: watermark,
-            applied_watermark: watermark,
-            fencing_shard_id: lease.shard_id.to_string(),
+            shard_id: lease.shard_id.to_string(),
             node_id: lease.node_id.to_string(),
             fencing_token: lease.fencing_token,
-            issued_at_ms: chrono::Utc::now().timestamp_millis(),
+        };
+        let checkpoint_store = store.clone();
+        let checkpoint_shard = lease.shard_id;
+        let result = cutover_with_raft(&http, &node, &config, &fence, &mut barrier, move || {
+            let store = checkpoint_store.clone();
+            async move {
+                let shard = store.get_shard(&checkpoint_shard).await?.unwrap();
+                match shard.offset {
+                    OffsetValue::Custom(value)
+                        if value["driver"].as_str() == Some("postgres_outbox") =>
+                    {
+                        Ok(value["last_sequence"].as_u64().unwrap_or(0))
+                    }
+                    _ => Ok(0),
+                }
+            }
         })
         .await
         .unwrap();
-    assert!(
-        cutover.success,
-        "Raft CDC cutover record failed: {}",
-        cutover.message
-    );
+        assert_eq!(result.final_watermark, watermark);
+        assert_eq!(result.applied_watermark, watermark);
+    } else {
+        let switched = http
+            .post(format!("{target}/_aliases"))
+            .json(&json!({"actions":[
+                {"remove":{"index":old_index,"alias":alias}},
+                {"add":{"index":new_index,"alias":alias}}
+            ]}))
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            switched.status().is_success(),
+            "alias switch failed: {}",
+            switched.text().await.unwrap_or_default()
+        );
+        let cutover = node
+            .propose(Command::RecordCdcCutover {
+                task_id: task_id.to_string(),
+                alias,
+                old_index: Some(old_index),
+                new_index,
+                final_watermark: watermark,
+                applied_watermark: watermark,
+                fencing_shard_id: lease.shard_id.to_string(),
+                node_id: lease.node_id.to_string(),
+                fencing_token: lease.fencing_token,
+                issued_at_ms: chrono::Utc::now().timestamp_millis(),
+            })
+            .await
+            .unwrap();
+        assert!(
+            cutover.success,
+            "Raft CDC cutover record failed: {}",
+            cutover.message
+        );
+    }
     let complete = node
         .propose(Command::CompleteShard {
             shard_id: lease.shard_id.to_string(),
@@ -428,42 +549,67 @@ async fn cdc_worker_crash_and_raft_failover_replays_without_duplicate_effects() 
             response.text().await.unwrap_or_default()
         );
     }
-    let seed = "{\"index\":{\"_id\":\"cdc-doc-1\"}}\n{\"value\":1}\n";
-    let response = http
-        .post(format!("{source}/{source_index}/_bulk"))
-        .header("content-type", "application/x-ndjson")
-        .body(seed)
-        .send()
-        .await
-        .unwrap();
-    assert!(response.status().is_success());
-    ensure_es_request_with_retry(
-        || {
-            http.put(format!("{source}/{source_index}/_doc/cdc-doc-1"))
-                .json(&json!({"value":99}))
-        },
-        "update source CDC document",
-    )
-    .await;
-    let event = json!({"sequence":1,"operation":"index","document_id":"cdc-doc-1","target_index":target_index,"document":{"value":99}});
-    let event_body = format!(
-        "{{\"index\":{{\"_id\":\"event-1\"}}}}\n{}\n",
-        serde_json::to_string(&event).unwrap()
-    );
-    let response = http
-        .post(format!("{source}/{outbox}/_bulk"))
-        .header("content-type", "application/x-ndjson")
-        .body(event_body)
-        .send()
-        .await
-        .unwrap();
-    assert!(response.status().is_success());
-    for index in [&source_index, &outbox] {
-        let _ = http
-            .post(format!("{source}/{index}/_refresh"))
+    let postgres_mode = std::env::var("DATASPOOL_TEST_POSTGRES_URL").is_ok();
+    if postgres_mode {
+        let database_url = env_required("DATASPOOL_TEST_POSTGRES_URL");
+        let producer = PostgresTransactionalOutbox::connect(&database_url, &outbox)
+            .await
+            .unwrap();
+        producer.migrate().await.unwrap();
+        sqlx::query("CREATE TABLE IF NOT EXISTS dataspool_cdc_worker_failover_source (stream_key TEXT NOT NULL, document_id TEXT NOT NULL, payload JSONB NOT NULL, PRIMARY KEY(stream_key, document_id))")
+            .execute(producer.pool()).await.unwrap();
+        let mut write = producer.begin_write().await.unwrap();
+        sqlx::query("INSERT INTO dataspool_cdc_worker_failover_source(stream_key, document_id, payload) VALUES ($1, 'cdc-doc-1', $2) ON CONFLICT (stream_key, document_id) DO UPDATE SET payload = EXCLUDED.payload")
+            .bind(&outbox).bind(json!({"value":99})).execute(write.connection()).await.unwrap();
+        write
+            .append_event(
+                uuid::Uuid::new_v4(),
+                "index",
+                "cdc-doc-1",
+                &target_index,
+                &json!({"value":99}),
+            )
+            .await
+            .unwrap();
+        write.commit().await.unwrap();
+    } else {
+        let seed = "{\"index\":{\"_id\":\"cdc-doc-1\"}}\n{\"value\":1}\n";
+        let response = http
+            .post(format!("{source}/{source_index}/_bulk"))
+            .header("content-type", "application/x-ndjson")
+            .body(seed)
             .send()
             .await
             .unwrap();
+        assert!(response.status().is_success());
+        ensure_es_request_with_retry(
+            || {
+                http.put(format!("{source}/{source_index}/_doc/cdc-doc-1"))
+                    .json(&json!({"value":99}))
+            },
+            "update source CDC document",
+        )
+        .await;
+        let event = json!({"sequence":1,"operation":"index","document_id":"cdc-doc-1","target_index":target_index,"document":{"value":99}});
+        let event_body = format!(
+            "{{\"index\":{{\"_id\":\"event-1\"}}}}\n{}\n",
+            serde_json::to_string(&event).unwrap()
+        );
+        let response = http
+            .post(format!("{source}/{outbox}/_bulk"))
+            .header("content-type", "application/x-ndjson")
+            .body(event_body)
+            .send()
+            .await
+            .unwrap();
+        assert!(response.status().is_success());
+        for index in [&source_index, &outbox] {
+            let _ = http
+                .post(format!("{source}/{index}/_refresh"))
+                .send()
+                .await
+                .unwrap();
+        }
     }
     let old_alias = http
         .post(format!("{target}/_aliases"))
@@ -538,17 +684,26 @@ async fn cdc_worker_crash_and_raft_failover_replays_without_duplicate_effects() 
     changes.urls = vec![source.clone()];
     let mut sink = DocumentConfig::local(&target_index);
     sink.urls = vec![target.clone()];
-    let task = TaskMeta::new(
-        "cdc-worker-joint-crash-failover".into(),
-        serde_json::to_string(&SourceConfig::ElasticsearchOnline {
+    let source_config = if postgres_mode {
+        SourceConfig::PostgresOutbox {
+            config: PostgresOutboxConfig {
+                connection_env: "DATASPOOL_TEST_POSTGRES_URL".into(),
+                stream_key: outbox.clone(),
+            },
+        }
+    } else {
+        SourceConfig::ElasticsearchOnline {
             snapshot,
             change_log_connection: changes,
             cdc: CdcConfig {
                 change_index: outbox.clone(),
                 ..CdcConfig::default()
             },
-        })
-        .unwrap(),
+        }
+    };
+    let task = TaskMeta::new(
+        "cdc-worker-joint-crash-failover".into(),
+        serde_json::to_string(&source_config).unwrap(),
         serde_json::to_string(&SinkConfig::Document { config: sink }).unwrap(),
     );
     let task_id = task.task_id;
@@ -716,9 +871,10 @@ async fn cdc_worker_crash_and_raft_failover_replays_without_duplicate_effects() 
                 }) && shard.as_ref().is_some_and(|shard| {
                     matches!(shard.state, dataspool::types::ShardState::Completed { .. })
                         && shard.offset
-                            == OffsetValue::Custom(
-                                json!({"driver":"elasticsearch_cdc","last_sequence":1}),
-                            )
+                            == OffsetValue::Custom(json!({
+                                "driver": if postgres_mode { "postgres_outbox" } else { "elasticsearch_cdc" },
+                                "last_sequence": 1
+                            }))
                 }) {
                     break;
                 }
@@ -738,20 +894,27 @@ async fn cdc_worker_crash_and_raft_failover_replays_without_duplicate_effects() 
         .json()
         .await
         .unwrap();
-    let source_doc: Value = http
-        .get(format!("{source}/{source_index}/_doc/cdc-doc-1"))
-        .send()
-        .await
-        .unwrap()
-        .error_for_status()
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(
-        target_doc["_source"]["value"],
-        source_doc["_source"]["value"]
-    );
+    let source_value = if postgres_mode {
+        let database_url = env_required("DATASPOOL_TEST_POSTGRES_URL");
+        let pool = sqlx::PgPool::connect(&database_url).await.unwrap();
+        let row: (Value,) = sqlx::query_as("SELECT payload FROM dataspool_cdc_worker_failover_source WHERE stream_key = $1 AND document_id = 'cdc-doc-1'")
+            .bind(&outbox).fetch_one(&pool).await.unwrap();
+        pool.close().await;
+        row.0["value"].clone()
+    } else {
+        let source_doc: Value = http
+            .get(format!("{source}/{source_index}/_doc/cdc-doc-1"))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        source_doc["_source"]["value"].clone()
+    };
+    assert_eq!(target_doc["_source"]["value"], source_value);
     assert_eq!(
         target_doc["_source"]["effect_count"], 1,
         "CDC replay must not duplicate the business effect"
@@ -782,6 +945,26 @@ async fn cdc_worker_crash_and_raft_failover_replays_without_duplicate_effects() 
             continue;
         }
         parent_servers[index].abort();
+    }
+    if postgres_mode {
+        let database_url = env_required("DATASPOOL_TEST_POSTGRES_URL");
+        let pool = sqlx::PgPool::connect(&database_url).await.unwrap();
+        sqlx::query("DELETE FROM dataspool_cdc_worker_failover_source WHERE stream_key = $1")
+            .bind(&outbox)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM dataspool_cdc_outbox WHERE stream_key = $1")
+            .bind(&outbox)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM dataspool_cdc_outbox_gate WHERE stream_key = $1")
+            .bind(&outbox)
+            .execute(&pool)
+            .await
+            .unwrap();
+        pool.close().await;
     }
     for (url, index) in [
         (&source, &source_index),

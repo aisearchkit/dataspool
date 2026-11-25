@@ -102,11 +102,24 @@ jobs:
           ES_EXPECT_NODES: 3
         run: tests/run_es_multinode.sh ${{ matrix.version }}
 
+  postgres-primary-failover:
+    if: github.event_name != 'pull_request' || github.event.pull_request.merged == true
+    name: PostgreSQL Primary Promotion and Outbox Recovery
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install native build dependencies
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler clang libclang-dev llvm-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Promote streaming standby and verify Outbox continuity
+        run: tests/run_postgres_primary_failover.sh
+
   build:
     if: github.event_name != 'pull_request' || github.event.pull_request.merged == true
     name: Build Release
     runs-on: ubuntu-24.04
-    needs: [format, clippy, audit, elasticsearch-multinode]
+    needs: [format, clippy, audit, elasticsearch-multinode, postgres-primary-failover]
     steps:
       - uses: actions/checkout@v7
       - name: Install native build dependencies
