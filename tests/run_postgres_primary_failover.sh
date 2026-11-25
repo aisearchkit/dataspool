@@ -32,9 +32,10 @@ docker run -d --name "$STANDBY" --network "$NETWORK" -p 15434:5432 \
     rm -rf "$PGDATA"/*
     chown -R postgres:postgres "$PGDATA"
     chmod 700 "$PGDATA"
-    printf "dataspool-pg-ha-primary:5432:replication:replicator:replica\n" > "$HOME/.pgpass"
-    chown postgres:postgres "$HOME/.pgpass"
-    chmod 600 "$HOME/.pgpass"
+    export PGPASSFILE=/var/lib/postgresql/.pgpass
+    printf "dataspool-pg-ha-primary:5432:replication:replicator:replica\n" > "$PGPASSFILE"
+    chown postgres:postgres "$PGPASSFILE"
+    chmod 600 "$PGPASSFILE"
     until gosu postgres pg_basebackup -h dataspool-pg-ha-primary -D "$PGDATA" -U replicator -Fp -Xs -P -R; do sleep 1; done
     exec gosu postgres /usr/lib/postgresql/16/bin/postgres -D "$PGDATA" -c hot_standby=on -c listen_addresses="*"
   ' >/dev/null
