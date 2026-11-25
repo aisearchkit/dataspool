@@ -3463,6 +3463,31 @@ mod tests {
                 .state,
             crate::federation::FederatedRemoteOperationState::Compensated
         );
+
+        // Cancellation may arrive before the source ever receives a Prepared
+        // acknowledgement. The target must still persist a compensation fence
+        // for that generation, and a delayed Prepare/Commit must not resurrect it.
+        let mut unprepared =
+            operation(crate::federation::FederatedRemoteOperationState::Compensating);
+        unprepared.generation = 5;
+        assert!(
+            sm.apply_command(propose(unprepared, "compensate-before-prepare"))
+                .await
+                .unwrap()
+                .success
+        );
+        let delayed_prepare = operation(crate::federation::FederatedRemoteOperationState::Prepared);
+        let mut delayed_prepare = delayed_prepare;
+        delayed_prepare.generation = 5;
+        assert!(
+            !sm.apply_command(propose(
+                delayed_prepare,
+                "delayed-prepare-after-compensation"
+            ))
+            .await
+            .unwrap()
+            .success
+        );
     }
 
     #[tokio::test]
