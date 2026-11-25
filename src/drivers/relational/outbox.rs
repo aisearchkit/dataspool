@@ -429,7 +429,7 @@ impl PostgresTransactionalOutbox {
     /// every chunk, limiting WAL bursts and transaction/lock duration.
     pub async fn prune_consumed_events_batch(&self, batch_size: u32) -> Result<u64> {
         let started = std::time::Instant::now();
-        let wal_before = sqlx::query("SELECT wal_bytes FROM pg_stat_wal")
+        let wal_before = sqlx::query("SELECT wal_bytes::bigint AS wal_bytes FROM pg_stat_wal")
             .fetch_one(&self.pool)
             .await
             .ok()
@@ -468,7 +468,7 @@ impl PostgresTransactionalOutbox {
             .await
             .map_err(|e| db_error("commit bounded Outbox pruning", e))?;
         let elapsed = started.elapsed();
-        let wal_after = sqlx::query("SELECT wal_bytes FROM pg_stat_wal")
+        let wal_after = sqlx::query("SELECT wal_bytes::bigint AS wal_bytes FROM pg_stat_wal")
             .fetch_one(&self.pool)
             .await
             .ok()
@@ -499,11 +499,12 @@ impl PostgresTransactionalOutbox {
         .await
         .map_err(|error| db_error("read Outbox retention statistics", error))?
         .ok_or_else(|| DatspoolError::Internal("Outbox table statistics are unavailable in the current schema".into()))?;
-        let cluster_wal_bytes = sqlx::query("SELECT wal_bytes FROM pg_stat_wal")
-            .fetch_one(&self.pool)
-            .await
-            .ok()
-            .and_then(|row| row.try_get::<i64, _>("wal_bytes").ok());
+        let cluster_wal_bytes =
+            sqlx::query("SELECT wal_bytes::bigint AS wal_bytes FROM pg_stat_wal")
+                .fetch_one(&self.pool)
+                .await
+                .ok()
+                .and_then(|row| row.try_get::<i64, _>("wal_bytes").ok());
         Ok(PostgresOutboxRetentionStats {
             live_rows_estimate: row
                 .try_get("n_live_tup")
@@ -910,11 +911,12 @@ impl PostgresPartitionedOutbox {
             "SELECT n_live_tup, n_dead_tup, autovacuum_count, last_autovacuum::text AS last_autovacuum, pg_total_relation_size(relid) AS total_bytes FROM pg_stat_user_tables WHERE schemaname = current_schema() AND relname = 'dataspool_cdc_outbox_partitioned'",
         ).fetch_optional(&self.pool).await.map_err(|e| db_error("read partitioned Outbox retention statistics", e))?
             .ok_or_else(|| DatspoolError::Internal("partitioned Outbox table statistics are unavailable in the current schema".into()))?;
-        let cluster_wal_bytes = sqlx::query("SELECT wal_bytes FROM pg_stat_wal")
-            .fetch_one(&self.pool)
-            .await
-            .ok()
-            .and_then(|row| row.try_get::<i64, _>("wal_bytes").ok());
+        let cluster_wal_bytes =
+            sqlx::query("SELECT wal_bytes::bigint AS wal_bytes FROM pg_stat_wal")
+                .fetch_one(&self.pool)
+                .await
+                .ok()
+                .and_then(|row| row.try_get::<i64, _>("wal_bytes").ok());
         Ok(PostgresOutboxRetentionStats {
             live_rows_estimate: row
                 .try_get("n_live_tup")
@@ -937,7 +939,7 @@ impl PostgresPartitionedOutbox {
 
     pub async fn prune_partition_batch(&self, partition_id: u32, batch_size: u32) -> Result<u64> {
         let started = std::time::Instant::now();
-        let wal_before = sqlx::query("SELECT wal_bytes FROM pg_stat_wal")
+        let wal_before = sqlx::query("SELECT wal_bytes::bigint AS wal_bytes FROM pg_stat_wal")
             .fetch_one(&self.pool)
             .await
             .ok()
@@ -968,7 +970,7 @@ impl PostgresPartitionedOutbox {
             .await
             .map_err(|e| db_error("commit partition retention batch", e))?;
         let elapsed = started.elapsed();
-        let wal_after = sqlx::query("SELECT wal_bytes FROM pg_stat_wal")
+        let wal_after = sqlx::query("SELECT wal_bytes::bigint AS wal_bytes FROM pg_stat_wal")
             .fetch_one(&self.pool)
             .await
             .ok()
