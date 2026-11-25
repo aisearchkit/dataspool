@@ -236,6 +236,22 @@ pub enum Command {
         request_id: String,
         actor: String,
     },
+    StageFederatedCertificateRotation {
+        cluster_id: String,
+        current_fingerprint: String,
+        new_fingerprint: String,
+        at_ms: i64,
+        grace_period_ms: i64,
+        request_id: String,
+        actor: String,
+    },
+    CompleteFederatedCertificateRotation {
+        cluster_id: String,
+        new_fingerprint: String,
+        at_ms: i64,
+        request_id: String,
+        actor: String,
+    },
     TransitionFederatedMigration {
         migration_id: String,
         next_state: crate::federation::MigrationState,
@@ -420,6 +436,12 @@ impl Command {
             Command::HeartbeatFederatedCluster {
                 cluster_id, status, ..
             } => format!("HeartbeatFederatedCluster({}, {:?})", cluster_id, status),
+            Command::StageFederatedCertificateRotation { cluster_id, .. } => {
+                format!("StageFederatedCertificateRotation({})", cluster_id)
+            }
+            Command::CompleteFederatedCertificateRotation { cluster_id, .. } => {
+                format!("CompleteFederatedCertificateRotation({})", cluster_id)
+            }
             Command::TransitionFederatedMigration {
                 migration_id,
                 next_state,

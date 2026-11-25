@@ -103,6 +103,61 @@ impl GrpcClient {
         })
     }
 
+    /// Stage a peer certificate rotation while authenticating with the currently trusted certificate.
+    pub async fn stage_federated_certificate_rotation(
+        &mut self,
+        peer_cluster_id: &str,
+        new_fingerprint: &str,
+        request_id: &str,
+        grace_period_ms: i64,
+    ) -> Result<task::FederatedCertificateRotationResponse> {
+        let mut request = Request::new(task::FederatedCertificateRotationRequest {
+            new_fingerprint: new_fingerprint.to_string(),
+            request_id: request_id.to_string(),
+            grace_period_ms,
+        });
+        request.metadata_mut().insert(
+            "x-dataspool-peer-cluster",
+            MetadataValue::try_from(peer_cluster_id).map_err(|e| {
+                DatspoolError::Configuration(format!("Invalid peer cluster metadata: {e}"))
+            })?,
+        );
+        self.task_client
+            .stage_federated_certificate_rotation(request)
+            .await
+            .map(|response| response.into_inner())
+            .map_err(|status| {
+                DatspoolError::Internal(format!("Certificate rotation staging failed: {status}"))
+            })
+    }
+
+    /// Prove possession of the staged new certificate. Call on a client connected using the new cert/key pair.
+    pub async fn prove_federated_certificate_rotation(
+        &mut self,
+        peer_cluster_id: &str,
+        new_fingerprint: &str,
+        request_id: &str,
+    ) -> Result<task::FederatedCertificateRotationResponse> {
+        let mut request = Request::new(task::FederatedCertificateRotationRequest {
+            new_fingerprint: new_fingerprint.to_string(),
+            request_id: request_id.to_string(),
+            grace_period_ms: 0,
+        });
+        request.metadata_mut().insert(
+            "x-dataspool-peer-cluster",
+            MetadataValue::try_from(peer_cluster_id).map_err(|e| {
+                DatspoolError::Configuration(format!("Invalid peer cluster metadata: {e}"))
+            })?,
+        );
+        self.task_client
+            .prove_federated_certificate_rotation(request)
+            .await
+            .map(|response| response.into_inner())
+            .map_err(|status| {
+                DatspoolError::Internal(format!("Certificate rotation proof failed: {status}"))
+            })
+    }
+
     /// Read a remote task over the authenticated federation channel.
     pub async fn get_remote_task(
         &mut self,

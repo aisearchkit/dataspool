@@ -442,6 +442,42 @@ impl<S: KvStore + Clone> MetaStateMachine<S> {
                 )
                 .await
             }
+            Command::StageFederatedCertificateRotation {
+                cluster_id,
+                current_fingerprint,
+                new_fingerprint,
+                at_ms,
+                grace_period_ms,
+                request_id,
+                actor,
+            } => {
+                self.apply_stage_federated_certificate_rotation(
+                    cluster_id,
+                    current_fingerprint,
+                    new_fingerprint,
+                    at_ms,
+                    grace_period_ms,
+                    request_id,
+                    actor,
+                )
+                .await
+            }
+            Command::CompleteFederatedCertificateRotation {
+                cluster_id,
+                new_fingerprint,
+                at_ms,
+                request_id,
+                actor,
+            } => {
+                self.apply_complete_federated_certificate_rotation(
+                    cluster_id,
+                    new_fingerprint,
+                    at_ms,
+                    request_id,
+                    actor,
+                )
+                .await
+            }
             Command::TransitionFederatedMigration {
                 migration_id,
                 next_state,
@@ -500,7 +536,7 @@ impl<S: KvStore + Clone> MetaStateMachine<S> {
 
     async fn apply_federated_cluster(
         &self,
-        cluster: crate::federation::FederatedCluster,
+        mut cluster: crate::federation::FederatedCluster,
         request_id: String,
         actor: String,
     ) -> Result<CommandResponse> {
@@ -531,11 +567,17 @@ impl<S: KvStore + Clone> MetaStateMachine<S> {
             .task_store
             .get_federated_cluster(&cluster.cluster_id)
             .await?
-            && existing.identity_fingerprint != cluster.identity_fingerprint
         {
-            return Ok(rejected(
-                "cluster identity fingerprint is immutable; use a new cluster_id for a new identity",
-            ));
+            if existing.identity_fingerprint != cluster.identity_fingerprint {
+                return Ok(rejected(
+                    "cluster identity fingerprint is immutable; use the certificate rotation protocol",
+                ));
+            }
+            cluster.previous_identity_fingerprint = existing.previous_identity_fingerprint;
+            cluster.previous_identity_expires_at_ms = existing.previous_identity_expires_at_ms;
+            cluster.pending_identity_fingerprint = existing.pending_identity_fingerprint;
+            cluster.rotation_started_at_ms = existing.rotation_started_at_ms;
+            cluster.pending_rotation_grace_period_ms = existing.pending_rotation_grace_period_ms;
         }
         let key = format!("federated_cluster:{}", cluster.cluster_id);
         let data = serde_json::to_value(&cluster)?;
@@ -575,7 +617,7 @@ impl<S: KvStore + Clone> MetaStateMachine<S> {
             Some(value) => value,
             None => return Ok(rejected("federated cluster not found")),
         };
-        if cluster.identity_fingerprint != identity_fingerprint {
+        if !cluster.accepts_fingerprint(&identity_fingerprint, last_seen_at_ms) {
             return Ok(rejected("federated cluster identity fingerprint mismatch"));
         }
         let payload = format!("federated-heartbeat:{cluster_id}:{identity_fingerprint}:{status:?}");
@@ -618,6 +660,189 @@ impl<S: KvStore + Clone> MetaStateMachine<S> {
             )
             .await?;
         Ok(accepted("Federated cluster heartbeat accepted", data))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn apply_stage_federated_certificate_rotation(
+        &self,
+        cluster_id: String,
+        current_fingerprint: String,
+        new_fingerprint: String,
+        at_ms: i64,
+        grace_period_ms: i64,
+        request_id: String,
+        actor: String,
+    ) -> Result<CommandResponse> {
+        if request_id.trim().is_empty() || request_id.len() > 128 {
+            return Ok(rejected("request_id must contain 1-128 characters"));
+        }
+        let valid = |value: &str| value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit());
+        if !(60_000..=604_800_000).contains(&grace_period_ms) {
+            return Ok(rejected(
+                "certificate overlap grace period must be between 1 minute and 7 days",
+            ));
+        }
+        if !valid(&new_fingerprint) {
+            return Ok(rejected(
+                "new fingerprint must be a 64-character SHA-256 hex digest",
+            ));
+        }
+        let mut cluster = match self.task_store.get_federated_cluster(&cluster_id).await? {
+            Some(value) => value,
+            None => return Ok(rejected("federated cluster not found")),
+        };
+        if !cluster
+            .identity_fingerprint
+            .eq_ignore_ascii_case(&current_fingerprint)
+        {
+            return Ok(rejected(
+                "rotation must be staged by the currently trusted certificate",
+            ));
+        }
+        if cluster
+            .identity_fingerprint
+            .eq_ignore_ascii_case(&new_fingerprint)
+        {
+            return Ok(rejected("new fingerprint is already the active identity"));
+        }
+        if cluster
+            .previous_identity_expires_at_ms
+            .is_some_and(|expires| at_ms < expires)
+        {
+            return Ok(rejected(
+                "previous certificate trust window is still active",
+            ));
+        }
+        if cluster
+            .pending_identity_fingerprint
+            .as_deref()
+            .is_some_and(|pending| !pending.eq_ignore_ascii_case(&new_fingerprint))
+            && cluster
+                .rotation_started_at_ms
+                .is_some_and(|started| at_ms.saturating_sub(started) < 3_600_000)
+        {
+            return Ok(rejected("another certificate rotation is already pending"));
+        }
+        let payload = format!(
+            "federated-cert-stage:{cluster_id}:{current_fingerprint}:{new_fingerprint}:{grace_period_ms}"
+        );
+        if let Some(existing) = self.task_store.get_control_request(&request_id).await? {
+            return if existing == payload {
+                Ok(accepted(
+                    "Certificate rotation already staged",
+                    serde_json::json!({"cluster_id": cluster_id}),
+                ))
+            } else {
+                Ok(rejected(
+                    "request_id was already used with a different payload",
+                ))
+            };
+        }
+        cluster.pending_identity_fingerprint = Some(new_fingerprint.clone());
+        cluster.rotation_started_at_ms = Some(at_ms);
+        cluster.pending_rotation_grace_period_ms = Some(grace_period_ms);
+        cluster.updated_at_ms = at_ms;
+        let audit = self.audit_event(
+            &actor,
+            &request_id,
+            "federated_cluster.certificate_rotation_staged",
+            &cluster_id,
+            "active",
+            "pending",
+        );
+        self.task_store
+            .save_federated_control(
+                &request_id,
+                &payload,
+                format!("federated_cluster:{cluster_id}"),
+                serde_json::to_vec(&cluster)?,
+                audit,
+            )
+            .await?;
+        Ok(accepted(
+            "Certificate rotation staged; new certificate proof required",
+            serde_json::json!({"cluster_id": cluster_id, "pending_fingerprint": new_fingerprint}),
+        ))
+    }
+
+    async fn apply_complete_federated_certificate_rotation(
+        &self,
+        cluster_id: String,
+        new_fingerprint: String,
+        at_ms: i64,
+        request_id: String,
+        actor: String,
+    ) -> Result<CommandResponse> {
+        if request_id.trim().is_empty() || request_id.len() > 128 {
+            return Ok(rejected("request_id must contain 1-128 characters"));
+        }
+        let mut cluster = match self.task_store.get_federated_cluster(&cluster_id).await? {
+            Some(value) => value,
+            None => return Ok(rejected("federated cluster not found")),
+        };
+        let payload = format!("federated-cert-complete:{cluster_id}:{new_fingerprint}");
+        if let Some(existing) = self.task_store.get_control_request(&request_id).await? {
+            return if existing == payload {
+                Ok(accepted(
+                    "Certificate rotation already completed",
+                    serde_json::json!({"cluster_id": cluster_id}),
+                ))
+            } else {
+                Ok(rejected(
+                    "request_id was already used with a different payload",
+                ))
+            };
+        }
+        if !cluster
+            .pending_identity_fingerprint
+            .as_deref()
+            .is_some_and(|pending| pending.eq_ignore_ascii_case(&new_fingerprint))
+        {
+            return Ok(rejected(
+                "new certificate has not been staged for this cluster",
+            ));
+        }
+        let grace_period_ms = cluster.pending_rotation_grace_period_ms.unwrap_or_default();
+        if !(60_000..=604_800_000).contains(&grace_period_ms) {
+            return Ok(rejected(
+                "staged certificate rotation has no valid overlap grace period",
+            ));
+        }
+        if cluster
+            .rotation_started_at_ms
+            .is_none_or(|started| at_ms.saturating_sub(started) > 3_600_000)
+        {
+            return Ok(rejected("staged certificate rotation has expired"));
+        }
+        let old_fingerprint =
+            std::mem::replace(&mut cluster.identity_fingerprint, new_fingerprint.clone());
+        cluster.previous_identity_fingerprint = Some(old_fingerprint);
+        cluster.previous_identity_expires_at_ms = Some(at_ms.saturating_add(grace_period_ms));
+        cluster.pending_identity_fingerprint = None;
+        cluster.rotation_started_at_ms = None;
+        cluster.pending_rotation_grace_period_ms = None;
+        cluster.updated_at_ms = at_ms;
+        let audit = self.audit_event(
+            &actor,
+            &request_id,
+            "federated_cluster.certificate_rotation_completed",
+            &cluster_id,
+            "pending",
+            "active_with_overlap",
+        );
+        self.task_store
+            .save_federated_control(
+                &request_id,
+                &payload,
+                format!("federated_cluster:{cluster_id}"),
+                serde_json::to_vec(&cluster)?,
+                audit,
+            )
+            .await?;
+        Ok(accepted(
+            "Certificate rotation completed",
+            serde_json::json!({"cluster_id": cluster_id, "active_fingerprint": new_fingerprint, "previous_fingerprint_expires_at_ms": cluster.previous_identity_expires_at_ms}),
+        ))
     }
 
     async fn apply_federated_migration(
@@ -2993,6 +3218,11 @@ mod tests {
             cluster_id: id.into(),
             endpoint: format!("https://{id}.example.com:9443"),
             identity_fingerprint: "a".repeat(64),
+            previous_identity_fingerprint: None,
+            previous_identity_expires_at_ms: None,
+            pending_identity_fingerprint: None,
+            rotation_started_at_ms: None,
+            pending_rotation_grace_period_ms: None,
             version: "0.1.0".into(),
             capabilities: [
                 "elasticsearch-source".to_string(),
@@ -3004,6 +3234,100 @@ mod tests {
             last_seen_at_ms: 100,
             updated_at_ms: 100,
         }
+    }
+
+    #[tokio::test]
+    async fn federated_certificate_rotation_requires_staging_and_has_bounded_overlap() {
+        let dir = tempdir().unwrap();
+        let store = TaskStore::new(RocksDbStore::open(dir.path()).unwrap());
+        let mut sm = MetaStateMachine::new(store.kv_store().clone());
+        assert!(
+            sm.apply_command(Command::UpsertFederatedCluster {
+                cluster: federated_cluster("rotation-peer"),
+                request_id: "register-rotation-peer".into(),
+                actor: "operator".into(),
+            })
+            .await
+            .unwrap()
+            .success
+        );
+
+        let invalid_grace = sm
+            .apply_command(Command::StageFederatedCertificateRotation {
+                cluster_id: "rotation-peer".into(),
+                current_fingerprint: "a".repeat(64),
+                new_fingerprint: "b".repeat(64),
+                at_ms: 1_000,
+                grace_period_ms: 1_000,
+                request_id: "stage-rotation-invalid-grace".into(),
+                actor: "operator".into(),
+            })
+            .await
+            .unwrap();
+        assert!(!invalid_grace.success);
+
+        let stage = Command::StageFederatedCertificateRotation {
+            cluster_id: "rotation-peer".into(),
+            current_fingerprint: "a".repeat(64),
+            new_fingerprint: "b".repeat(64),
+            at_ms: 1_000,
+            grace_period_ms: 120_000,
+            request_id: "stage-rotation-peer".into(),
+            actor: "peer-old-certificate".into(),
+        };
+        assert!(sm.apply_command(stage.clone()).await.unwrap().success);
+        assert!(sm.apply_command(stage).await.unwrap().success);
+        let staged = store
+            .get_federated_cluster("rotation-peer")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(staged.identity_fingerprint, "a".repeat(64));
+        assert_eq!(
+            staged.pending_identity_fingerprint.as_deref(),
+            Some("b".repeat(64).as_str())
+        );
+        assert!(staged.accepts_fingerprint(&"a".repeat(64), 2_000));
+        assert!(!staged.accepts_fingerprint(&"b".repeat(64), 2_000));
+
+        let rejected = sm
+            .apply_command(Command::StageFederatedCertificateRotation {
+                cluster_id: "rotation-peer".into(),
+                current_fingerprint: "c".repeat(64),
+                new_fingerprint: "d".repeat(64),
+                at_ms: 2_000,
+                grace_period_ms: 120_000,
+                request_id: "stage-with-untrusted-current".into(),
+                actor: "attacker".into(),
+            })
+            .await
+            .unwrap();
+        assert!(!rejected.success);
+
+        let complete = Command::CompleteFederatedCertificateRotation {
+            cluster_id: "rotation-peer".into(),
+            new_fingerprint: "b".repeat(64),
+            at_ms: 3_000,
+            request_id: "complete-rotation-peer".into(),
+            actor: "peer-new-certificate-proof".into(),
+        };
+        assert!(sm.apply_command(complete.clone()).await.unwrap().success);
+        assert!(sm.apply_command(complete).await.unwrap().success);
+        let active = store
+            .get_federated_cluster("rotation-peer")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(active.identity_fingerprint, "b".repeat(64));
+        assert_eq!(
+            active.previous_identity_fingerprint.as_deref(),
+            Some("a".repeat(64).as_str())
+        );
+        assert_eq!(active.previous_identity_expires_at_ms, Some(123_000));
+        assert!(active.pending_identity_fingerprint.is_none());
+        assert!(active.accepts_fingerprint(&"a".repeat(64), 122_999));
+        assert!(!active.accepts_fingerprint(&"a".repeat(64), 123_000));
+        assert!(active.accepts_fingerprint(&"b".repeat(64), 123_000));
     }
 
     #[tokio::test]

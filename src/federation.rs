@@ -20,6 +20,18 @@ pub struct FederatedCluster {
     pub endpoint: String,
     /// SHA-256 fingerprint of the remote control-plane identity certificate.
     pub identity_fingerprint: String,
+    /// Previous identity remains trusted only until this deadline.
+    #[serde(default)]
+    pub previous_identity_fingerprint: Option<String>,
+    #[serde(default)]
+    pub previous_identity_expires_at_ms: Option<i64>,
+    /// Candidate identity accepted only by the proof RPC, never ordinary RPCs.
+    #[serde(default)]
+    pub pending_identity_fingerprint: Option<String>,
+    #[serde(default)]
+    pub rotation_started_at_ms: Option<i64>,
+    #[serde(default)]
+    pub pending_rotation_grace_period_ms: Option<i64>,
     pub version: String,
     pub capabilities: BTreeSet<String>,
     pub status: FederatedClusterStatus,
@@ -184,6 +196,19 @@ impl FederatedMigration {
     }
 }
 
+impl FederatedCluster {
+    pub fn accepts_fingerprint(&self, fingerprint: &str, now_ms: i64) -> bool {
+        self.identity_fingerprint.eq_ignore_ascii_case(fingerprint)
+            || (self
+                .previous_identity_expires_at_ms
+                .is_some_and(|expires| now_ms < expires)
+                && self
+                    .previous_identity_fingerprint
+                    .as_deref()
+                    .is_some_and(|previous| previous.eq_ignore_ascii_case(fingerprint)))
+    }
+}
+
 pub fn validate_cluster(cluster: &FederatedCluster) -> Result<(), String> {
     if cluster.cluster_id.trim().is_empty() || cluster.cluster_id.len() > 128 {
         return Err("cluster_id must contain 1-128 characters".into());
@@ -235,11 +260,36 @@ mod tests {
     use super::*;
 
     #[test]
+    fn legacy_registry_records_deserialize_without_rotation_fields() {
+        let cluster: FederatedCluster = serde_json::from_value(serde_json::json!({
+            "cluster_id": "legacy-peer",
+            "endpoint": "https://legacy.example.com",
+            "identity_fingerprint": "a".repeat(64),
+            "version": "0.1.0",
+            "capabilities": [],
+            "status": "healthy",
+            "last_seen_at_ms": 1,
+            "updated_at_ms": 1
+        }))
+        .unwrap();
+        assert!(cluster.previous_identity_fingerprint.is_none());
+        assert!(cluster.previous_identity_expires_at_ms.is_none());
+        assert!(cluster.pending_identity_fingerprint.is_none());
+        assert!(cluster.rotation_started_at_ms.is_none());
+        assert!(cluster.pending_rotation_grace_period_ms.is_none());
+    }
+
+    #[test]
     fn cluster_endpoint_requires_secure_origin_and_valid_fingerprint() {
         let mut cluster = FederatedCluster {
             cluster_id: "east".into(),
             endpoint: "https://east.example.com:9443".into(),
             identity_fingerprint: "a".repeat(64),
+            previous_identity_fingerprint: None,
+            previous_identity_expires_at_ms: None,
+            pending_identity_fingerprint: None,
+            rotation_started_at_ms: None,
+            pending_rotation_grace_period_ms: None,
             version: "0.1.0".into(),
             capabilities: BTreeSet::new(),
             status: FederatedClusterStatus::Healthy,

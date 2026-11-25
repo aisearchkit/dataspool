@@ -41,6 +41,19 @@ const CLIENT_CERT: &[u8] = include_bytes!("../../../tests/fixtures/federation-te
 const SERVER_CERT: &[u8] = include_bytes!("../../../tests/fixtures/federation-test-server.pem");
 const SERVER_KEY: &[u8] = include_bytes!("../../../tests/fixtures/federation-test-server.key.pem");
 const CA_CERT: &[u8] = include_bytes!("../../../tests/fixtures/federation-test-ca.pem");
+const ROTATION_CA: &[u8] = include_bytes!("../../../tests/fixtures/federation-rotation/ca.pem");
+const ROTATION_SERVER_CERT: &[u8] =
+    include_bytes!("../../../tests/fixtures/federation-rotation/server.pem");
+const ROTATION_SERVER_KEY: &[u8] =
+    include_bytes!("../../../tests/fixtures/federation-rotation/server.key.pem");
+const ROTATION_OLD_CLIENT_CERT: &[u8] =
+    include_bytes!("../../../tests/fixtures/federation-rotation/old-client.pem");
+const ROTATION_OLD_CLIENT_KEY: &[u8] =
+    include_bytes!("../../../tests/fixtures/federation-rotation/old-client.key.pem");
+const ROTATION_NEW_CLIENT_CERT: &[u8] =
+    include_bytes!("../../../tests/fixtures/federation-rotation/new-client.pem");
+const ROTATION_NEW_CLIENT_KEY: &[u8] =
+    include_bytes!("../../../tests/fixtures/federation-rotation/new-client.key.pem");
 
 fn cert_der(pem: &[u8]) -> Vec<u8> {
     let encoded = std::str::from_utf8(pem)
@@ -53,6 +66,14 @@ fn cert_der(pem: &[u8]) -> Vec<u8> {
 
 fn client_fingerprint() -> String {
     format!("{:x}", Sha256::digest(cert_der(CLIENT_CERT)))
+}
+
+fn rotation_old_client_fingerprint() -> String {
+    format!("{:x}", Sha256::digest(cert_der(ROTATION_OLD_CLIENT_CERT)))
+}
+
+fn rotation_new_client_fingerprint() -> String {
+    format!("{:x}", Sha256::digest(cert_der(ROTATION_NEW_CLIENT_CERT)))
 }
 
 struct TestRaftCluster {
@@ -163,6 +184,11 @@ impl TestRaftCluster {
                     cluster_id: peer_id.into(),
                     endpoint,
                     identity_fingerprint: client_fingerprint(),
+                    previous_identity_fingerprint: None,
+                    previous_identity_expires_at_ms: None,
+                    pending_identity_fingerprint: None,
+                    rotation_started_at_ms: None,
+                    pending_rotation_grace_period_ms: None,
                     version: env!("CARGO_PKG_VERSION").into(),
                     capabilities: BTreeSet::from([
                         "task-provisioning".into(),
@@ -1142,6 +1168,158 @@ impl TestRaftGroup {
     }
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn federated_certificate_rotation_requires_new_mtls_proof_and_keeps_bounded_overlap() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let mut raft = TestRaftCluster::start("federation-rotation-test-token").await;
+    let now = chrono::Utc::now().timestamp_millis();
+    let registered = raft
+        .node()
+        .propose(Command::UpsertFederatedCluster {
+            cluster: FederatedCluster {
+                cluster_id: "rotation-source".into(),
+                endpoint: "https://127.0.0.1:1".into(),
+                identity_fingerprint: rotation_old_client_fingerprint(),
+                previous_identity_fingerprint: None,
+                previous_identity_expires_at_ms: None,
+                pending_identity_fingerprint: None,
+                rotation_started_at_ms: None,
+                pending_rotation_grace_period_ms: None,
+                version: env!("CARGO_PKG_VERSION").into(),
+                capabilities: BTreeSet::new(),
+                status: FederatedClusterStatus::Healthy,
+                last_seen_at_ms: now,
+                updated_at_ms: now,
+            },
+            request_id: "register-rotation-source".into(),
+            actor: "rotation-e2e".into(),
+        })
+        .await
+        .unwrap();
+    assert!(registered.success, "{}", registered.message);
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let tls = ServerTlsConfig::new()
+        .identity(Identity::from_pem(
+            ROTATION_SERVER_CERT,
+            ROTATION_SERVER_KEY,
+        ))
+        .client_ca_root(Certificate::from_pem(ROTATION_CA));
+    let service = Arc::new(RwLock::new(TaskServiceImpl {
+        task_store: raft.task_store.clone(),
+        raft_node: Some(Arc::new(raft.node().clone())),
+    }));
+    let shutdown = ShutdownToken::new();
+    let server_shutdown = shutdown.clone();
+    let server = tokio::spawn(async move {
+        Server::builder()
+            .tls_config(tls)
+            .unwrap()
+            .add_service(task::task_service_server::TaskServiceServer::new(service))
+            .serve_with_incoming_shutdown(
+                tokio_stream::wrappers::TcpListenerStream::new(listener),
+                server_shutdown.cancelled_owned(),
+            )
+            .await
+            .unwrap();
+    });
+
+    let directory = tempfile::tempdir().unwrap();
+    let write = |name: &str, bytes: &[u8]| {
+        let path = directory.path().join(name);
+        std::fs::write(&path, bytes).unwrap();
+        path
+    };
+    let ca = write("ca.pem", ROTATION_CA);
+    let old_cert = write("old-client.pem", ROTATION_OLD_CLIENT_CERT);
+    let old_key = write("old-client.key.pem", ROTATION_OLD_CLIENT_KEY);
+    let new_cert = write("new-client.pem", ROTATION_NEW_CLIENT_CERT);
+    let new_key = write("new-client.key.pem", ROTATION_NEW_CLIENT_KEY);
+    let endpoint = format!("https://{address}");
+
+    let mut old_client =
+        crate::comms::client::GrpcClient::connect_mtls(&endpoint, &ca, &old_cert, &old_key)
+            .await
+            .unwrap();
+    let staged = old_client
+        .stage_federated_certificate_rotation(
+            "rotation-source",
+            &rotation_new_client_fingerprint(),
+            "rotation-stage-e2e",
+            120_000,
+        )
+        .await
+        .unwrap();
+    assert!(staged.accepted, "{}", staged.message);
+
+    // The staged identity is not trusted for ordinary RPCs; it can only prove possession.
+    let mut new_client =
+        crate::comms::client::GrpcClient::connect_mtls(&endpoint, &ca, &new_cert, &new_key)
+            .await
+            .unwrap();
+    let proved = new_client
+        .prove_federated_certificate_rotation(
+            "rotation-source",
+            &rotation_new_client_fingerprint(),
+            "rotation-proof-e2e",
+        )
+        .await
+        .unwrap();
+    assert!(proved.accepted, "{}", proved.message);
+    assert_eq!(proved.state, "active_with_overlap");
+
+    let registered = raft
+        .task_store
+        .get_federated_cluster("rotation-source")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        registered.identity_fingerprint,
+        rotation_new_client_fingerprint()
+    );
+    assert_eq!(
+        registered.previous_identity_fingerprint.as_deref(),
+        Some(rotation_old_client_fingerprint().as_str())
+    );
+    assert!(registered.accepts_fingerprint(
+        &rotation_old_client_fingerprint(),
+        chrono::Utc::now().timestamp_millis()
+    ));
+
+    // The old certificate remains accepted during overlap, but cannot stage another rotation.
+    let old_identity_attempt = old_client
+        .stage_federated_certificate_rotation(
+            "rotation-source",
+            &"c".repeat(64),
+            "old-identity-cannot-rotate",
+            120_000,
+        )
+        .await
+        .unwrap();
+    assert!(!old_identity_attempt.accepted);
+
+    // A replay after a lost response is idempotent and does not extend the overlap window.
+    let replay = new_client
+        .prove_federated_certificate_rotation(
+            "rotation-source",
+            &rotation_new_client_fingerprint(),
+            "rotation-proof-e2e",
+        )
+        .await
+        .unwrap();
+    assert!(replay.accepted);
+    assert_eq!(
+        replay.previous_fingerprint_expires_at_ms,
+        proved.previous_fingerprint_expires_at_ms
+    );
+
+    shutdown.cancel();
+    server.await.unwrap();
+    raft.node.take().unwrap().shutdown().await.unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn federation_mtls_recovery_survives_two_source_and_target_leader_changes() {
     let _ = rustls::crypto::ring::default_provider().install_default();
@@ -1209,6 +1387,11 @@ async fn federation_mtls_recovery_survives_two_source_and_target_leader_changes(
                             cluster_id: cluster_id.into(),
                             endpoint: cluster_endpoint,
                             identity_fingerprint: client_fingerprint(),
+                            previous_identity_fingerprint: None,
+                            previous_identity_expires_at_ms: None,
+                            pending_identity_fingerprint: None,
+                            rotation_started_at_ms: None,
+                            pending_rotation_grace_period_ms: None,
                             version: env!("CARGO_PKG_VERSION").into(),
                             capabilities: BTreeSet::from([
                                 "task-provisioning".into(),

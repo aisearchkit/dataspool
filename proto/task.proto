@@ -157,6 +157,17 @@ message FederatedOperationResponse {
   string checkpoint_digest = 3;
   string message = 4;
 }
+message FederatedCertificateRotationRequest {
+  string new_fingerprint = 1;
+  string request_id = 2;
+  int64 grace_period_ms = 3;
+}
+message FederatedCertificateRotationResponse {
+  bool accepted = 1;
+  string state = 2;
+  int64 previous_fingerprint_expires_at_ms = 3;
+  string message = 4;
+}
 
 message TaskControlRequest { string task_id = 1; string request_id = 2; }
 message TaskControlResponse { bool success = 1; string message = 2; }
@@ -186,4 +197,7 @@ service TaskService {
   rpc PrepareFederatedCommit(FederatedOperationRequest) returns (FederatedOperationResponse);
   rpc CommitFederatedMigration(FederatedOperationRequest) returns (FederatedOperationResponse);
   rpc CompensateFederatedMigration(FederatedOperationRequest) returns (FederatedOperationResponse);
+  // Rotation staging uses the currently trusted certificate; proof must use the new certificate.
+  rpc StageFederatedCertificateRotation(FederatedCertificateRotationRequest) returns (FederatedCertificateRotationResponse);
+  rpc ProveFederatedCertificateRotation(FederatedCertificateRotationRequest) returns (FederatedCertificateRotationResponse);
 }

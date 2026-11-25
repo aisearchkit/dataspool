@@ -164,10 +164,7 @@ async fn verify_peer_identity<T>(
         .await
         .map_err(|error| Status::internal(error.to_string()))?
         .ok_or_else(|| Status::unauthenticated("Peer cluster is not registered"))?;
-    if !registered
-        .identity_fingerprint
-        .eq_ignore_ascii_case(&fingerprint)
-    {
+    if !registered.accepts_fingerprint(&fingerprint, chrono::Utc::now().timestamp_millis()) {
         return Err(Status::unauthenticated(
             "Peer certificate fingerprint does not match the pinned cluster identity",
         ));
@@ -631,6 +628,153 @@ impl task::task_service_server::TaskService for Arc<RwLock<TaskServiceImpl>> {
 
         Ok(Response::new(task::FailShardResponse {
             should_retry: false,
+        }))
+    }
+
+    async fn stage_federated_certificate_rotation(
+        &self,
+        request: Request<task::FederatedCertificateRotationRequest>,
+    ) -> std::result::Result<Response<task::FederatedCertificateRotationResponse>, Status> {
+        let peer = verify_peer_identity(self, &request).await?.ok_or_else(|| {
+            Status::unauthenticated(
+                "Certificate rotation requires an authenticated federation peer",
+            )
+        })?;
+        let current_fingerprint = request
+            .peer_certs()
+            .and_then(|certs| {
+                certs
+                    .first()
+                    .map(|cert| format!("{:x}", Sha256::digest(cert.as_ref())))
+            })
+            .ok_or_else(|| {
+                Status::unauthenticated("Current mTLS client certificate is required")
+            })?;
+        let req = request.into_inner();
+        if req.request_id.trim().is_empty() || req.request_id.len() > 128 {
+            return Err(Status::invalid_argument(
+                "request_id must contain 1-128 characters",
+            ));
+        }
+        let raft = self
+            .read()
+            .await
+            .raft_node
+            .clone()
+            .ok_or_else(|| Status::unavailable("Certificate rotation requires Raft"))?;
+        let result = raft
+            .propose(crate::raft::Command::StageFederatedCertificateRotation {
+                cluster_id: peer,
+                current_fingerprint,
+                new_fingerprint: req.new_fingerprint,
+                at_ms: chrono::Utc::now().timestamp_millis(),
+                grace_period_ms: req.grace_period_ms,
+                request_id: req.request_id,
+                actor: "federation-certificate-rotation".into(),
+            })
+            .await
+            .map_err(raft_status)?;
+        Ok(Response::new(task::FederatedCertificateRotationResponse {
+            accepted: result.success,
+            state: if result.success { "staged" } else { "rejected" }.into(),
+            previous_fingerprint_expires_at_ms: 0,
+            message: result.message,
+        }))
+    }
+
+    async fn prove_federated_certificate_rotation(
+        &self,
+        request: Request<task::FederatedCertificateRotationRequest>,
+    ) -> std::result::Result<Response<task::FederatedCertificateRotationResponse>, Status> {
+        let peer_header = request
+            .metadata()
+            .get("x-dataspool-peer-cluster")
+            .ok_or_else(|| Status::unauthenticated("Peer cluster identity is required"))?;
+        let peer = peer_header
+            .to_str()
+            .map_err(|_| Status::unauthenticated("Invalid peer cluster identity"))?
+            .to_string();
+        if peer.trim().is_empty() || peer.len() > 128 {
+            return Err(Status::unauthenticated("Invalid peer cluster identity"));
+        }
+        let fingerprint = request
+            .peer_certs()
+            .and_then(|certs| {
+                certs
+                    .first()
+                    .map(|cert| format!("{:x}", Sha256::digest(cert.as_ref())))
+            })
+            .ok_or_else(|| Status::unauthenticated("New mTLS client certificate is required"))?;
+        let req = request.into_inner();
+        if req.request_id.trim().is_empty() || req.request_id.len() > 128 {
+            return Err(Status::invalid_argument(
+                "request_id must contain 1-128 characters",
+            ));
+        }
+        if !req.new_fingerprint.eq_ignore_ascii_case(&fingerprint) {
+            return Err(Status::unauthenticated(
+                "Proof request fingerprint does not match the presented certificate",
+            ));
+        }
+        let (store, raft) = {
+            let service = self.read().await;
+            (service.task_store.clone(), service.raft_node.clone())
+        };
+        let raft = raft.ok_or_else(|| Status::unavailable("Certificate rotation requires Raft"))?;
+        raft.ensure_linearizable().await.map_err(raft_status)?;
+        let registered = store
+            .get_federated_cluster(&peer)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?
+            .ok_or_else(|| Status::unauthenticated("Peer cluster is not registered"))?;
+        if registered
+            .identity_fingerprint
+            .eq_ignore_ascii_case(&fingerprint)
+            && registered.previous_identity_fingerprint.is_some()
+            && registered.previous_identity_expires_at_ms.is_some()
+        {
+            return Ok(Response::new(task::FederatedCertificateRotationResponse {
+                accepted: true,
+                state: "active_with_overlap".into(),
+                previous_fingerprint_expires_at_ms: registered
+                    .previous_identity_expires_at_ms
+                    .unwrap_or_default(),
+                message: "Certificate rotation was already completed".into(),
+            }));
+        }
+        if !registered
+            .pending_identity_fingerprint
+            .as_deref()
+            .is_some_and(|pending| pending.eq_ignore_ascii_case(&fingerprint))
+        {
+            return Err(Status::unauthenticated(
+                "Presented certificate is not the staged rotation identity",
+            ));
+        }
+        let now = chrono::Utc::now().timestamp_millis();
+        let grace_period_ms = registered
+            .pending_rotation_grace_period_ms
+            .unwrap_or_default();
+        let result = raft
+            .propose(crate::raft::Command::CompleteFederatedCertificateRotation {
+                cluster_id: peer,
+                new_fingerprint: fingerprint,
+                at_ms: now,
+                request_id: req.request_id,
+                actor: "federation-certificate-proof".into(),
+            })
+            .await
+            .map_err(raft_status)?;
+        Ok(Response::new(task::FederatedCertificateRotationResponse {
+            accepted: result.success,
+            state: if result.success {
+                "active_with_overlap"
+            } else {
+                "rejected"
+            }
+            .into(),
+            previous_fingerprint_expires_at_ms: now.saturating_add(grace_period_ms),
+            message: result.message,
         }))
     }
 
