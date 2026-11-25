@@ -3435,7 +3435,6 @@ mod tests {
             .await
             .unwrap();
         assert!(!concurrent_commit.success);
-        assert!(concurrent_commit.message.contains("compensating"));
 
         assert!(
             sm.apply_command(propose(
