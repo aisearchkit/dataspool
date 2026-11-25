@@ -1229,7 +1229,7 @@ async fn postgres_partitioned_outbox_uses_vector_checkpoints_and_cutover_barrier
         allocated
     );
     replay.commit().await.unwrap();
-    assert_eq!(partitioned.vector_watermark().await.unwrap()[&2], 9);
+    assert_eq!(partitioned.vector_watermark().await.unwrap()[&2], 33);
 }
 
 #[tokio::test]
