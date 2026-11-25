@@ -72,5 +72,5 @@ jobs:
         run: cargo test --test postgres_cutover -- --nocapture
       - name: Run multi-member Raft failover integration
         run: cargo test --test raft_failover --all-features -- --nocapture
-      - name: Run federated certificate rotation process-crash integration
-        run: cargo test --test federation_rotation_process --all-features -- --nocapture
+      - name: Run federated CA bundle HA and process-crash integration
+        run: cargo test --test federation_rotation_process --all-features -- --nocapture --test-threads=1

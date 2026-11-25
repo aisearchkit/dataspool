@@ -447,6 +447,513 @@ fn reserve_local_addr() -> String {
     listener.local_addr().unwrap().to_string()
 }
 
+fn six_member_child_process(
+    cluster: &str,
+    member: usize,
+    root: &Path,
+    addresses: &str,
+    ready_dir: &Path,
+    control: &Path,
+    markers: &Path,
+) -> Child {
+    ProcessCommand::new(std::env::current_exe().expect("integration test executable"))
+        .args([
+            "--exact",
+            "federated_trust_bundle_rotation_survives_sigkill_of_both_three_member_raft_leaders",
+            "--nocapture",
+        ])
+        .env("DATASPOOL_TRUST_HA_CHILD", "1")
+        .env("DATASPOOL_TRUST_HA_CLUSTER", cluster)
+        .env("DATASPOOL_TRUST_HA_MEMBER", member.to_string())
+        .env("DATASPOOL_TRUST_HA_ROOT", root)
+        .env("DATASPOOL_TRUST_HA_ADDRESSES", addresses)
+        .env("DATASPOOL_TRUST_HA_READY_DIR", ready_dir)
+        .env("DATASPOOL_TRUST_HA_CONTROL", control)
+        .env("DATASPOOL_TRUST_HA_MARKERS", markers)
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .expect("spawn six-member Raft child")
+}
+
+fn write_control(path: &Path, value: &str) {
+    let next = path.with_extension("next");
+    std::fs::write(&next, value).unwrap();
+    std::fs::rename(next, path).unwrap();
+}
+
+async fn wait_for_file(path: &Path, children: &mut [Child]) {
+    tokio::time::timeout(Duration::from_secs(35), async {
+        loop {
+            if path.exists() {
+                return;
+            }
+            for child in children.iter_mut() {
+                if let Some(status) = child.try_wait().expect("poll six-member child") {
+                    panic!(
+                        "six-member child exited before {}: {status}",
+                        path.display()
+                    );
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(40)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("timed out waiting for {}", path.display()));
+}
+
+async fn run_six_member_child() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let cluster = std::env::var("DATASPOOL_TRUST_HA_CLUSTER").unwrap();
+    let member: usize = std::env::var("DATASPOOL_TRUST_HA_MEMBER")
+        .unwrap()
+        .parse()
+        .unwrap();
+    let root = PathBuf::from(std::env::var("DATASPOOL_TRUST_HA_ROOT").unwrap());
+    let addresses = std::env::var("DATASPOOL_TRUST_HA_ADDRESSES")
+        .unwrap()
+        .split(';')
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    assert_eq!(addresses.len(), 3);
+    let ready_dir = PathBuf::from(std::env::var("DATASPOOL_TRUST_HA_READY_DIR").unwrap());
+    let control = PathBuf::from(std::env::var("DATASPOOL_TRUST_HA_CONTROL").unwrap());
+    let markers = PathBuf::from(std::env::var("DATASPOOL_TRUST_HA_MARKERS").unwrap());
+    let base_id = if cluster == "source" { 91_000 } else { 92_000 };
+    let node_id = base_id + member as u64;
+    let peer_id = if cluster == "source" {
+        "trust-target-ha"
+    } else {
+        "trust-source-ha"
+    };
+    let db = RocksDbStore::open(root.join("app")).expect("open member application RocksDB");
+    let store = TaskStore::new(db.clone());
+    let node = RaftNode::new(
+        node_id,
+        root.join("raft"),
+        store.clone(),
+        raft_config(Duration::from_millis(140), Duration::from_millis(650)),
+        RAFT_TOKEN.into(),
+    )
+    .await
+    .expect("open persistent multi-member Raft node");
+    let listener = tokio::net::TcpListener::bind(&addresses[member])
+        .await
+        .expect("bind six-member Raft RPC listener");
+    let router = dataspool::raft_router(node.handle(), RAFT_TOKEN.into());
+    let _raft_server = tokio::spawn(async move {
+        axum::serve(listener, router)
+            .await
+            .expect("serve six-member Raft RPC");
+    });
+    std::fs::write(
+        ready_dir.join(format!("{cluster}-{member}.ready")),
+        b"ready",
+    )
+    .unwrap();
+    for index in 0..3 {
+        let ready = ready_dir.join(format!("{cluster}-{index}.ready"));
+        tokio::time::timeout(Duration::from_secs(20), async {
+            while !ready.exists() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("all three members must bind before bootstrap");
+    }
+    let members = (0..3)
+        .map(|index| {
+            (
+                base_id + index as u64,
+                BasicNode::new(addresses[index].clone()),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    if member == 0 {
+        node.initialize(members)
+            .await
+            .expect("initialize three-member Raft membership");
+    }
+    node.wait_for_leader(Duration::from_secs(25))
+        .await
+        .expect("elect multi-member Raft leader");
+    let process_id = std::process::id();
+    std::fs::write(
+        ready_dir.join(format!("{cluster}-{member}-{process_id}.ready")),
+        b"ready",
+    )
+    .unwrap();
+
+    let mut last_command = String::new();
+    let mut previous_leader = None;
+    loop {
+        if let Some(leader) = node.current_leader().await
+            && leader != previous_leader.unwrap_or(0)
+        {
+            previous_leader = Some(leader);
+            let leader_index = leader.saturating_sub(base_id) as usize;
+            std::fs::write(
+                markers.join(format!("{cluster}.leader")),
+                leader_index.to_string(),
+            )
+            .unwrap();
+        }
+        if !markers
+            .join(format!("{cluster}.member-{member}-{process_id}.candidate"))
+            .exists()
+            && let Some(state) = store.get_federated_cluster(peer_id).await.unwrap()
+            && state.pending_trust_bundle_fingerprint.as_deref() == Some(NEW_CA_FINGERPRINT)
+        {
+            std::fs::write(
+                markers.join(format!("{cluster}.member-{member}-{process_id}.candidate")),
+                b"candidate-recovered",
+            )
+            .unwrap();
+        }
+        let command = std::fs::read_to_string(&control).unwrap_or_default();
+        if command != last_command
+            && let Some(expected) = command.strip_prefix("verify:")
+        {
+            let expected_expiry: i64 = expected.parse().unwrap();
+            tokio::time::timeout(Duration::from_secs(20), async {
+                loop {
+                    if let Some(state) = store.get_federated_cluster(peer_id).await.unwrap()
+                        && state.trust_bundle_fingerprint.as_deref() == Some(NEW_CA_FINGERPRINT)
+                        && state.previous_trust_bundle_expires_at_ms == Some(expected_expiry)
+                        && state.pending_trust_bundle_pem.is_none()
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(40)).await;
+                }
+            })
+            .await
+            .expect("local state machine must converge after leader restart");
+            std::fs::write(
+                markers.join(format!("{cluster}.verified-{member}")),
+                b"verified",
+            )
+            .unwrap();
+            last_command = command.clone();
+        }
+        if command != last_command && node.is_leader().await {
+            if command == "stage" {
+                let now = chrono::Utc::now().timestamp_millis();
+                let old_ca = String::from_utf8(ROTATION_CA.to_vec()).unwrap();
+                let registered = node
+                    .propose(Command::UpsertFederatedCluster {
+                        cluster: FederatedCluster {
+                            cluster_id: peer_id.into(),
+                            endpoint: "https://127.0.0.1:1".into(),
+                            identity_fingerprint: OLD_FINGERPRINT.into(),
+                            previous_identity_fingerprint: None,
+                            previous_identity_expires_at_ms: None,
+                            pending_identity_fingerprint: None,
+                            rotation_started_at_ms: None,
+                            pending_rotation_grace_period_ms: None,
+                            trust_bundle_pem: Some(old_ca.clone()),
+                            trust_bundle_fingerprint: Some(
+                                dataspool::federation::validate_trust_bundle(&old_ca).unwrap(),
+                            ),
+                            pending_trust_bundle_pem: None,
+                            pending_trust_bundle_fingerprint: None,
+                            trust_bundle_staged_at_ms: None,
+                            previous_trust_bundle_pem: None,
+                            previous_trust_bundle_fingerprint: None,
+                            previous_trust_bundle_expires_at_ms: None,
+                            version: env!("CARGO_PKG_VERSION").into(),
+                            capabilities: BTreeSet::new(),
+                            status: FederatedClusterStatus::Healthy,
+                            last_seen_at_ms: now,
+                            updated_at_ms: now,
+                        },
+                        request_id: format!("six-member-register-{cluster}"),
+                        actor: "six-process-crash-e2e".into(),
+                    })
+                    .await
+                    .unwrap();
+                assert!(registered.success, "{}", registered.message);
+                let staged = node
+                    .propose(Command::StageFederatedTrustBundle {
+                        cluster_id: peer_id.into(),
+                        current_fingerprint: OLD_FINGERPRINT_CA.into(),
+                        bundle_pem: String::from_utf8(ROTATION_NEW_CA.to_vec()).unwrap(),
+                        bundle_fingerprint: NEW_CA_FINGERPRINT.into(),
+                        at_ms: now,
+                        request_id: format!("six-member-stage-{cluster}"),
+                        actor: "six-process-crash-e2e".into(),
+                    })
+                    .await
+                    .unwrap();
+                assert!(staged.success, "{}", staged.message);
+                // This is the durable commit marker. The parent SIGKILLs the
+                // actual leader immediately after observing it.
+                let committed = markers.join(format!("{cluster}.stage-committed"));
+                if !committed.exists() {
+                    std::fs::write(committed, member.to_string()).unwrap();
+                }
+                last_command = command;
+            } else if let Some(timestamp) = command.strip_prefix("activate:") {
+                let activated_at: i64 = timestamp.parse().unwrap();
+                let activated = node
+                    .propose(Command::ActivateFederatedTrustBundle {
+                        cluster_id: peer_id.into(),
+                        bundle_fingerprint: NEW_CA_FINGERPRINT.into(),
+                        at_ms: activated_at,
+                        overlap_ms: 60_000,
+                        request_id: format!("six-member-activate-{cluster}"),
+                        actor: "six-process-crash-e2e".into(),
+                    })
+                    .await
+                    .unwrap();
+                assert!(activated.success, "{}", activated.message);
+                let state = store.get_federated_cluster(peer_id).await.unwrap().unwrap();
+                assert_eq!(
+                    state.previous_trust_bundle_expires_at_ms,
+                    Some(activated_at + 60_000)
+                );
+                // Deliberately do not publish an acknowledgement marker: the
+                // parent kills this process at the commit-before-ACK boundary.
+                let committed = markers.join(format!("{cluster}.activate-committed"));
+                if !committed.exists() {
+                    std::fs::write(committed, member.to_string()).unwrap();
+                }
+                last_command = command;
+            } else if let Some(timestamp) = command.strip_prefix("replay:") {
+                let expiry: i64 = timestamp.parse().unwrap();
+                let replay = node
+                    .propose(Command::ActivateFederatedTrustBundle {
+                        cluster_id: peer_id.into(),
+                        bundle_fingerprint: NEW_CA_FINGERPRINT.into(),
+                        at_ms: expiry + 120_000,
+                        overlap_ms: 60_000,
+                        request_id: format!("six-member-activate-{cluster}"),
+                        actor: "six-process-lost-ack-replay".into(),
+                    })
+                    .await
+                    .unwrap();
+                assert!(replay.success, "{}", replay.message);
+                let state = store.get_federated_cluster(peer_id).await.unwrap().unwrap();
+                assert_eq!(state.previous_trust_bundle_expires_at_ms, Some(expiry));
+                std::fs::write(
+                    markers.join(format!("{cluster}.replayed")),
+                    member.to_string(),
+                )
+                .unwrap();
+                last_command = command;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn federated_trust_bundle_rotation_survives_sigkill_of_both_three_member_raft_leaders() {
+    if std::env::var_os("DATASPOOL_TRUST_HA_CHILD").is_some() {
+        run_six_member_child().await;
+        return;
+    }
+    let root = TempDir::new().unwrap();
+    let ready = root.path().join("ready");
+    let markers = root.path().join("markers");
+    std::fs::create_dir_all(&ready).unwrap();
+    std::fs::create_dir_all(&markers).unwrap();
+    let mut groups = Vec::new();
+    for cluster in ["source", "target"] {
+        let cluster_root = root.path().join(cluster);
+        std::fs::create_dir_all(&cluster_root).unwrap();
+        let addresses = (0..3).map(|_| reserve_local_addr()).collect::<Vec<_>>();
+        let address_list = addresses.join(";");
+        let control = root.path().join(format!("{cluster}.control"));
+        let mut children = Vec::new();
+        for member in 0..3 {
+            let member_root = cluster_root.join(format!("member-{member}"));
+            std::fs::create_dir_all(&member_root).unwrap();
+            children.push(six_member_child_process(
+                cluster,
+                member,
+                &member_root,
+                &address_list,
+                &ready,
+                &control,
+                &markers,
+            ));
+        }
+        groups.push((cluster.to_string(), addresses, control, children));
+    }
+    for (cluster, _, _, children) in &mut groups {
+        for member in 0..3 {
+            wait_for_file(&ready.join(format!("{cluster}-{member}.ready")), children).await;
+        }
+        wait_for_file(&markers.join(format!("{cluster}.leader")), children).await;
+    }
+
+    for (cluster, _, control, children) in &mut groups {
+        write_control(control, "stage");
+        wait_for_file(
+            &markers.join(format!("{cluster}.stage-committed")),
+            children,
+        )
+        .await;
+    }
+    let mut first_leaders = Vec::new();
+    for (cluster, _, _, children) in &mut groups {
+        let member: usize =
+            std::fs::read_to_string(markers.join(format!("{cluster}.stage-committed")))
+                .unwrap()
+                .parse()
+                .unwrap();
+        assert_sigkill(
+            &mut children[member],
+            "SIGKILL leader after CA Stage commit",
+        );
+        first_leaders.push((cluster.clone(), member));
+    }
+    for (cluster, _, _, children) in &mut groups {
+        let leader_file = markers.join(format!("{cluster}.leader"));
+        tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                if let Ok(value) = std::fs::read_to_string(&leader_file) {
+                    let index: usize = value.parse().unwrap();
+                    if children[index].try_wait().unwrap().is_none() {
+                        return;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(40)).await;
+            }
+        })
+        .await
+        .expect("quorum must elect a replacement leader after Stage SIGKILL");
+    }
+
+    for (cluster, member) in &first_leaders {
+        let group = groups.iter_mut().find(|group| &group.0 == cluster).unwrap();
+        let member_root = root.path().join(cluster).join(format!("member-{member}"));
+        let address_list = group.1.join(";");
+        group.3[*member] = six_member_child_process(
+            cluster,
+            *member,
+            &member_root,
+            &address_list,
+            &ready,
+            &group.2,
+            &markers,
+        );
+        let pid = group.3[*member].id();
+        wait_for_file(
+            &ready.join(format!("{cluster}-{member}-{pid}.ready")),
+            &mut group.3,
+        )
+        .await;
+        wait_for_file(
+            &markers.join(format!("{cluster}.member-{member}-{pid}.candidate")),
+            &mut group.3,
+        )
+        .await;
+    }
+
+    // Verify both surviving quorum members have applied the staged candidate,
+    // not merely that a replacement leader was elected.
+    for (cluster, killed_member) in &first_leaders {
+        let group = groups.iter_mut().find(|group| &group.0 == cluster).unwrap();
+        for member in 0..3 {
+            if member == *killed_member {
+                continue;
+            }
+            let pid = group.3[member].id();
+            wait_for_file(
+                &markers.join(format!("{cluster}.member-{member}-{pid}.candidate")),
+                &mut group.3,
+            )
+            .await;
+        }
+    }
+
+    let activate_at = chrono::Utc::now().timestamp_millis();
+    let expiry = activate_at + 60_000;
+    for (cluster, _, control, children) in &mut groups {
+        write_control(control, &format!("activate:{activate_at}"));
+        wait_for_file(
+            &markers.join(format!("{cluster}.activate-committed")),
+            children,
+        )
+        .await;
+        let member: usize =
+            std::fs::read_to_string(markers.join(format!("{cluster}.activate-committed")))
+                .unwrap()
+                .parse()
+                .unwrap();
+        assert_sigkill(
+            &mut children[member],
+            "SIGKILL leader after CA Activate commit before ACK",
+        );
+    }
+    for (cluster, _, control, children) in &mut groups {
+        let leader_file = markers.join(format!("{cluster}.leader"));
+        tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                if let Ok(value) = std::fs::read_to_string(&leader_file) {
+                    let index: usize = value.parse().unwrap();
+                    if children[index].try_wait().unwrap().is_none() {
+                        return;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(40)).await;
+            }
+        })
+        .await
+        .expect("quorum must elect a replacement leader after Activate SIGKILL");
+        write_control(control, &format!("replay:{expiry}"));
+        wait_for_file(&markers.join(format!("{cluster}.replayed")), children).await;
+    }
+
+    // Restart the Activate-killed leaders. Stage-killed leaders were already
+    // restarted and proved to have recovered their pending CA before Activate.
+    for (cluster, addresses, control, children) in &mut groups {
+        let activate_killed: usize =
+            std::fs::read_to_string(markers.join(format!("{cluster}.activate-committed")))
+                .unwrap()
+                .parse()
+                .unwrap();
+        let member_root = root
+            .path()
+            .join(&*cluster)
+            .join(format!("member-{activate_killed}"));
+        let address_list = addresses.join(";");
+        children[activate_killed] = six_member_child_process(
+            &*cluster,
+            activate_killed,
+            &member_root,
+            &address_list,
+            &ready,
+            control,
+            &markers,
+        );
+        let pid = children[activate_killed].id();
+        wait_for_file(
+            &ready.join(format!("{cluster}-{activate_killed}-{pid}.ready")),
+            children,
+        )
+        .await;
+        write_control(control, &format!("verify:{expiry}"));
+        for member in 0..3 {
+            wait_for_file(
+                &markers.join(format!("{cluster}.verified-{member}")),
+                children,
+            )
+            .await;
+        }
+    }
+    for (_, _, _, children) in &mut groups {
+        for child in children {
+            if child.try_wait().unwrap().is_none() {
+                assert_sigkill(child, "cleanup six-member Raft process");
+            }
+        }
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn federated_certificate_rotation_recovers_after_sigkill_across_both_raft_processes() {
     if std::env::var_os("DATASPOOL_ROTATION_PROCESS_PHASE").is_some() {
