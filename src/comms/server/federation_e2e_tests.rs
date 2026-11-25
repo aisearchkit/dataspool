@@ -121,15 +121,30 @@ impl TestRaftCluster {
         old_node.shutdown().await.unwrap();
         drop(old_node);
         let listener = TcpListener::bind(&self.raft_addr).await.unwrap();
-        let node = RaftNode::new(
-            self.node_id,
-            self._directory.path().join("raft"),
-            TaskStore::new(self.store.clone()),
-            raft_config(Duration::from_millis(120), Duration::from_millis(500)),
-            self.raft_token.clone(),
-        )
-        .await
-        .unwrap();
+        // OpenRaft shutdown completes before its RocksDB handle is necessarily
+        // released by every background task. Retry only the transient local
+        // RocksDB LOCK contention instead of making this crash/restart E2E flaky.
+        let mut lock_retries = 0;
+        let node = loop {
+            match RaftNode::new(
+                self.node_id,
+                self._directory.path().join("raft"),
+                TaskStore::new(self.store.clone()),
+                raft_config(Duration::from_millis(120), Duration::from_millis(500)),
+                self.raft_token.clone(),
+            )
+            .await
+            {
+                Ok(node) => break node,
+                Err(error)
+                    if lock_retries < 20 && format!("{error:?}").contains("No locks available") =>
+                {
+                    lock_retries += 1;
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                Err(error) => panic!("failed to reopen Raft after shutdown: {error}"),
+            }
+        };
         let router = raft_router(node.handle(), self.raft_token.clone());
         self.raft_server = Some(tokio::spawn(async move {
             let _ = axum::serve(listener, router).await;
