@@ -588,11 +588,33 @@ async fn postgres_drop_commit_response_proxy(
     // Relay the PostgreSQL startup packet (length + protocol + parameters).
     let mut startup_len = [0_u8; 4];
     client.read_exact(&mut startup_len).await.unwrap();
-    let startup_len = u32::from_be_bytes(startup_len) as usize;
-    let mut startup_rest = vec![0; startup_len - 4];
+    let mut startup_len_value = u32::from_be_bytes(startup_len) as usize;
+    let mut startup_rest = vec![0; startup_len_value - 4];
     client.read_exact(&mut startup_rest).await.unwrap();
+
+    // SQLx may probe TLS with the PostgreSQL SSLRequest before sending its
+    // StartupMessage. The server's one-byte N response is not a framed
+    // backend message, so relay it separately before switching to framing.
+    if startup_len_value == 8
+        && u32::from_be_bytes(startup_rest[..4].try_into().unwrap()) == 80_877_103
+    {
+        backend.write_all(&startup_len).await.unwrap();
+        backend.write_all(&startup_rest).await.unwrap();
+        let mut ssl_response = [0_u8; 1];
+        backend.read_exact(&mut ssl_response).await.unwrap();
+        client.write_all(&ssl_response).await.unwrap();
+        assert_eq!(
+            ssl_response[0], b'N',
+            "test proxy requires TLS-disabled PostgreSQL"
+        );
+        client.read_exact(&mut startup_len).await.unwrap();
+        startup_len_value = u32::from_be_bytes(startup_len) as usize;
+        startup_rest = vec![0; startup_len_value - 4];
+        client.read_exact(&mut startup_rest).await.unwrap();
+    }
+
     backend
-        .write_all(&(startup_len as u32).to_be_bytes())
+        .write_all(&(startup_len_value as u32).to_be_bytes())
         .await
         .unwrap();
     backend.write_all(&startup_rest).await.unwrap();
