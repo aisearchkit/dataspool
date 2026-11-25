@@ -26,13 +26,17 @@ docker exec "$PRIMARY" bash -lc "echo 'host replication replicator 0.0.0.0/0 scr
 docker exec -u postgres "$PRIMARY" /usr/lib/postgresql/16/bin/pg_ctl -D /var/lib/postgresql/data reload >/dev/null
 
 docker run -d --name "$STANDBY" --network "$NETWORK" -p 15434:5432 \
-  --user postgres --entrypoint bash postgres:16 -lc '
+  --entrypoint bash postgres:16 -lc '
     export PGPASSWORD=replica
-    printf "dataspool-pg-ha-primary:5432:replication:replicator:replica\n" > "$HOME/.pgpass"
-    chmod 600 "$HOME/.pgpass"
+    mkdir -p "$PGDATA"
     rm -rf "$PGDATA"/*
-    until pg_basebackup -h dataspool-pg-ha-primary -D "$PGDATA" -U replicator -Fp -Xs -P -R; do sleep 1; done
-    exec /usr/lib/postgresql/16/bin/postgres -c hot_standby=on -c listen_addresses="*"
+    chown -R postgres:postgres "$PGDATA"
+    chmod 700 "$PGDATA"
+    printf "dataspool-pg-ha-primary:5432:replication:replicator:replica\n" > "$HOME/.pgpass"
+    chown postgres:postgres "$HOME/.pgpass"
+    chmod 600 "$HOME/.pgpass"
+    until gosu postgres pg_basebackup -h dataspool-pg-ha-primary -D "$PGDATA" -U replicator -Fp -Xs -P -R; do sleep 1; done
+    exec gosu postgres /usr/lib/postgresql/16/bin/postgres -D "$PGDATA" -c hot_standby=on -c listen_addresses="*"
   ' >/dev/null
 for attempt in $(seq 1 90); do
   if docker exec "$STANDBY" pg_isready -U postgres -d dataspool_test >/dev/null 2>&1; then break; fi
