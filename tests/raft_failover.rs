@@ -89,7 +89,16 @@ async fn three_member_raft_leader_failover_fences_stale_worker() {
     )
     .with_lease_seconds(3)
     .unwrap();
-    let first_lease = first_claimer.try_claim().await.unwrap().unwrap();
+    let first_lease = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(lease) = first_claimer.try_claim().await.unwrap() {
+                break lease;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("replicated shard must become claimable on a follower");
     let first_fence = first_lease.fencing_token;
 
     // Stop the actual Raft leader while retaining the other two live members.
