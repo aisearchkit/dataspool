@@ -19,6 +19,300 @@ use crate::storage::RocksDbStore;
 use crate::task::TaskStore;
 use tokio_util::sync::CancellationToken;
 
+async fn connect_mtls_with_retry(
+    endpoint: &str,
+    ca_file: &std::path::Path,
+    certificate_file: &std::path::Path,
+    private_key_file: &std::path::Path,
+) -> crate::Result<GrpcClient> {
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            match GrpcClient::connect_mtls(endpoint, ca_file, certificate_file, private_key_file)
+                .await
+            {
+                Ok(client) => return Ok(client),
+                Err(_) => tokio::time::sleep(std::time::Duration::from_millis(50)).await,
+            }
+        }
+    })
+    .await
+    .map_err(|_| {
+        crate::DatspoolError::Internal(format!(
+            "timed out connecting to federation gRPC endpoint {endpoint}"
+        ))
+    })?
+}
+
+/// Stateless process-level coordinator that drives a bilateral activation
+/// through the two clusters' authenticated gRPC control planes. Durable progress
+/// remains in each cluster's Raft log, so this coordinator can be SIGKILLed and
+/// restarted without sharing a Raft member process or local database.
+pub struct FederatedTrustRotationProcessCoordinator {
+    local_client: GrpcClient,
+    peer_client: GrpcClient,
+    local_cluster_id: String,
+    peer_cluster_id: String,
+    rotation_id: String,
+    request_prefix: String,
+}
+
+impl FederatedTrustRotationProcessCoordinator {
+    #[allow(clippy::too_many_arguments)]
+    pub async fn connect(
+        local_cluster_id: impl Into<String>,
+        peer_cluster_id: impl Into<String>,
+        rotation_id: impl Into<String>,
+        request_prefix: impl Into<String>,
+        local_endpoint: &str,
+        peer_endpoint: &str,
+        local_ca_file: &std::path::Path,
+        peer_ca_file: &std::path::Path,
+        local_certificate_file: &std::path::Path,
+        local_private_key_file: &std::path::Path,
+        peer_certificate_file: &std::path::Path,
+        peer_private_key_file: &std::path::Path,
+    ) -> crate::Result<Self> {
+        let local_cluster_id = local_cluster_id.into();
+        let peer_cluster_id = peer_cluster_id.into();
+        let rotation_id = rotation_id.into();
+        let request_prefix = request_prefix.into();
+        if local_cluster_id.trim().is_empty()
+            || peer_cluster_id.trim().is_empty()
+            || rotation_id.trim().is_empty()
+            || request_prefix.trim().is_empty()
+            || request_prefix.len() > 80
+        {
+            return Err(crate::DatspoolError::Configuration(
+                "local/peer cluster IDs, rotation ID and request prefix are required (prefix <= 80 bytes)".into(),
+            ));
+        }
+        // The local cluster authenticates the peer's certificate; the peer
+        // cluster authenticates this coordinator's local-cluster certificate.
+        let local_client = connect_mtls_with_retry(
+            local_endpoint,
+            local_ca_file,
+            peer_certificate_file,
+            peer_private_key_file,
+        )
+        .await?;
+        let peer_client = connect_mtls_with_retry(
+            peer_endpoint,
+            peer_ca_file,
+            local_certificate_file,
+            local_private_key_file,
+        )
+        .await?;
+        Ok(Self {
+            local_client,
+            peer_client,
+            local_cluster_id,
+            peer_cluster_id,
+            rotation_id,
+            request_prefix,
+        })
+    }
+
+    /// Resume bilateral activation using stable request IDs. The first cluster
+    /// activates its peer trust, then the peer records that acknowledgement and
+    /// activates its own peer trust, then the first cluster records peer activation.
+    /// Repeating this method after process death replays the same committed commands.
+    pub async fn activate_both(
+        &mut self,
+    ) -> crate::Result<(
+        FederatedTrustRotationSnapshot,
+        FederatedTrustRotationSnapshot,
+    )> {
+        self.activate_both_with_expiry(None).await
+    }
+
+    /// Activate using a caller-supplied absolute deadline. This allows an
+    /// external scheduler to persist the intended deadline before issuing RPCs.
+    pub async fn activate_both_at(
+        &mut self,
+        expiry_ms: i64,
+    ) -> crate::Result<(
+        FederatedTrustRotationSnapshot,
+        FederatedTrustRotationSnapshot,
+    )> {
+        self.activate_both_with_expiry(Some(expiry_ms)).await
+    }
+
+    async fn activate_both_with_expiry(
+        &mut self,
+        requested_expiry: Option<i64>,
+    ) -> crate::Result<(
+        FederatedTrustRotationSnapshot,
+        FederatedTrustRotationSnapshot,
+    )> {
+        let (local_before, peer_before) = self.read_snapshots().await?;
+        if !local_before.rotation.activation_barrier_committed
+            || !peer_before.rotation.activation_barrier_committed
+        {
+            return Err(crate::DatspoolError::Configuration(
+                "both clusters must commit the activation barrier before process-level activation"
+                    .into(),
+            ));
+        }
+        for rotation in [&local_before.rotation, &peer_before.rotation] {
+            if !matches!(
+                rotation.phase,
+                FederatedTrustRotationPhase::Activating
+                    | FederatedTrustRotationPhase::RecoveryRequired
+                    | FederatedTrustRotationPhase::Overlap
+            ) {
+                return Err(crate::DatspoolError::Configuration(format!(
+                    "rotation {} cannot activate from phase {:?}",
+                    rotation.rotation_id, rotation.phase
+                )));
+            }
+        }
+        if local_before.rotation.overlap_ms != peer_before.rotation.overlap_ms {
+            return Err(crate::DatspoolError::Configuration(
+                "bilateral trust rotation overlap durations do not match".into(),
+            ));
+        }
+        let overlap_ms = local_before.rotation.overlap_ms;
+        let committed_expiries = [
+            local_before.rotation.local_activation_expires_at_ms,
+            local_before.rotation.peer_activation_expires_at_ms,
+            peer_before.rotation.local_activation_expires_at_ms,
+            peer_before.rotation.peer_activation_expires_at_ms,
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<std::collections::BTreeSet<_>>();
+        if committed_expiries.len() > 1 {
+            return Err(crate::DatspoolError::Internal(
+                "bilateral activation already contains conflicting overlap expiries".into(),
+            ));
+        }
+        let committed_expiry = committed_expiries.first().copied();
+        if requested_expiry.is_some()
+            && committed_expiry.is_some()
+            && requested_expiry != committed_expiry
+        {
+            return Err(crate::DatspoolError::Configuration(
+                "requested activation deadline differs from a deadline already committed in Raft"
+                    .into(),
+            ));
+        }
+        let expiry = committed_expiry.or(requested_expiry).unwrap_or_else(|| {
+            chrono::Utc::now()
+                .timestamp_millis()
+                .saturating_add(overlap_ms)
+        });
+
+        Self::ensure_remote_success(
+            self.local_client
+                .advance_remote_trust_rotation(
+                    &self.peer_cluster_id,
+                    &self.rotation_id,
+                    &format!("{}:activate-local", self.request_prefix),
+                    &FederatedTrustRotationEvent::PeerActivated {
+                        previous_expires_at_ms: expiry,
+                    },
+                )
+                .await?,
+        )?;
+        Self::ensure_remote_success(
+            self.peer_client
+                .advance_remote_trust_rotation(
+                    &self.local_cluster_id,
+                    &self.rotation_id,
+                    &format!("{}:peer-records-local-activation", self.request_prefix),
+                    &FederatedTrustRotationEvent::LocalActivated {
+                        previous_expires_at_ms: expiry,
+                    },
+                )
+                .await?,
+        )?;
+        Self::ensure_remote_success(
+            self.peer_client
+                .advance_remote_trust_rotation(
+                    &self.local_cluster_id,
+                    &self.rotation_id,
+                    &format!("{}:activate-peer", self.request_prefix),
+                    &FederatedTrustRotationEvent::PeerActivated {
+                        previous_expires_at_ms: expiry,
+                    },
+                )
+                .await?,
+        )?;
+        Self::ensure_remote_success(
+            self.local_client
+                .advance_remote_trust_rotation(
+                    &self.peer_cluster_id,
+                    &self.rotation_id,
+                    &format!("{}:event-peer-activated", self.request_prefix),
+                    &FederatedTrustRotationEvent::LocalActivated {
+                        previous_expires_at_ms: expiry,
+                    },
+                )
+                .await?,
+        )?;
+
+        let (local_after, peer_after) = self.read_snapshots().await?;
+        for snapshot in [&local_after, &peer_after] {
+            if snapshot.rotation.phase != FederatedTrustRotationPhase::Overlap
+                || snapshot.rotation.local_activation_expires_at_ms != Some(expiry)
+                || snapshot.rotation.peer_activation_expires_at_ms != Some(expiry)
+                || snapshot.peer_previous_ca_expires_at_ms != Some(expiry)
+            {
+                return Err(crate::DatspoolError::Internal(
+                    "bilateral activation did not converge to the same durable overlap deadline"
+                        .into(),
+                ));
+            }
+        }
+        Ok((local_after, peer_after))
+    }
+
+    async fn read_snapshots(
+        &mut self,
+    ) -> crate::Result<(
+        FederatedTrustRotationSnapshot,
+        FederatedTrustRotationSnapshot,
+    )> {
+        let local = self
+            .local_client
+            .get_remote_trust_rotation(&self.peer_cluster_id, &self.rotation_id)
+            .await?;
+        let peer = self
+            .peer_client
+            .get_remote_trust_rotation(&self.local_cluster_id, &self.rotation_id)
+            .await?;
+        if !local.accepted || !peer.accepted {
+            return Err(crate::DatspoolError::Internal(
+                "one federation cluster rejected a durable trust-rotation read".into(),
+            ));
+        }
+        let local: FederatedTrustRotationSnapshot = serde_json::from_str(&local.state_json)
+            .map_err(|error| crate::DatspoolError::Serialization(error.to_string()))?;
+        let peer: FederatedTrustRotationSnapshot = serde_json::from_str(&peer.state_json)
+            .map_err(|error| crate::DatspoolError::Serialization(error.to_string()))?;
+        if local.rotation.peer_cluster_id != self.peer_cluster_id
+            || peer.rotation.peer_cluster_id != self.local_cluster_id
+            || local.rotation.rotation_id != self.rotation_id
+            || peer.rotation.rotation_id != self.rotation_id
+        {
+            return Err(crate::DatspoolError::Configuration(
+                "the two gRPC endpoints returned mismatched federation rotation identities".into(),
+            ));
+        }
+        Ok((local, peer))
+    }
+
+    fn ensure_remote_success(
+        response: crate::comms::task::FederatedTrustRotationResponse,
+    ) -> crate::Result<()> {
+        if response.accepted {
+            Ok(())
+        } else {
+            Err(crate::DatspoolError::Internal(response.message))
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct FederatedTrustRotationCoordinator {
     store: Arc<TaskStore<RocksDbStore>>,

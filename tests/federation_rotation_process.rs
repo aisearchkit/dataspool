@@ -6,7 +6,10 @@
 
 use dataspool::{
     comms::{GrpcClient, GrpcServer},
-    federation::{FederatedCluster, FederatedClusterStatus},
+    federation::{
+        FederatedCluster, FederatedClusterStatus, FederatedTrustRotation,
+        FederatedTrustRotationEvent, FederatedTrustRotationPhase,
+    },
     raft::{Command, RaftNode, raft_config},
     storage::RocksDbStore,
     task::TaskStore,
@@ -584,6 +587,73 @@ fn six_member_child_process(
         .expect("spawn six-member Raft child")
 }
 
+#[allow(clippy::too_many_arguments)]
+fn coordinator_raft_child_process(
+    cluster: &str,
+    member: usize,
+    root: &Path,
+    addresses: &str,
+    ready_dir: &Path,
+    control: &Path,
+    markers: &Path,
+    grpc_addr: &str,
+    peer_grpc_addr: &str,
+    cert_dir: &Path,
+    ack_marker: &Path,
+    ack_gate: &Path,
+) -> Child {
+    ProcessCommand::new(std::env::current_exe().expect("integration test executable"))
+        .args([
+            "--exact",
+            "federated_trust_rotation_coordinator_process_recovers_after_remote_activate_ack_loss",
+            "--nocapture",
+        ])
+        .env("DATASPOOL_TRUST_HA_CHILD", "1")
+        .env("DATASPOOL_TRUST_HA_CLUSTER", cluster)
+        .env("DATASPOOL_TRUST_HA_MEMBER", member.to_string())
+        .env("DATASPOOL_TRUST_HA_ROOT", root)
+        .env("DATASPOOL_TRUST_HA_ADDRESSES", addresses)
+        .env("DATASPOOL_TRUST_HA_READY_DIR", ready_dir)
+        .env("DATASPOOL_TRUST_HA_CONTROL", control)
+        .env("DATASPOOL_TRUST_HA_MARKERS", markers)
+        .env("DATASPOOL_TRUST_HA_GRPC_ADDR", grpc_addr)
+        .env("DATASPOOL_TRUST_HA_PEER_GRPC_ADDR", peer_grpc_addr)
+        .env("DATASPOOL_TRUST_HA_CERT_DIR", cert_dir)
+        .env("DATASPOOL_TRUST_HA_ACK_MARKER", ack_marker)
+        .env("DATASPOOL_TRUST_HA_ACK_GATE", ack_gate)
+        .env("DATASPOOL_TRUST_HA_COORDINATOR_MODE", "1")
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .expect("spawn three-member Raft node with federation gRPC endpoint")
+}
+
+fn coordinator_process_child(
+    phase: &str,
+    source_endpoint: &str,
+    target_endpoint: &str,
+    cert_dir: &Path,
+    expiry_file: &Path,
+    marker: &Path,
+) -> Child {
+    ProcessCommand::new(std::env::current_exe().expect("integration test executable"))
+        .args([
+            "--exact",
+            "federated_trust_rotation_coordinator_process_recovers_after_remote_activate_ack_loss",
+            "--nocapture",
+        ])
+        .env("DATASPOOL_COORDINATOR_PROCESS_PHASE", phase)
+        .env("DATASPOOL_COORDINATOR_SOURCE_ENDPOINT", source_endpoint)
+        .env("DATASPOOL_COORDINATOR_TARGET_ENDPOINT", target_endpoint)
+        .env("DATASPOOL_COORDINATOR_CERT_DIR", cert_dir)
+        .env("DATASPOOL_COORDINATOR_EXPIRY_FILE", expiry_file)
+        .env("DATASPOOL_COORDINATOR_MARKER", marker)
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .expect("spawn independent coordinator OS process")
+}
+
 fn write_control(path: &Path, value: &str) {
     let next = path.with_extension("next");
     std::fs::write(&next, value).unwrap();
@@ -614,6 +684,159 @@ async fn wait_for_file(path: &Path, children: &mut [Child]) {
     .unwrap_or_else(|_| panic!("timed out waiting for {}", path.display()));
 }
 
+async fn seed_coordinator_rotation(
+    node: &RaftNode,
+    store: &TaskStore<RocksDbStore>,
+    cluster_id: &str,
+    peer_id: &str,
+    peer_endpoint: &str,
+) {
+    let now = chrono::Utc::now().timestamp_millis();
+    let old_ca_pem = String::from_utf8(ROTATION_CA.to_vec()).unwrap();
+    let new_ca_pem = String::from_utf8(ROTATION_NEW_CA.to_vec()).unwrap();
+    let registered = node
+        .propose(Command::UpsertFederatedCluster {
+            cluster: FederatedCluster {
+                cluster_id: peer_id.into(),
+                endpoint: peer_endpoint.into(),
+                identity_fingerprint: OLD_FINGERPRINT.into(),
+                previous_identity_fingerprint: None,
+                previous_identity_expires_at_ms: None,
+                pending_identity_fingerprint: None,
+                rotation_started_at_ms: None,
+                pending_rotation_grace_period_ms: None,
+                trust_bundle_pem: Some(old_ca_pem.clone()),
+                trust_bundle_fingerprint: Some(OLD_FINGERPRINT_CA.into()),
+                pending_trust_bundle_pem: None,
+                pending_trust_bundle_fingerprint: None,
+                trust_bundle_staged_at_ms: None,
+                previous_trust_bundle_pem: None,
+                previous_trust_bundle_fingerprint: None,
+                previous_trust_bundle_expires_at_ms: None,
+                version: env!("CARGO_PKG_VERSION").into(),
+                capabilities: BTreeSet::new(),
+                status: FederatedClusterStatus::Healthy,
+                last_seen_at_ms: now,
+                updated_at_ms: now,
+            },
+            request_id: format!("coordinator-process-register-{cluster_id}"),
+            actor: "coordinator-process-e2e".into(),
+        })
+        .await
+        .unwrap();
+    assert!(registered.success, "{}", registered.message);
+
+    let rotation = FederatedTrustRotation {
+        rotation_id: "coordinator-process-rotation".into(),
+        peer_cluster_id: peer_id.into(),
+        current_peer_ca_fingerprint: Some(OLD_FINGERPRINT_CA.into()),
+        local_ca_bundle_pem: new_ca_pem.clone(),
+        local_ca_bundle_fingerprint: NEW_CA_FINGERPRINT.into(),
+        peer_ca_bundle_pem: new_ca_pem.clone(),
+        peer_ca_bundle_fingerprint: NEW_CA_FINGERPRINT.into(),
+        local_leaf_fingerprint: NEW_FINGERPRINT.into(),
+        peer_leaf_fingerprint: NEW_FINGERPRINT.into(),
+        overlap_ms: 60_000,
+        phase: FederatedTrustRotationPhase::Staging,
+        local_staged: false,
+        peer_staged: false,
+        local_deployment_ready: false,
+        peer_deployment_ready: false,
+        activation_barrier_committed: false,
+        local_activation_expires_at_ms: None,
+        peer_activation_expires_at_ms: None,
+        local_retired: false,
+        peer_retired: false,
+        rollback_reason: None,
+        last_error: None,
+        revision: 0,
+        created_at_ms: now,
+        updated_at_ms: now,
+    };
+    let created = node
+        .propose(Command::CreateFederatedTrustRotation {
+            rotation: Box::new(rotation),
+            at_ms: now,
+            request_id: format!("coordinator-process-create-{cluster_id}"),
+            actor: "coordinator-process-e2e".into(),
+        })
+        .await
+        .unwrap();
+    assert!(created.success, "{}", created.message);
+
+    let staged_leaf = node
+        .propose(Command::StageFederatedCertificateRotation {
+            cluster_id: peer_id.into(),
+            current_fingerprint: OLD_FINGERPRINT.into(),
+            new_fingerprint: NEW_FINGERPRINT.into(),
+            at_ms: now,
+            grace_period_ms: 60_000,
+            request_id: format!("coordinator-process-stage-leaf-{cluster_id}"),
+            actor: "coordinator-process-e2e".into(),
+        })
+        .await
+        .unwrap();
+    assert!(staged_leaf.success, "{}", staged_leaf.message);
+    let staged_ca = node
+        .propose(Command::StageFederatedTrustBundle {
+            cluster_id: peer_id.into(),
+            current_fingerprint: OLD_FINGERPRINT_CA.into(),
+            bundle_pem: new_ca_pem,
+            bundle_fingerprint: NEW_CA_FINGERPRINT.into(),
+            at_ms: now,
+            request_id: format!("coordinator-process-stage-ca-{cluster_id}"),
+            actor: "coordinator-process-e2e".into(),
+        })
+        .await
+        .unwrap();
+    assert!(staged_ca.success, "{}", staged_ca.message);
+
+    let events = [
+        FederatedTrustRotationEvent::LocalStaged {
+            fingerprint: NEW_CA_FINGERPRINT.into(),
+        },
+        FederatedTrustRotationEvent::PeerStaged {
+            fingerprint: NEW_CA_FINGERPRINT.into(),
+        },
+        FederatedTrustRotationEvent::LocalDeploymentReady {
+            leaf_fingerprint: NEW_FINGERPRINT.into(),
+        },
+        FederatedTrustRotationEvent::PeerDeploymentReady {
+            leaf_fingerprint: NEW_FINGERPRINT.into(),
+        },
+        FederatedTrustRotationEvent::AuthorizeActivation,
+    ];
+    for (index, event) in events.into_iter().enumerate() {
+        let current = store
+            .get_federated_trust_rotation("coordinator-process-rotation")
+            .await
+            .unwrap()
+            .unwrap();
+        let result = node
+            .propose(Command::AdvanceFederatedTrustRotation {
+                rotation_id: current.rotation_id,
+                expected_revision: current.revision,
+                event,
+                at_ms: now + index as i64,
+                request_id: format!("coordinator-process-event-{cluster_id}-{index}"),
+                actor: "coordinator-process-e2e".into(),
+            })
+            .await
+            .unwrap();
+        assert!(result.success, "{}", result.message);
+    }
+    let final_rotation = store
+        .get_federated_trust_rotation("coordinator-process-rotation")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        final_rotation.phase,
+        FederatedTrustRotationPhase::Activating
+    );
+    assert!(final_rotation.activation_barrier_committed);
+}
+
 async fn run_six_member_child() {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let cluster = std::env::var("DATASPOOL_TRUST_HA_CLUSTER").unwrap();
@@ -633,7 +856,13 @@ async fn run_six_member_child() {
     let markers = PathBuf::from(std::env::var("DATASPOOL_TRUST_HA_MARKERS").unwrap());
     let base_id = if cluster == "source" { 91_000 } else { 92_000 };
     let node_id = base_id + member as u64;
-    let peer_id = if cluster == "source" {
+    let peer_id = if std::env::var_os("DATASPOOL_TRUST_HA_COORDINATOR_MODE").is_some() {
+        if cluster == "source" {
+            "target"
+        } else {
+            "source"
+        }
+    } else if cluster == "source" {
         "trust-target-ha"
     } else {
         "trust-source-ha"
@@ -689,6 +918,39 @@ async fn run_six_member_child() {
     node.wait_for_leader(Duration::from_secs(25))
         .await
         .expect("elect multi-member Raft leader");
+    if member == 0
+        && let Ok(grpc_addr) = std::env::var("DATASPOOL_TRUST_HA_GRPC_ADDR")
+    {
+        let cert_dir = PathBuf::from(std::env::var("DATASPOOL_TRUST_HA_CERT_DIR").unwrap());
+        let server_cert = cert_dir.join("server.pem");
+        let server_key = cert_dir.join("server.key.pem");
+        let client_ca = cert_dir.join("ca.pem");
+        let mut grpc = GrpcServer::new(
+            &grpc_addr,
+            std::sync::Arc::new(store.clone()),
+            Some(std::sync::Arc::new(node.clone())),
+        )
+        .await
+        .unwrap()
+        .with_mtls_files(&server_cert, &server_key, &client_ca)
+        .await
+        .unwrap();
+        if cluster == "target" {
+            grpc = grpc
+                .with_rotation_event_ack_drop_marker(PathBuf::from(
+                    std::env::var("DATASPOOL_TRUST_HA_ACK_MARKER").unwrap(),
+                ))
+                .with_rotation_event_ack_gate(PathBuf::from(
+                    std::env::var("DATASPOOL_TRUST_HA_ACK_GATE").unwrap(),
+                ))
+                .with_rotation_event_ack_drop_after(1);
+        }
+        tokio::spawn(async move {
+            grpc.serve()
+                .await
+                .expect("serve Raft-backed federation gRPC endpoint");
+        });
+    }
     let process_id = std::process::id();
     std::fs::write(
         ready_dir.join(format!("{cluster}-{member}-{process_id}.ready")),
@@ -724,6 +986,36 @@ async fn run_six_member_child() {
         }
         let command = std::fs::read_to_string(&control).unwrap_or_default();
         if command != last_command
+            && let Some(expected) = command.strip_prefix("verify-coordinator:")
+        {
+            let expected_expiry: i64 = expected.parse().unwrap();
+            tokio::time::timeout(Duration::from_secs(25), async {
+                loop {
+                    let peer = store.get_federated_cluster(peer_id).await.unwrap();
+                    let rotation = store.get_federated_trust_rotation("coordinator-process-rotation").await.unwrap();
+                    if let (Some(peer), Some(rotation)) = (peer, rotation)
+                        && peer.trust_bundle_fingerprint.as_deref() == Some(NEW_CA_FINGERPRINT)
+                        && peer.previous_trust_bundle_expires_at_ms == Some(expected_expiry)
+                        && peer.pending_trust_bundle_pem.is_none()
+                        && rotation.phase == FederatedTrustRotationPhase::Overlap
+                        && rotation.local_activation_expires_at_ms == Some(expected_expiry)
+                        && rotation.peer_activation_expires_at_ms == Some(expected_expiry)
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(40)).await;
+                }
+            })
+            .await
+            .expect("both Raft state machine and coordinator record must converge to the same Overlap expiry");
+            std::fs::write(
+                markers.join(format!("{cluster}.coordinator-verified-{member}")),
+                b"verified",
+            )
+            .unwrap();
+            last_command = command.clone();
+        }
+        if command != last_command
             && let Some(expected) = command.strip_prefix("verify:")
         {
             let expected_expiry: i64 = expected.parse().unwrap();
@@ -749,7 +1041,16 @@ async fn run_six_member_child() {
             last_command = command.clone();
         }
         if command != last_command && node.is_leader().await {
-            if command == "stage" {
+            if command.strip_prefix("seed:").is_some() {
+                let peer_endpoint = std::env::var("DATASPOOL_TRUST_HA_PEER_GRPC_ADDR").unwrap();
+                seed_coordinator_rotation(&node, &store, &cluster, peer_id, &peer_endpoint).await;
+                std::fs::write(
+                    markers.join(format!("{cluster}.coordinator-seeded")),
+                    b"seeded",
+                )
+                .unwrap();
+                last_command = command;
+            } else if command == "stage" {
                 let now = chrono::Utc::now().timestamp_millis();
                 let old_ca = String::from_utf8(ROTATION_CA.to_vec()).unwrap();
                 let registered = node
@@ -1061,6 +1362,262 @@ async fn federated_trust_bundle_rotation_survives_sigkill_of_both_three_member_r
             if child.try_wait().unwrap().is_none() {
                 assert_sigkill(child, "cleanup six-member Raft process");
             }
+        }
+    }
+}
+
+async fn run_coordinator_process() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let phase = std::env::var("DATASPOOL_COORDINATOR_PROCESS_PHASE").unwrap();
+    let source_endpoint = std::env::var("DATASPOOL_COORDINATOR_SOURCE_ENDPOINT").unwrap();
+    let target_endpoint = std::env::var("DATASPOOL_COORDINATOR_TARGET_ENDPOINT").unwrap();
+    let cert_dir = PathBuf::from(std::env::var("DATASPOOL_COORDINATOR_CERT_DIR").unwrap());
+    let expiry_file = PathBuf::from(std::env::var("DATASPOOL_COORDINATOR_EXPIRY_FILE").unwrap());
+    let marker = PathBuf::from(std::env::var("DATASPOOL_COORDINATOR_MARKER").unwrap());
+    let ca = cert_dir.join("ca.pem");
+    let client_cert = cert_dir.join("client.pem");
+    let client_key = cert_dir.join("client.key.pem");
+    let mut coordinator = dataspool::FederatedTrustRotationProcessCoordinator::connect(
+        "source",
+        "target",
+        "coordinator-process-rotation",
+        "coordinator-process",
+        &source_endpoint,
+        &target_endpoint,
+        &ca,
+        &ca,
+        &client_cert,
+        &client_key,
+        &client_cert,
+        &client_key,
+    )
+    .await
+    .unwrap();
+    if phase == "initial" {
+        let expiry = chrono::Utc::now().timestamp_millis() + 60_000;
+        std::fs::write(&expiry_file, expiry.to_string()).unwrap();
+        let result = coordinator.activate_both_at(expiry).await;
+        panic!("target Activate ACK should remain gated after Raft commit: {result:?}");
+    }
+    let expiry: i64 = std::fs::read_to_string(&expiry_file)
+        .unwrap()
+        .parse()
+        .unwrap();
+    let (source, target) = coordinator.activate_both_at(expiry).await.unwrap();
+    assert_eq!(source.rotation.phase, FederatedTrustRotationPhase::Overlap);
+    assert_eq!(target.rotation.phase, FederatedTrustRotationPhase::Overlap);
+    assert_eq!(source.rotation.local_activation_expires_at_ms, Some(expiry));
+    assert_eq!(source.rotation.peer_activation_expires_at_ms, Some(expiry));
+    assert_eq!(target.rotation.local_activation_expires_at_ms, Some(expiry));
+    assert_eq!(target.rotation.peer_activation_expires_at_ms, Some(expiry));
+    std::fs::write(&marker, b"coordinator-recovered-overlap").unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn federated_trust_rotation_coordinator_process_recovers_after_remote_activate_ack_loss() {
+    if std::env::var_os("DATASPOOL_TRUST_HA_CHILD").is_some() {
+        run_six_member_child().await;
+        return;
+    }
+    if std::env::var_os("DATASPOOL_COORDINATOR_PROCESS_PHASE").is_some() {
+        run_coordinator_process().await;
+        return;
+    }
+
+    let root = TempDir::new().unwrap();
+    let ready = root.path().join("ready");
+    let markers = root.path().join("markers");
+    let cert_dir = root.path().join("certs");
+    std::fs::create_dir_all(&ready).unwrap();
+    std::fs::create_dir_all(&markers).unwrap();
+    std::fs::create_dir_all(&cert_dir).unwrap();
+    for (name, bytes) in [
+        ("ca.pem", ROTATION_CA),
+        ("server.pem", ROTATION_SERVER_CERT),
+        ("server.key.pem", ROTATION_SERVER_KEY),
+        ("client.pem", ROTATION_OLD_CERT),
+        ("client.key.pem", ROTATION_OLD_KEY),
+    ] {
+        std::fs::write(cert_dir.join(name), bytes).unwrap();
+    }
+    let source_grpc = reserve_local_addr();
+    let target_grpc = reserve_local_addr();
+    let ack_marker = root.path().join("target-activate-committed.marker");
+    let ack_gate = root.path().join("target-activate-ack.release");
+    let expiry_file = root.path().join("activation-expiry.txt");
+    let initial_marker = root.path().join("coordinator-initial.marker");
+    let recovered_marker = root.path().join("coordinator-recovered.marker");
+    let mut groups = Vec::new();
+    for cluster in ["source", "target"] {
+        let cluster_root = root.path().join(cluster);
+        std::fs::create_dir_all(&cluster_root).unwrap();
+        let addresses = (0..3).map(|_| reserve_local_addr()).collect::<Vec<_>>();
+        let address_list = addresses.join(";");
+        let control = root.path().join(format!("{cluster}.control"));
+        let mut children = Vec::new();
+        for member in 0..3 {
+            let member_root = cluster_root.join(format!("member-{member}"));
+            std::fs::create_dir_all(&member_root).unwrap();
+            let (grpc, peer_grpc) = if cluster == "source" {
+                (&source_grpc, &target_grpc)
+            } else {
+                (&target_grpc, &source_grpc)
+            };
+            children.push(coordinator_raft_child_process(
+                cluster,
+                member,
+                &member_root,
+                &address_list,
+                &ready,
+                &control,
+                &markers,
+                grpc,
+                peer_grpc,
+                &cert_dir,
+                &ack_marker,
+                &ack_gate,
+            ));
+        }
+        groups.push((cluster.to_string(), addresses, control, children));
+    }
+    for (cluster, _, _, children) in &mut groups {
+        for member in 0..3 {
+            wait_for_file(&ready.join(format!("{cluster}-{member}.ready")), children).await;
+        }
+        wait_for_file(&markers.join(format!("{cluster}.leader")), children).await;
+    }
+    for (cluster, _, control, children) in &mut groups {
+        write_control(control, "seed:coordinator-process");
+        wait_for_file(
+            &markers.join(format!("{cluster}.coordinator-seeded")),
+            children,
+        )
+        .await;
+    }
+
+    let mut coordinator = coordinator_process_child(
+        "initial",
+        &format!("https://{source_grpc}"),
+        &format!("https://{target_grpc}"),
+        &cert_dir,
+        &expiry_file,
+        &initial_marker,
+    );
+    wait_for_file(&ack_marker, std::slice::from_mut(&mut coordinator)).await;
+    let expiry: i64 = std::fs::read_to_string(&expiry_file)
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_sigkill(
+        &mut coordinator,
+        "SIGKILL independent coordinator while remote Activate ACK is gated",
+    );
+    // Release the remote server's blocked response only after the coordinator
+    // has died. The Raft processes and their RocksDB directories remain intact.
+    std::fs::write(&ack_gate, b"release").unwrap();
+
+    // Inspect both durable Raft snapshots before restarting the coordinator:
+    // Source has committed its local Activate but has not recorded peer ACK;
+    // Target has committed its local Activate and the corresponding peer event.
+    let read_snapshot = |endpoint: String, peer_id: &'static str| {
+        let ca = cert_dir.join("ca.pem");
+        let cert = cert_dir.join("client.pem");
+        let key = cert_dir.join("client.key.pem");
+        async move {
+            tokio::time::timeout(Duration::from_secs(20), async {
+                loop {
+                    if let Ok(mut client) =
+                        GrpcClient::connect_mtls(&endpoint, &ca, &cert, &key).await
+                        && let Ok(response) = client
+                            .get_remote_trust_rotation(peer_id, "coordinator-process-rotation")
+                            .await
+                        && response.accepted
+                        && let Ok(snapshot) = serde_json::from_str::<
+                            dataspool::federation::FederatedTrustRotationSnapshot,
+                        >(&response.state_json)
+                    {
+                        return snapshot;
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            })
+            .await
+            .expect("committed coordinator crash-boundary state must be readable")
+        }
+    };
+    let source_before_restart = read_snapshot(format!("https://{source_grpc}"), "target").await;
+    let target_before_restart = read_snapshot(format!("https://{target_grpc}"), "source").await;
+    assert_eq!(
+        source_before_restart.rotation.phase,
+        FederatedTrustRotationPhase::Activating
+    );
+    assert_eq!(
+        source_before_restart
+            .rotation
+            .local_activation_expires_at_ms,
+        Some(expiry)
+    );
+    assert_eq!(
+        source_before_restart.rotation.peer_activation_expires_at_ms,
+        None
+    );
+    assert_eq!(
+        source_before_restart.peer_previous_ca_expires_at_ms,
+        Some(expiry)
+    );
+    assert_eq!(
+        target_before_restart.rotation.phase,
+        FederatedTrustRotationPhase::Overlap
+    );
+    assert_eq!(
+        target_before_restart
+            .rotation
+            .local_activation_expires_at_ms,
+        Some(expiry)
+    );
+    assert_eq!(
+        target_before_restart.rotation.peer_activation_expires_at_ms,
+        Some(expiry)
+    );
+    assert_eq!(
+        target_before_restart.peer_previous_ca_expires_at_ms,
+        Some(expiry)
+    );
+
+    let mut recovered = coordinator_process_child(
+        "recover",
+        &format!("https://{source_grpc}"),
+        &format!("https://{target_grpc}"),
+        &cert_dir,
+        &expiry_file,
+        &recovered_marker,
+    );
+    wait_for_file(&recovered_marker, std::slice::from_mut(&mut recovered)).await;
+    let recovered_status = recovered
+        .wait()
+        .expect("wait for recovered coordinator process");
+    assert!(
+        recovered_status.success(),
+        "recovered coordinator failed: {recovered_status}"
+    );
+
+    for (cluster, _, control, children) in &mut groups {
+        write_control(control, &format!("verify-coordinator:{expiry}"));
+        for member in 0..3 {
+            wait_for_file(
+                &markers.join(format!("{cluster}.coordinator-verified-{member}")),
+                children,
+            )
+            .await;
+        }
+    }
+    for (_, _, _, children) in &mut groups {
+        for child in children {
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "a Raft member process exited; the coordinator crash must not restart or kill cluster members"
+            );
+            assert_sigkill(child, "cleanup coordinator recovery Raft member process");
         }
     }
 }

@@ -10,7 +10,7 @@ use sha2::{Digest, Sha256};
 use std::{
     future::Future,
     pin::Pin,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
     task::{Context, Poll},
 };
 use std::{path::PathBuf, sync::Arc};
@@ -46,6 +46,8 @@ pub struct GrpcServer {
     rotation_event_ack_drop_marker: Option<PathBuf>,
     #[cfg(feature = "test-fault-injection")]
     rotation_event_ack_gate: Option<PathBuf>,
+    #[cfg(feature = "test-fault-injection")]
+    rotation_event_ack_drop_after: usize,
 }
 
 impl GrpcServer {
@@ -71,6 +73,8 @@ impl GrpcServer {
             rotation_event_ack_drop_marker: None,
             #[cfg(feature = "test-fault-injection")]
             rotation_event_ack_gate: None,
+            #[cfg(feature = "test-fault-injection")]
+            rotation_event_ack_drop_after: 0,
         })
     }
 
@@ -127,6 +131,13 @@ impl GrpcServer {
         self
     }
 
+    /// Allow this many event responses through before dropping one response.
+    #[cfg(feature = "test-fault-injection")]
+    pub fn with_rotation_event_ack_drop_after(mut self, count: usize) -> Self {
+        self.rotation_event_ack_drop_after = count;
+        self
+    }
+
     /// Start the gRPC server until the process receives its shutdown signal.
     pub async fn serve(self) -> Result<()> {
         self.serve_until_cancelled(crate::CancellationToken::new())
@@ -143,16 +154,19 @@ impl GrpcServer {
             )))
         })?;
         info!("Starting gRPC server on {}", addr);
+        #[cfg(feature = "test-fault-injection")]
+        let fault_layer = DropRotationProofAckLayer::new(
+            self.rotation_proof_ack_drop_marker.clone(),
+            self.rotation_event_ack_drop_marker.clone(),
+            self.rotation_event_ack_gate.clone(),
+            self.rotation_event_ack_drop_after,
+        );
 
         loop {
             let tls = self.load_tls_config().await?;
             let tls_fingerprint = self.tls_material_fingerprint().await?;
             #[cfg(feature = "test-fault-injection")]
-            let mut builder = Server::builder().layer(DropRotationProofAckLayer::new(
-                self.rotation_proof_ack_drop_marker.clone(),
-                self.rotation_event_ack_drop_marker.clone(),
-                self.rotation_event_ack_gate.clone(),
-            ));
+            let mut builder = Server::builder().layer(fault_layer.clone());
             #[cfg(not(feature = "test-fault-injection"))]
             let mut builder = Server::builder();
             if let Some(tls) = tls {
@@ -282,6 +296,8 @@ struct DropRotationProofAckLayer {
     proof_marker: Option<Arc<PathBuf>>,
     event_marker: Option<Arc<PathBuf>>,
     event_gate: Option<Arc<PathBuf>>,
+    event_drop_after: usize,
+    event_seen: Arc<AtomicUsize>,
     proof_dropped: Arc<AtomicBool>,
     event_dropped: Arc<AtomicBool>,
 }
@@ -292,11 +308,14 @@ impl DropRotationProofAckLayer {
         proof_marker: Option<PathBuf>,
         event_marker: Option<PathBuf>,
         event_gate: Option<PathBuf>,
+        event_drop_after: usize,
     ) -> Self {
         Self {
             proof_marker: proof_marker.map(Arc::new),
             event_marker: event_marker.map(Arc::new),
             event_gate: event_gate.map(Arc::new),
+            event_drop_after,
+            event_seen: Arc::new(AtomicUsize::new(0)),
             proof_dropped: Arc::new(AtomicBool::new(false)),
             event_dropped: Arc::new(AtomicBool::new(false)),
         }
@@ -313,6 +332,8 @@ impl<S> Layer<S> for DropRotationProofAckLayer {
             proof_marker: self.proof_marker.clone(),
             event_marker: self.event_marker.clone(),
             event_gate: self.event_gate.clone(),
+            event_drop_after: self.event_drop_after,
+            event_seen: self.event_seen.clone(),
             proof_dropped: self.proof_dropped.clone(),
             event_dropped: self.event_dropped.clone(),
         }
@@ -326,6 +347,8 @@ struct DropRotationProofAck<S> {
     proof_marker: Option<Arc<PathBuf>>,
     event_marker: Option<Arc<PathBuf>>,
     event_gate: Option<Arc<PathBuf>>,
+    event_drop_after: usize,
+    event_seen: Arc<AtomicUsize>,
     proof_dropped: Arc<AtomicBool>,
     event_dropped: Arc<AtomicBool>,
 }
@@ -358,6 +381,8 @@ where
         let proof_marker = self.proof_marker.clone();
         let event_marker = self.event_marker.clone();
         let event_gate = self.event_gate.clone();
+        let event_drop_after = self.event_drop_after;
+        let event_seen = self.event_seen.clone();
         let proof_dropped = self.proof_dropped.clone();
         let event_dropped = self.event_dropped.clone();
         Box::pin(async move {
@@ -369,6 +394,7 @@ where
                 proof_marker.as_ref()
             } else if path.contains("advancefederatedtrustrotation")
                 && event_marker.is_some()
+                && event_seen.fetch_add(1, Ordering::SeqCst) >= event_drop_after
                 && !event_dropped.swap(true, Ordering::SeqCst)
             {
                 event_marker.as_ref()

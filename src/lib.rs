@@ -43,7 +43,9 @@ pub use agent::{NodeLifecycle, ShardClaimer, ShardExecutor, WorkerPool};
 pub use comms::{GrpcClient, GrpcServer};
 pub use config::DatspoolConfig;
 pub use error::{ConfigError, DatspoolError, DriverError, RaftError, Result, StorageError};
-pub use federation::trust_rotation::FederatedTrustRotationCoordinator;
+pub use federation::trust_rotation::{
+    FederatedTrustRotationCoordinator, FederatedTrustRotationProcessCoordinator,
+};
 pub use federation::{
     FederatedCluster, FederatedClusterStatus, FederatedMigration, FederatedTrustRotation,
     FederatedTrustRotationEvent, FederatedTrustRotationPhase, MigrationState,
