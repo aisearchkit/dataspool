@@ -2624,16 +2624,23 @@ async fn bilateral_trust_rotation_coordinator_proves_new_leaves_and_activates_bo
         "old-and-new-ca.pem",
         &[old_ca, new_ca].concat(),
     );
-    assert!(
-        crate::comms::GrpcClient::connect_mtls(
-            &format!("https://{target_addr}"),
-            &old_and_new_ca,
-            &old_source_client_cert,
-            &old_source_client_key,
-        )
-        .await
-        .is_err()
-    );
+    match crate::comms::GrpcClient::connect_mtls(
+        &format!("https://{target_addr}"),
+        &old_and_new_ca,
+        &old_source_client_cert,
+        &old_source_client_key,
+    )
+    .await
+    {
+        Err(_) => {}
+        Ok(mut old_client) => assert!(
+            old_client
+                .get_remote_task("00000000-0000-0000-0000-000000000001", "source")
+                .await
+                .is_err(),
+            "old CA client completed an authenticated RPC after bilateral rollback",
+        ),
+    }
     let mut new_client = connect_trust_bundle_client(
         &format!("https://{target_addr}"),
         &old_and_new_ca,
