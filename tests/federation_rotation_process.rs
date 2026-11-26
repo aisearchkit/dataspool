@@ -33,7 +33,115 @@ const ROTATION_NEW_CERT: &[u8] = include_bytes!("fixtures/federation-trust-bundl
 const ROTATION_NEW_KEY: &[u8] =
     include_bytes!("fixtures/federation-trust-bundle/new-client.key.pem");
 const ROTATION_NEW_CA: &[u8] = include_bytes!("fixtures/federation-trust-bundle/new-ca.pem");
+const ASYMMETRIC_SOURCE_CA: &[u8] = include_bytes!("fixtures/federation-trust-bundle/old-ca.pem");
+const ASYMMETRIC_SOURCE_CERT: &[u8] =
+    include_bytes!("fixtures/federation-trust-bundle/old-server.pem");
+const ASYMMETRIC_SOURCE_KEY: &[u8] =
+    include_bytes!("fixtures/federation-trust-bundle/old-server.key.pem");
+const ASYMMETRIC_SOURCE_CLIENT: &[u8] =
+    include_bytes!("fixtures/federation-trust-bundle/old-client.pem");
+const ASYMMETRIC_SOURCE_CLIENT_KEY: &[u8] =
+    include_bytes!("fixtures/federation-trust-bundle/old-client.key.pem");
+const ASYMMETRIC_TARGET_CA: &[u8] = include_bytes!("fixtures/federation-trust-bundle/new-ca.pem");
+const ASYMMETRIC_TARGET_CERT: &[u8] =
+    include_bytes!("fixtures/federation-trust-bundle/new-server.pem");
+const ASYMMETRIC_TARGET_KEY: &[u8] =
+    include_bytes!("fixtures/federation-trust-bundle/new-server.key.pem");
+const ASYMMETRIC_TARGET_CLIENT: &[u8] =
+    include_bytes!("fixtures/federation-trust-bundle/new-client.pem");
+const ASYMMETRIC_TARGET_CLIENT_KEY: &[u8] =
+    include_bytes!("fixtures/federation-trust-bundle/new-client.key.pem");
 const RAFT_TOKEN: &str = "federated-rotation-process-test-token-0123456789";
+
+/// The two federation directions must use independent trust roots: Source
+/// authenticates Target with Target's CA while Target authenticates Source
+/// with Source's CA. A shared CA fixture would not catch reversed CA wiring.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn federation_mtls_accepts_asymmetric_source_and_target_roots() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let source_dir = TempDir::new().unwrap();
+    let target_dir = TempDir::new().unwrap();
+    let write = |dir: &TempDir, name: &str, bytes: &[u8]| {
+        let path = dir.path().join(name);
+        std::fs::write(&path, bytes).unwrap();
+        path
+    };
+
+    let source_cert = write(&source_dir, "server.pem", ASYMMETRIC_SOURCE_CERT);
+    let source_key = write(&source_dir, "server.key.pem", ASYMMETRIC_SOURCE_KEY);
+    let source_client_ca = write(&source_dir, "client-ca.pem", ASYMMETRIC_TARGET_CA);
+    let target_cert = write(&target_dir, "server.pem", ASYMMETRIC_TARGET_CERT);
+    let target_key = write(&target_dir, "server.key.pem", ASYMMETRIC_TARGET_KEY);
+    let target_client_ca = write(&target_dir, "client-ca.pem", ASYMMETRIC_SOURCE_CA);
+    let source_root = write(&source_dir, "source-ca.pem", ASYMMETRIC_SOURCE_CA);
+    let target_root = write(&target_dir, "target-ca.pem", ASYMMETRIC_TARGET_CA);
+    let source_client = write(&source_dir, "source-client.pem", ASYMMETRIC_SOURCE_CLIENT);
+    let source_client_key = write(
+        &source_dir,
+        "source-client.key.pem",
+        ASYMMETRIC_SOURCE_CLIENT_KEY,
+    );
+    let target_client = write(&target_dir, "target-client.pem", ASYMMETRIC_TARGET_CLIENT);
+    let target_client_key = write(
+        &target_dir,
+        "target-client.key.pem",
+        ASYMMETRIC_TARGET_CLIENT_KEY,
+    );
+
+    let source_db = RocksDbStore::open(source_dir.path().join("source-db")).unwrap();
+    let target_db = RocksDbStore::open(target_dir.path().join("target-db")).unwrap();
+    let source_addr = reserve_local_addr();
+    let target_addr = reserve_local_addr();
+    let source_server = GrpcServer::new(
+        &source_addr,
+        std::sync::Arc::new(TaskStore::new(source_db)),
+        None,
+    )
+    .await
+    .unwrap()
+    .with_mtls_files(&source_cert, &source_key, &source_client_ca)
+    .await
+    .unwrap();
+    let target_server = GrpcServer::new(
+        &target_addr,
+        std::sync::Arc::new(TaskStore::new(target_db)),
+        None,
+    )
+    .await
+    .unwrap()
+    .with_mtls_files(&target_cert, &target_key, &target_client_ca)
+    .await
+    .unwrap();
+    let source_task = tokio::spawn(async move {
+        source_server.serve().await.unwrap();
+    });
+    let target_task = tokio::spawn(async move {
+        target_server.serve().await.unwrap();
+    });
+
+    // Source -> Target: Target's server certificate is rooted at Target CA;
+    // its inbound client trust is Source CA.
+    let source_to_target = connect_mtls_retry(
+        &format!("https://{target_addr}"),
+        &target_root,
+        &source_client,
+        &source_client_key,
+    )
+    .await;
+    drop(source_to_target);
+    // Target -> Source exercises the opposite CA direction independently.
+    let target_to_source = connect_mtls_retry(
+        &format!("https://{source_addr}"),
+        &source_root,
+        &target_client,
+        &target_client_key,
+    )
+    .await;
+    drop(target_to_source);
+
+    source_task.abort();
+    target_task.abort();
+}
 
 fn child_process(
     role: &str,

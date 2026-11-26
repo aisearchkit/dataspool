@@ -44,6 +44,8 @@ pub struct GrpcServer {
     rotation_proof_ack_drop_marker: Option<PathBuf>,
     #[cfg(feature = "test-fault-injection")]
     rotation_event_ack_drop_marker: Option<PathBuf>,
+    #[cfg(feature = "test-fault-injection")]
+    rotation_event_ack_gate: Option<PathBuf>,
 }
 
 impl GrpcServer {
@@ -67,6 +69,8 @@ impl GrpcServer {
             rotation_proof_ack_drop_marker: None,
             #[cfg(feature = "test-fault-injection")]
             rotation_event_ack_drop_marker: None,
+            #[cfg(feature = "test-fault-injection")]
+            rotation_event_ack_gate: None,
         })
     }
 
@@ -115,6 +119,14 @@ impl GrpcServer {
         self
     }
 
+    /// Hold the committed event response until the test releases this gate.
+    /// A parent process can SIGKILL the coordinator while its RPC is still pending.
+    #[cfg(feature = "test-fault-injection")]
+    pub fn with_rotation_event_ack_gate(mut self, gate: PathBuf) -> Self {
+        self.rotation_event_ack_gate = Some(gate);
+        self
+    }
+
     /// Start the gRPC server until the process receives its shutdown signal.
     pub async fn serve(self) -> Result<()> {
         self.serve_until_cancelled(crate::CancellationToken::new())
@@ -139,6 +151,7 @@ impl GrpcServer {
             let mut builder = Server::builder().layer(DropRotationProofAckLayer::new(
                 self.rotation_proof_ack_drop_marker.clone(),
                 self.rotation_event_ack_drop_marker.clone(),
+                self.rotation_event_ack_gate.clone(),
             ));
             #[cfg(not(feature = "test-fault-injection"))]
             let mut builder = Server::builder();
@@ -268,16 +281,22 @@ impl GrpcServer {
 struct DropRotationProofAckLayer {
     proof_marker: Option<Arc<PathBuf>>,
     event_marker: Option<Arc<PathBuf>>,
+    event_gate: Option<Arc<PathBuf>>,
     proof_dropped: Arc<AtomicBool>,
     event_dropped: Arc<AtomicBool>,
 }
 
 #[cfg(feature = "test-fault-injection")]
 impl DropRotationProofAckLayer {
-    fn new(proof_marker: Option<PathBuf>, event_marker: Option<PathBuf>) -> Self {
+    fn new(
+        proof_marker: Option<PathBuf>,
+        event_marker: Option<PathBuf>,
+        event_gate: Option<PathBuf>,
+    ) -> Self {
         Self {
             proof_marker: proof_marker.map(Arc::new),
             event_marker: event_marker.map(Arc::new),
+            event_gate: event_gate.map(Arc::new),
             proof_dropped: Arc::new(AtomicBool::new(false)),
             event_dropped: Arc::new(AtomicBool::new(false)),
         }
@@ -293,6 +312,7 @@ impl<S> Layer<S> for DropRotationProofAckLayer {
             inner,
             proof_marker: self.proof_marker.clone(),
             event_marker: self.event_marker.clone(),
+            event_gate: self.event_gate.clone(),
             proof_dropped: self.proof_dropped.clone(),
             event_dropped: self.event_dropped.clone(),
         }
@@ -305,6 +325,7 @@ struct DropRotationProofAck<S> {
     inner: S,
     proof_marker: Option<Arc<PathBuf>>,
     event_marker: Option<Arc<PathBuf>>,
+    event_gate: Option<Arc<PathBuf>>,
     proof_dropped: Arc<AtomicBool>,
     event_dropped: Arc<AtomicBool>,
 }
@@ -336,6 +357,7 @@ where
         let mut inner = self.inner.clone();
         let proof_marker = self.proof_marker.clone();
         let event_marker = self.event_marker.clone();
+        let event_gate = self.event_gate.clone();
         let proof_dropped = self.proof_dropped.clone();
         let event_dropped = self.event_dropped.clone();
         Box::pin(async move {
@@ -359,6 +381,13 @@ where
                     format!("{}-committed-response-dropped", path),
                 )
                 .expect("persist process-crash ACK-drop marker");
+                if path.contains("advancefederatedtrustrotation")
+                    && let Some(gate) = event_gate.as_ref()
+                {
+                    while !gate.exists() {
+                        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                    }
+                }
                 return Ok(tonic::codegen::http::Response::builder()
                     .status(tonic::codegen::http::StatusCode::SERVICE_UNAVAILABLE)
                     .body(tonic::body::empty_body())
