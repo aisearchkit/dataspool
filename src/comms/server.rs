@@ -42,6 +42,8 @@ pub struct GrpcServer {
     tls_files: Option<(PathBuf, PathBuf, PathBuf)>,
     #[cfg(feature = "test-fault-injection")]
     rotation_proof_ack_drop_marker: Option<PathBuf>,
+    #[cfg(feature = "test-fault-injection")]
+    rotation_event_ack_drop_marker: Option<PathBuf>,
 }
 
 impl GrpcServer {
@@ -63,6 +65,8 @@ impl GrpcServer {
             tls: None,
             #[cfg(feature = "test-fault-injection")]
             rotation_proof_ack_drop_marker: None,
+            #[cfg(feature = "test-fault-injection")]
+            rotation_event_ack_drop_marker: None,
         })
     }
 
@@ -103,6 +107,14 @@ impl GrpcServer {
         self
     }
 
+    /// Drop the next successful trust-rotation event response after its Raft
+    /// command commits. This models a lost remote ACK at the coordinator boundary.
+    #[cfg(feature = "test-fault-injection")]
+    pub fn with_rotation_event_ack_drop_marker(mut self, marker: PathBuf) -> Self {
+        self.rotation_event_ack_drop_marker = Some(marker);
+        self
+    }
+
     /// Start the gRPC server until the process receives its shutdown signal.
     pub async fn serve(self) -> Result<()> {
         self.serve_until_cancelled(crate::CancellationToken::new())
@@ -126,6 +138,7 @@ impl GrpcServer {
             #[cfg(feature = "test-fault-injection")]
             let mut builder = Server::builder().layer(DropRotationProofAckLayer::new(
                 self.rotation_proof_ack_drop_marker.clone(),
+                self.rotation_event_ack_drop_marker.clone(),
             ));
             #[cfg(not(feature = "test-fault-injection"))]
             let mut builder = Server::builder();
@@ -253,16 +266,20 @@ impl GrpcServer {
 #[cfg(feature = "test-fault-injection")]
 #[derive(Clone)]
 struct DropRotationProofAckLayer {
-    marker: Option<Arc<PathBuf>>,
-    dropped: Arc<AtomicBool>,
+    proof_marker: Option<Arc<PathBuf>>,
+    event_marker: Option<Arc<PathBuf>>,
+    proof_dropped: Arc<AtomicBool>,
+    event_dropped: Arc<AtomicBool>,
 }
 
 #[cfg(feature = "test-fault-injection")]
 impl DropRotationProofAckLayer {
-    fn new(marker: Option<PathBuf>) -> Self {
+    fn new(proof_marker: Option<PathBuf>, event_marker: Option<PathBuf>) -> Self {
         Self {
-            marker: marker.map(Arc::new),
-            dropped: Arc::new(AtomicBool::new(false)),
+            proof_marker: proof_marker.map(Arc::new),
+            event_marker: event_marker.map(Arc::new),
+            proof_dropped: Arc::new(AtomicBool::new(false)),
+            event_dropped: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -274,8 +291,10 @@ impl<S> Layer<S> for DropRotationProofAckLayer {
     fn layer(&self, inner: S) -> Self::Service {
         DropRotationProofAck {
             inner,
-            marker: self.marker.clone(),
-            dropped: self.dropped.clone(),
+            proof_marker: self.proof_marker.clone(),
+            event_marker: self.event_marker.clone(),
+            proof_dropped: self.proof_dropped.clone(),
+            event_dropped: self.event_dropped.clone(),
         }
     }
 }
@@ -284,8 +303,10 @@ impl<S> Layer<S> for DropRotationProofAckLayer {
 #[derive(Clone)]
 struct DropRotationProofAck<S> {
     inner: S,
-    marker: Option<Arc<PathBuf>>,
-    dropped: Arc<AtomicBool>,
+    proof_marker: Option<Arc<PathBuf>>,
+    event_marker: Option<Arc<PathBuf>>,
+    proof_dropped: Arc<AtomicBool>,
+    event_dropped: Arc<AtomicBool>,
 }
 
 #[cfg(feature = "test-fault-injection")]
@@ -313,16 +334,31 @@ where
     fn call(&mut self, request: tonic::codegen::http::Request<B>) -> Self::Future {
         let path = request.uri().path().to_ascii_lowercase();
         let mut inner = self.inner.clone();
-        let marker = self.marker.clone();
-        let dropped = self.dropped.clone();
+        let proof_marker = self.proof_marker.clone();
+        let event_marker = self.event_marker.clone();
+        let proof_dropped = self.proof_dropped.clone();
+        let event_dropped = self.event_dropped.clone();
         Box::pin(async move {
             let response = inner.call(request).await?;
-            if path.contains("provefederatedcertificaterotation")
-                && let Some(marker) = marker.as_ref()
-                && !dropped.swap(true, Ordering::SeqCst)
+            let marker = if path.contains("provefederatedcertificaterotation")
+                && proof_marker.is_some()
+                && !proof_dropped.swap(true, Ordering::SeqCst)
             {
-                std::fs::write(marker.as_ref(), b"proof-committed-response-dropped")
-                    .expect("persist process-crash ACK-drop marker");
+                proof_marker.as_ref()
+            } else if path.contains("advancefederatedtrustrotation")
+                && event_marker.is_some()
+                && !event_dropped.swap(true, Ordering::SeqCst)
+            {
+                event_marker.as_ref()
+            } else {
+                None
+            };
+            if let Some(marker) = marker {
+                std::fs::write(
+                    marker.as_ref(),
+                    format!("{}-committed-response-dropped", path),
+                )
+                .expect("persist process-crash ACK-drop marker");
                 return Ok(tonic::codegen::http::Response::builder()
                     .status(tonic::codegen::http::StatusCode::SERVICE_UNAVAILABLE)
                     .body(tonic::body::empty_body())
