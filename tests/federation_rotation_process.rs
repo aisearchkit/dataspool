@@ -698,7 +698,7 @@ async fn seed_coordinator_rotation(
         .propose(Command::UpsertFederatedCluster {
             cluster: FederatedCluster {
                 cluster_id: peer_id.into(),
-                endpoint: peer_endpoint.into(),
+                endpoint: format!("https://{peer_endpoint}"),
                 identity_fingerprint: OLD_FINGERPRINT.into(),
                 previous_identity_fingerprint: None,
                 previous_identity_expires_at_ms: None,
