@@ -2385,6 +2385,43 @@ async fn bilateral_trust_rotation_coordinator_proves_new_leaves_and_activates_bo
     assert_eq!(source_ready.local_leaf_fingerprint, new_leaf_fingerprint);
     assert_eq!(source_ready.peer_leaf_fingerprint, new_leaf_fingerprint);
 
+    // A background reconciliation pass must not manufacture operator consent:
+    // ActivationBarrier on only one Raft side is not an activation authorization.
+    source_coordinator.reconcile_once().await.unwrap();
+    let before_authorization = source_coordinator
+        .get_rotation("bilateral-ca-rotation-e2e")
+        .await
+        .unwrap();
+    assert_eq!(
+        before_authorization.phase,
+        crate::federation::FederatedTrustRotationPhase::ActivationBarrier
+    );
+    assert!(!before_authorization.activation_barrier_committed);
+    let premature_activation = source_coordinator
+        .activate_both(
+            "bilateral-ca-rotation-e2e",
+            "reject-premature-activation",
+            "reconciler-guard-test",
+        )
+        .await;
+    assert!(
+        premature_activation.is_err(),
+        "activation must be rejected until both Raft groups commit the authorization barrier"
+    );
+    for (group, peer_id) in [(&source, "target"), (&target, "source")] {
+        let peer = group
+            .task_store(group.wait_for_leader(None).await)
+            .get_federated_cluster(peer_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            peer.trust_bundle_fingerprint.as_deref(),
+            Some(old_ca_fingerprint.as_str()),
+            "a reconciliation pass or premature activation attempt changed the active CA"
+        );
+    }
+
     let authorized = source_coordinator
         .authorize_activation(
             "bilateral-ca-rotation-e2e",
@@ -2600,6 +2637,22 @@ async fn bilateral_trust_rotation_coordinator_proves_new_leaves_and_activates_bo
         .unwrap();
     assert_eq!(
         rolled_back.phase,
+        crate::federation::FederatedTrustRotationPhase::RolledBack
+    );
+    // A coordinator restart may replay rollback after one side's final ACK was
+    // lost. Repeating the complete rollback must converge without resurrecting
+    // staged CA or leaf state on either independent Raft group.
+    let rollback_replay = source_coordinator
+        .rollback_before_activation(
+            "bilateral-ca-rollback-e2e",
+            "candidate deployment failed validation",
+            "rollback-bilateral-trust-rotation-replay",
+            "restart-reconciler",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rollback_replay.phase,
         crate::federation::FederatedTrustRotationPhase::RolledBack
     );
     for (group, peer_id) in [(&source, "target"), (&target, "source")] {
