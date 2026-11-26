@@ -165,6 +165,115 @@ impl GrpcClient {
             })
     }
 
+    /// Create the peer-side half of a bilateral CA trust rotation. The remote
+    /// server reverses local/peer material and durably stages trust for this client.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_remote_trust_rotation(
+        &mut self,
+        peer_cluster_id: &str,
+        rotation_id: &str,
+        request_id: &str,
+        local_ca_bundle_pem: &str,
+        peer_ca_bundle_pem: &str,
+        local_leaf_fingerprint: &str,
+        peer_leaf_fingerprint: &str,
+        overlap_ms: i64,
+    ) -> Result<task::FederatedTrustRotationResponse> {
+        let mut request = Request::new(task::FederatedTrustRotationRequest {
+            rotation_id: rotation_id.to_string(),
+            request_id: request_id.to_string(),
+            local_ca_bundle_pem: local_ca_bundle_pem.to_string(),
+            peer_ca_bundle_pem: peer_ca_bundle_pem.to_string(),
+            local_leaf_fingerprint: local_leaf_fingerprint.to_string(),
+            peer_leaf_fingerprint: peer_leaf_fingerprint.to_string(),
+            overlap_ms,
+            expected_revision: 0,
+            event_json: String::new(),
+        });
+        request.metadata_mut().insert(
+            "x-dataspool-peer-cluster",
+            MetadataValue::try_from(peer_cluster_id).map_err(|error| {
+                DatspoolError::Configuration(format!("Invalid peer cluster metadata: {error}"))
+            })?,
+        );
+        self.task_client
+            .create_federated_trust_rotation(request)
+            .await
+            .map(|response| response.into_inner())
+            .map_err(|status| {
+                DatspoolError::Internal(format!("Remote trust rotation creation failed: {status}"))
+            })
+    }
+
+    /// Apply a peer-side event; the remote server mirrors local/peer semantics
+    /// and performs the corresponding local Activate/Retire/Abort Raft command.
+    pub async fn advance_remote_trust_rotation(
+        &mut self,
+        peer_cluster_id: &str,
+        rotation_id: &str,
+        request_id: &str,
+        event: &crate::federation::FederatedTrustRotationEvent,
+    ) -> Result<task::FederatedTrustRotationResponse> {
+        let event_json = serde_json::to_string(event)
+            .map_err(|error| DatspoolError::Serialization(error.to_string()))?;
+        let mut request = Request::new(task::FederatedTrustRotationRequest {
+            rotation_id: rotation_id.to_string(),
+            request_id: request_id.to_string(),
+            local_ca_bundle_pem: String::new(),
+            peer_ca_bundle_pem: String::new(),
+            local_leaf_fingerprint: String::new(),
+            peer_leaf_fingerprint: String::new(),
+            overlap_ms: 0,
+            expected_revision: 0,
+            event_json,
+        });
+        request.metadata_mut().insert(
+            "x-dataspool-peer-cluster",
+            MetadataValue::try_from(peer_cluster_id).map_err(|error| {
+                DatspoolError::Configuration(format!("Invalid peer cluster metadata: {error}"))
+            })?,
+        );
+        self.task_client
+            .advance_federated_trust_rotation(request)
+            .await
+            .map(|response| response.into_inner())
+            .map_err(|status| {
+                DatspoolError::Internal(format!("Remote trust rotation advance failed: {status}"))
+            })
+    }
+
+    /// Read the peer's durable half of the bilateral rotation state.
+    pub async fn get_remote_trust_rotation(
+        &mut self,
+        peer_cluster_id: &str,
+        rotation_id: &str,
+    ) -> Result<task::FederatedTrustRotationResponse> {
+        let mut request = Request::new(task::FederatedTrustRotationRequest {
+            rotation_id: rotation_id.to_string(),
+            request_id: String::new(),
+            local_ca_bundle_pem: String::new(),
+            peer_ca_bundle_pem: String::new(),
+            local_leaf_fingerprint: String::new(),
+            peer_leaf_fingerprint: String::new(),
+            overlap_ms: 0,
+            expected_revision: 0,
+            event_json: String::new(),
+        });
+        request.metadata_mut().insert(
+            "x-dataspool-peer-cluster",
+            MetadataValue::try_from(peer_cluster_id).map_err(|error| {
+                DatspoolError::Configuration(format!("Invalid peer cluster metadata: {error}"))
+            })?,
+        );
+        self.task_client
+            .get_federated_trust_rotation(request)
+            .await
+            .map(|response| response.into_inner())
+            .map_err(|status| {
+                DatspoolError::Internal(format!("Remote trust rotation read failed: {status}"))
+            })
+    }
+
     /// Read a remote task over the authenticated federation channel.
     pub async fn get_remote_task(
         &mut self,

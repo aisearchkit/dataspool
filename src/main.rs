@@ -67,7 +67,7 @@ async fn main() -> Result<()> {
 
     let store = dataspool::RocksDbStore::open(&db_path)?;
     let tasks = Arc::new(TaskStore::new(store.clone()));
-    let api = dataspool::DlqApi::new(tasks.clone(), admin_token)?;
+    let mut api = dataspool::DlqApi::new(tasks.clone(), admin_token)?;
     let listener = tokio::net::TcpListener::bind(&bind)
         .await
         .map_err(|e| DatspoolError::Internal(format!("HTTP bind {bind} failed: {e}")))?;
@@ -281,6 +281,7 @@ async fn main() -> Result<()> {
         tokio::spawn(async move { grpc_api.serve_until_cancelled(grpc_shutdown).await });
 
     let mut federation_task = None;
+    let mut trust_rotation_task = None;
     if let (Some(config), Some(raft), Ok(local_cluster_id)) = (
         config.as_ref().filter(|value| value.server.tls.enabled),
         raft_node.as_ref(),
@@ -295,6 +296,19 @@ async fn main() -> Result<()> {
         let private_key_file = config.server.tls.key_file.clone().ok_or_else(|| {
             DatspoolError::Configuration("server.tls.key_file is required for federation".into())
         })?;
+        let coordinator = Arc::new(dataspool::FederatedTrustRotationCoordinator::new(
+            tasks.clone(),
+            Arc::new(raft.clone()),
+            local_cluster_id.clone(),
+            ca_file.clone(),
+            certificate_file.clone(),
+            private_key_file.clone(),
+        ));
+        api = api.with_trust_rotation_coordinator(coordinator.clone());
+        let rotation_shutdown = shutdown.clone();
+        trust_rotation_task = Some(tokio::spawn(async move {
+            coordinator.run_until_cancelled(rotation_shutdown).await
+        }));
         let reconciler = dataspool::federation::orchestrator::FederatedOrchestrator::new(
             tasks.clone(),
             Arc::new(raft.clone()),
@@ -307,7 +321,7 @@ async fn main() -> Result<()> {
         federation_task = Some(tokio::spawn(async move {
             reconciler.run_until_cancelled(federation_shutdown).await
         }));
-        info!("Federated migration reconciler enabled");
+        info!("Federated migration reconciler and bilateral trust rotation controller enabled");
     } else if config
         .as_ref()
         .is_some_and(|value| value.server.tls.enabled)
@@ -341,6 +355,13 @@ async fn main() -> Result<()> {
     if let Some(federation) = federation_task {
         federation.await.map_err(|e| {
             DatspoolError::Internal(format!("Federation reconciler task failed: {e}"))
+        })?;
+    }
+    if let Some(rotation) = trust_rotation_task {
+        rotation.await.map_err(|e| {
+            DatspoolError::Internal(format!(
+                "Federated trust rotation controller task failed: {e}"
+            ))
         })?;
     }
     if let Some(worker) = worker {

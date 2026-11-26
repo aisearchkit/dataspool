@@ -168,6 +168,22 @@ message FederatedCertificateRotationResponse {
   int64 previous_fingerprint_expires_at_ms = 3;
   string message = 4;
 }
+message FederatedTrustRotationRequest {
+  string rotation_id = 1;
+  string request_id = 2;
+  string local_ca_bundle_pem = 3;
+  string peer_ca_bundle_pem = 4;
+  string local_leaf_fingerprint = 5;
+  string peer_leaf_fingerprint = 6;
+  int64 overlap_ms = 7;
+  uint64 expected_revision = 8;
+  string event_json = 9;
+}
+message FederatedTrustRotationResponse {
+  bool accepted = 1;
+  string state_json = 2;
+  string message = 3;
+}
 
 message TaskControlRequest { string task_id = 1; string request_id = 2; }
 message TaskControlResponse { bool success = 1; string message = 2; }
@@ -200,4 +216,8 @@ service TaskService {
   // Rotation staging uses the currently trusted certificate; proof must use the new certificate.
   rpc StageFederatedCertificateRotation(FederatedCertificateRotationRequest) returns (FederatedCertificateRotationResponse);
   rpc ProveFederatedCertificateRotation(FederatedCertificateRotationRequest) returns (FederatedCertificateRotationResponse);
+  // Bilateral CA and leaf lifecycle coordination across independent Raft groups.
+  rpc CreateFederatedTrustRotation(FederatedTrustRotationRequest) returns (FederatedTrustRotationResponse);
+  rpc AdvanceFederatedTrustRotation(FederatedTrustRotationRequest) returns (FederatedTrustRotationResponse);
+  rpc GetFederatedTrustRotation(FederatedTrustRotationRequest) returns (FederatedTrustRotationResponse);
 }

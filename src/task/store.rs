@@ -359,6 +359,29 @@ impl<S: KvStore> TaskStore<S> {
             .collect()
     }
 
+    pub async fn get_federated_trust_rotation(
+        &self,
+        rotation_id: &str,
+    ) -> Result<Option<crate::federation::FederatedTrustRotation>> {
+        let key = format!("federated_trust_rotation:{rotation_id}");
+        self.store
+            .get_cf(cf::META, key.as_bytes())
+            .await?
+            .map(|value| serde_json::from_slice(&value).map_err(Into::into))
+            .transpose()
+    }
+
+    pub async fn list_federated_trust_rotations(
+        &self,
+    ) -> Result<Vec<crate::federation::FederatedTrustRotation>> {
+        self.store
+            .prefix_scan_cf(cf::META, b"federated_trust_rotation:")
+            .await?
+            .into_iter()
+            .map(|(_, value)| serde_json::from_slice(&value).map_err(Into::into))
+            .collect()
+    }
+
     pub async fn get_federated_migration(
         &self,
         migration_id: &str,

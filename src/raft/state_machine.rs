@@ -478,6 +478,38 @@ impl<S: KvStore + Clone> MetaStateMachine<S> {
                 )
                 .await
             }
+            Command::AbortFederatedCertificateRotation {
+                cluster_id,
+                new_fingerprint,
+                at_ms,
+                request_id,
+                actor,
+            } => {
+                self.apply_abort_federated_certificate_rotation(
+                    cluster_id,
+                    new_fingerprint,
+                    at_ms,
+                    request_id,
+                    actor,
+                )
+                .await
+            }
+            Command::RollbackFederatedCertificateRotation {
+                cluster_id,
+                new_fingerprint,
+                at_ms,
+                request_id,
+                actor,
+            } => {
+                self.apply_rollback_federated_certificate_rotation(
+                    cluster_id,
+                    new_fingerprint,
+                    at_ms,
+                    request_id,
+                    actor,
+                )
+                .await
+            }
             Command::StageFederatedTrustBundle {
                 cluster_id,
                 current_fingerprint,
@@ -524,6 +556,49 @@ impl<S: KvStore + Clone> MetaStateMachine<S> {
             } => {
                 self.apply_retire_federated_trust_bundle(cluster_id, at_ms, request_id, actor)
                     .await
+            }
+            Command::AbortFederatedTrustBundle {
+                cluster_id,
+                bundle_fingerprint,
+                at_ms,
+                request_id,
+                actor,
+            } => {
+                self.apply_abort_federated_trust_bundle(
+                    cluster_id,
+                    bundle_fingerprint,
+                    at_ms,
+                    request_id,
+                    actor,
+                )
+                .await
+            }
+            Command::CreateFederatedTrustRotation {
+                rotation,
+                at_ms,
+                request_id,
+                actor,
+            } => {
+                self.apply_create_federated_trust_rotation(*rotation, at_ms, request_id, actor)
+                    .await
+            }
+            Command::AdvanceFederatedTrustRotation {
+                rotation_id,
+                expected_revision,
+                event,
+                at_ms,
+                request_id,
+                actor,
+            } => {
+                self.apply_advance_federated_trust_rotation(
+                    rotation_id,
+                    expected_revision,
+                    event,
+                    at_ms,
+                    request_id,
+                    actor,
+                )
+                .await
             }
             Command::TransitionFederatedMigration {
                 migration_id,
@@ -942,6 +1017,24 @@ impl<S: KvStore + Clone> MetaStateMachine<S> {
                 ))
             };
         }
+        for rotation in self.task_store.list_federated_trust_rotations().await? {
+            if rotation.peer_cluster_id == cluster_id
+                && !matches!(
+                    rotation.phase,
+                    crate::federation::FederatedTrustRotationPhase::Completed
+                        | crate::federation::FederatedTrustRotationPhase::RolledBack
+                )
+                && (!rotation
+                    .peer_ca_bundle_fingerprint
+                    .eq_ignore_ascii_case(&bundle_fingerprint)
+                    || rotation.phase
+                        == crate::federation::FederatedTrustRotationPhase::RollingBack)
+            {
+                return Ok(rejected(
+                    "CA staging conflicts with an active bilateral trust rotation",
+                ));
+            }
+        }
         match cluster.trust_bundle_fingerprint.as_deref() {
             Some(active) if !active.eq_ignore_ascii_case(&current_fingerprint) => {
                 return Ok(rejected(
@@ -1028,6 +1121,30 @@ impl<S: KvStore + Clone> MetaStateMachine<S> {
                 ))
             };
         }
+        for rotation in self.task_store.list_federated_trust_rotations().await? {
+            if rotation.peer_cluster_id == cluster_id
+                && rotation
+                    .peer_ca_bundle_fingerprint
+                    .eq_ignore_ascii_case(&bundle_fingerprint)
+                && !matches!(
+                    rotation.phase,
+                    crate::federation::FederatedTrustRotationPhase::Completed
+                        | crate::federation::FederatedTrustRotationPhase::RolledBack
+                )
+                && (!rotation.activation_barrier_committed
+                    || !matches!(
+                        rotation.phase,
+                        crate::federation::FederatedTrustRotationPhase::Activating
+                            | crate::federation::FederatedTrustRotationPhase::RecoveryRequired
+                            | crate::federation::FederatedTrustRotationPhase::Overlap
+                            | crate::federation::FederatedTrustRotationPhase::Retiring
+                    ))
+            {
+                return Ok(rejected(
+                    "bilateral CA activation requires the committed activation barrier and must not race with rollback",
+                ));
+            }
+        }
         if !cluster
             .pending_trust_bundle_fingerprint
             .as_deref()
@@ -1104,6 +1221,45 @@ impl<S: KvStore + Clone> MetaStateMachine<S> {
                 ))
             };
         }
+        for rotation in self.task_store.list_federated_trust_rotations().await? {
+            if rotation.peer_cluster_id == cluster_id
+                && !matches!(
+                    rotation.phase,
+                    crate::federation::FederatedTrustRotationPhase::Completed
+                        | crate::federation::FederatedTrustRotationPhase::RolledBack
+                )
+            {
+                if !cluster
+                    .trust_bundle_fingerprint
+                    .as_deref()
+                    .is_some_and(|fingerprint| {
+                        fingerprint.eq_ignore_ascii_case(&rotation.peer_ca_bundle_fingerprint)
+                    })
+                {
+                    return Ok(rejected(
+                        "active peer CA does not match the bilateral rotation candidate",
+                    ));
+                }
+                if !matches!(
+                    rotation.phase,
+                    crate::federation::FederatedTrustRotationPhase::Overlap
+                        | crate::federation::FederatedTrustRotationPhase::Retiring
+                ) {
+                    return Ok(rejected(
+                        "bilateral trust rotation is not ready for CA retirement",
+                    ));
+                }
+                let bilateral_deadline = rotation
+                    .local_activation_expires_at_ms
+                    .zip(rotation.peer_activation_expires_at_ms)
+                    .map(|(local, peer)| local.max(peer));
+                if bilateral_deadline.is_none_or(|deadline| at_ms < deadline) {
+                    return Ok(rejected(
+                        "both federation CA overlap deadlines must expire before retirement",
+                    ));
+                }
+            }
+        }
         let expiry = match cluster.previous_trust_bundle_expires_at_ms {
             Some(value) => value,
             None => return Ok(rejected("there is no previous CA bundle to retire")),
@@ -1135,6 +1291,502 @@ impl<S: KvStore + Clone> MetaStateMachine<S> {
         Ok(accepted(
             "previous CA bundle retired",
             serde_json::json!({"cluster_id": cluster_id, "active_fingerprint": cluster.trust_bundle_fingerprint}),
+        ))
+    }
+
+    async fn apply_abort_federated_certificate_rotation(
+        &self,
+        cluster_id: String,
+        new_fingerprint: String,
+        at_ms: i64,
+        request_id: String,
+        actor: String,
+    ) -> Result<CommandResponse> {
+        if request_id.trim().is_empty() || request_id.len() > 128 {
+            return Ok(rejected("request_id must contain 1-128 characters"));
+        }
+        let mut cluster = match self.task_store.get_federated_cluster(&cluster_id).await? {
+            Some(value) => value,
+            None => return Ok(rejected("federated cluster not found")),
+        };
+        let payload = format!("federated-leaf-abort:{cluster_id}:{new_fingerprint}");
+        if let Some(existing) = self.task_store.get_control_request(&request_id).await? {
+            return if existing == payload {
+                Ok(accepted(
+                    "staged leaf identity abort already committed",
+                    serde_json::json!({"cluster_id": cluster_id}),
+                ))
+            } else {
+                Ok(rejected(
+                    "request_id was already used with a different payload",
+                ))
+            };
+        }
+        if !cluster
+            .pending_identity_fingerprint
+            .as_deref()
+            .is_some_and(|pending| pending.eq_ignore_ascii_case(&new_fingerprint))
+        {
+            return Ok(rejected("requested leaf identity is not pending"));
+        }
+        cluster.pending_identity_fingerprint = None;
+        cluster.rotation_started_at_ms = None;
+        cluster.pending_rotation_grace_period_ms = None;
+        cluster.updated_at_ms = at_ms;
+        let audit = self.audit_event(
+            &actor,
+            &request_id,
+            "federated_cluster.leaf_rotation_aborted",
+            &cluster_id,
+            "pending",
+            "active_unchanged",
+        );
+        self.task_store
+            .save_federated_control(
+                &request_id,
+                &payload,
+                format!("federated_cluster:{cluster_id}"),
+                serde_json::to_vec(&cluster)?,
+                audit,
+            )
+            .await?;
+        Ok(accepted(
+            "staged leaf identity aborted",
+            serde_json::json!({"cluster_id": cluster_id, "identity_fingerprint": cluster.identity_fingerprint}),
+        ))
+    }
+
+    async fn apply_rollback_federated_certificate_rotation(
+        &self,
+        cluster_id: String,
+        new_fingerprint: String,
+        at_ms: i64,
+        request_id: String,
+        actor: String,
+    ) -> Result<CommandResponse> {
+        if request_id.trim().is_empty() || request_id.len() > 128 {
+            return Ok(rejected("request_id must contain 1-128 characters"));
+        }
+        let mut cluster = match self.task_store.get_federated_cluster(&cluster_id).await? {
+            Some(value) => value,
+            None => return Ok(rejected("federated cluster not found")),
+        };
+        let payload = format!("federated-leaf-rollback:{cluster_id}:{new_fingerprint}");
+        if let Some(existing) = self.task_store.get_control_request(&request_id).await? {
+            return if existing == payload {
+                Ok(accepted(
+                    "leaf identity rollback already committed",
+                    serde_json::json!({"cluster_id": cluster_id}),
+                ))
+            } else {
+                Ok(rejected(
+                    "request_id was already used with a different payload",
+                ))
+            };
+        }
+        if !cluster
+            .identity_fingerprint
+            .eq_ignore_ascii_case(&new_fingerprint)
+        {
+            return Ok(rejected(
+                "active leaf identity does not match the requested rollback target",
+            ));
+        }
+        let Some(previous) = cluster.previous_identity_fingerprint.clone() else {
+            return Ok(rejected(
+                "no previous leaf identity is available for rollback",
+            ));
+        };
+        if !cluster
+            .previous_identity_expires_at_ms
+            .is_some_and(|expires| at_ms < expires)
+        {
+            return Ok(rejected("previous leaf identity grace period has expired"));
+        }
+        cluster.identity_fingerprint = previous;
+        cluster.previous_identity_fingerprint = None;
+        cluster.previous_identity_expires_at_ms = None;
+        cluster.pending_identity_fingerprint = None;
+        cluster.rotation_started_at_ms = None;
+        cluster.pending_rotation_grace_period_ms = None;
+        cluster.updated_at_ms = at_ms;
+        let audit = self.audit_event(
+            &actor,
+            &request_id,
+            "federated_cluster.leaf_rotation_rolled_back",
+            &cluster_id,
+            "new_identity",
+            "previous_identity",
+        );
+        self.task_store
+            .save_federated_control(
+                &request_id,
+                &payload,
+                format!("federated_cluster:{cluster_id}"),
+                serde_json::to_vec(&cluster)?,
+                audit,
+            )
+            .await?;
+        Ok(accepted(
+            "previous leaf identity restored",
+            serde_json::json!({"cluster_id": cluster_id, "identity_fingerprint": cluster.identity_fingerprint}),
+        ))
+    }
+
+    async fn apply_abort_federated_trust_bundle(
+        &self,
+        cluster_id: String,
+        bundle_fingerprint: String,
+        at_ms: i64,
+        request_id: String,
+        actor: String,
+    ) -> Result<CommandResponse> {
+        if request_id.trim().is_empty() || request_id.len() > 128 {
+            return Ok(rejected("request_id must contain 1-128 characters"));
+        }
+        let mut cluster = match self.task_store.get_federated_cluster(&cluster_id).await? {
+            Some(value) => value,
+            None => return Ok(rejected("federated cluster not found")),
+        };
+        let payload = format!("federated-ca-abort:{cluster_id}:{bundle_fingerprint}");
+        if let Some(existing) = self.task_store.get_control_request(&request_id).await? {
+            return if existing == payload {
+                Ok(accepted(
+                    "staged CA bundle abort already committed",
+                    serde_json::json!({"cluster_id": cluster_id}),
+                ))
+            } else {
+                Ok(rejected(
+                    "request_id was already used with a different payload",
+                ))
+            };
+        }
+        if cluster
+            .trust_bundle_fingerprint
+            .as_deref()
+            .is_some_and(|active| active.eq_ignore_ascii_case(&bundle_fingerprint))
+            || cluster
+                .previous_trust_bundle_fingerprint
+                .as_deref()
+                .is_some_and(|previous| previous.eq_ignore_ascii_case(&bundle_fingerprint))
+        {
+            return Ok(rejected(
+                "an activated CA bundle cannot be rolled back; forward recovery is required",
+            ));
+        }
+        if !cluster
+            .pending_trust_bundle_fingerprint
+            .as_deref()
+            .is_some_and(|pending| pending.eq_ignore_ascii_case(&bundle_fingerprint))
+        {
+            return Ok(rejected("the requested CA bundle is not staged"));
+        }
+        cluster.pending_trust_bundle_pem = None;
+        cluster.pending_trust_bundle_fingerprint = None;
+        cluster.trust_bundle_staged_at_ms = None;
+        cluster.updated_at_ms = at_ms;
+        let audit = self.audit_event(
+            &actor,
+            &request_id,
+            "federated_cluster.ca_bundle_aborted",
+            &cluster_id,
+            "staged",
+            "active_unchanged",
+        );
+        self.task_store
+            .save_federated_control(
+                &request_id,
+                &payload,
+                format!("federated_cluster:{cluster_id}"),
+                serde_json::to_vec(&cluster)?,
+                audit,
+            )
+            .await?;
+        Ok(accepted(
+            "staged CA bundle aborted without changing active trust",
+            serde_json::json!({"cluster_id": cluster_id, "active_fingerprint": cluster.trust_bundle_fingerprint}),
+        ))
+    }
+
+    async fn apply_create_federated_trust_rotation(
+        &self,
+        mut rotation: crate::federation::FederatedTrustRotation,
+        at_ms: i64,
+        request_id: String,
+        actor: String,
+    ) -> Result<CommandResponse> {
+        if request_id.trim().is_empty()
+            || request_id.len() > 128
+            || rotation.rotation_id.trim().is_empty()
+            || rotation.rotation_id.len() > 96
+            || rotation.peer_cluster_id.trim().is_empty()
+            || rotation.peer_cluster_id.len() > 128
+            || !rotation
+                .rotation_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+            || rotation.overlap_ms < 60_000
+            || rotation.overlap_ms > 604_800_000
+        {
+            return Ok(rejected(
+                "rotation_id, peer_cluster_id, request_id and a 1-minute to 7-day overlap are required",
+            ));
+        }
+        let local_ca = match crate::federation::validate_trust_bundle(&rotation.local_ca_bundle_pem)
+        {
+            Ok(value) => value,
+            Err(error) => return Ok(rejected(&format!("invalid local CA bundle: {error}"))),
+        };
+        let peer_ca = match crate::federation::validate_trust_bundle(&rotation.peer_ca_bundle_pem) {
+            Ok(value) => value,
+            Err(error) => return Ok(rejected(&format!("invalid peer CA bundle: {error}"))),
+        };
+        if !local_ca.eq_ignore_ascii_case(&rotation.local_ca_bundle_fingerprint)
+            || !peer_ca.eq_ignore_ascii_case(&rotation.peer_ca_bundle_fingerprint)
+        {
+            return Ok(rejected(
+                "trust rotation CA fingerprints do not match their PEM bundles",
+            ));
+        }
+        if rotation
+            .current_peer_ca_fingerprint
+            .as_deref()
+            .is_some_and(|fingerprint| {
+                fingerprint.len() != 64 || !fingerprint.bytes().all(|byte| byte.is_ascii_hexdigit())
+            })
+        {
+            return Ok(rejected(
+                "current peer CA fingerprint must be a 64-character SHA-256 hex digest",
+            ));
+        }
+        for fingerprint in [
+            &rotation.local_leaf_fingerprint,
+            &rotation.peer_leaf_fingerprint,
+        ] {
+            if fingerprint.len() != 64 || !fingerprint.bytes().all(|byte| byte.is_ascii_hexdigit())
+            {
+                return Ok(rejected(
+                    "local and peer leaf fingerprints must be 64-character SHA-256 hex digests",
+                ));
+            }
+        }
+        if rotation.phase != crate::federation::FederatedTrustRotationPhase::Staging
+            || rotation.revision != 0
+            || rotation.local_staged
+            || rotation.peer_staged
+            || rotation.local_deployment_ready
+            || rotation.peer_deployment_ready
+            || rotation.activation_barrier_committed
+            || rotation.local_activation_expires_at_ms.is_some()
+            || rotation.peer_activation_expires_at_ms.is_some()
+            || rotation.local_retired
+            || rotation.peer_retired
+        {
+            return Ok(rejected(
+                "new trust rotations must start in the pristine staging state",
+            ));
+        }
+        let payload = format!(
+            "federated-trust-rotation-create:{}:{}:{}:{}:{}:{}:{}:{}",
+            rotation.rotation_id,
+            rotation.peer_cluster_id,
+            rotation
+                .current_peer_ca_fingerprint
+                .as_deref()
+                .unwrap_or("<bootstrap>"),
+            rotation.local_ca_bundle_fingerprint,
+            rotation.peer_ca_bundle_fingerprint,
+            rotation.local_leaf_fingerprint,
+            rotation.peer_leaf_fingerprint,
+            rotation.overlap_ms
+        );
+        if let Some(existing) = self.task_store.get_control_request(&request_id).await? {
+            return if existing == payload {
+                Ok(accepted(
+                    "Federated trust rotation already created",
+                    serde_json::json!({"rotation_id": rotation.rotation_id}),
+                ))
+            } else {
+                Ok(rejected(
+                    "request_id was already used with a different payload",
+                ))
+            };
+        }
+        let peer = match self
+            .task_store
+            .get_federated_cluster(&rotation.peer_cluster_id)
+            .await?
+        {
+            Some(peer) if peer.status != crate::federation::FederatedClusterStatus::Offline => peer,
+            _ => {
+                return Ok(rejected(
+                    "trust rotation peer is not registered or is offline",
+                ));
+            }
+        };
+        let current_pin_matches = match (
+            peer.trust_bundle_fingerprint.as_deref(),
+            rotation.current_peer_ca_fingerprint.as_deref(),
+        ) {
+            (None, None) => true,
+            (Some(current), Some(expected)) => current.eq_ignore_ascii_case(expected),
+            _ => false,
+        };
+        if !current_pin_matches {
+            return Ok(rejected(
+                "peer CA pin changed since the trust rotation was planned",
+            ));
+        }
+        if peer
+            .trust_bundle_fingerprint
+            .as_deref()
+            .is_some_and(|fingerprint| {
+                fingerprint.eq_ignore_ascii_case(&rotation.peer_ca_bundle_fingerprint)
+            })
+        {
+            return Ok(rejected("candidate peer CA bundle is already active"));
+        }
+        if self
+            .task_store
+            .get_federated_trust_rotation(&rotation.rotation_id)
+            .await?
+            .is_some()
+        {
+            return Ok(rejected("trust rotation ID already exists"));
+        }
+        for existing in self.task_store.list_federated_trust_rotations().await? {
+            if existing.peer_cluster_id == rotation.peer_cluster_id
+                && !matches!(
+                    existing.phase,
+                    crate::federation::FederatedTrustRotationPhase::Completed
+                        | crate::federation::FederatedTrustRotationPhase::RolledBack
+                )
+            {
+                return Ok(rejected(
+                    "another trust rotation for this peer is still active",
+                ));
+            }
+        }
+        rotation.created_at_ms = at_ms;
+        rotation.updated_at_ms = at_ms;
+        let audit = self.audit_event(
+            &actor,
+            &request_id,
+            "federation.trust_rotation.create",
+            &rotation.rotation_id,
+            "none",
+            "staging",
+        );
+        self.task_store
+            .save_federated_control(
+                &request_id,
+                &payload,
+                format!("federated_trust_rotation:{}", rotation.rotation_id),
+                serde_json::to_vec(&rotation)?,
+                audit,
+            )
+            .await?;
+        Ok(accepted(
+            "Federated trust rotation created",
+            serde_json::to_value(rotation)?,
+        ))
+    }
+
+    async fn apply_advance_federated_trust_rotation(
+        &self,
+        rotation_id: String,
+        expected_revision: u64,
+        event: crate::federation::FederatedTrustRotationEvent,
+        at_ms: i64,
+        request_id: String,
+        actor: String,
+    ) -> Result<CommandResponse> {
+        if request_id.trim().is_empty() || request_id.len() > 128 {
+            return Ok(rejected("request_id must contain 1-128 characters"));
+        }
+        // Request identity is the idempotency key. Revision is an optimistic
+        // concurrency fence for the first application, not part of event identity;
+        // a lost ACK may be replayed after later events have advanced the revision.
+        let payload = format!("federated-trust-rotation-event:{rotation_id}:{event:?}");
+        if let Some(existing) = self.task_store.get_control_request(&request_id).await? {
+            return if existing == payload {
+                let current = self
+                    .task_store
+                    .get_federated_trust_rotation(&rotation_id)
+                    .await?;
+                Ok(accepted(
+                    "Federated trust rotation event already committed",
+                    serde_json::to_value(current)?,
+                ))
+            } else {
+                Ok(rejected(
+                    "request_id was already used with a different payload",
+                ))
+            };
+        }
+        let mut rotation = match self
+            .task_store
+            .get_federated_trust_rotation(&rotation_id)
+            .await?
+        {
+            Some(rotation) => rotation,
+            None => return Ok(rejected("federated trust rotation not found")),
+        };
+        if matches!(
+            event,
+            crate::federation::FederatedTrustRotationEvent::BeginRollback { .. }
+        ) {
+            let peer = match self
+                .task_store
+                .get_federated_cluster(&rotation.peer_cluster_id)
+                .await?
+            {
+                Some(peer) => peer,
+                None => return Ok(rejected("federated peer disappeared before rollback")),
+            };
+            let candidate_ca_is_active =
+                peer.trust_bundle_fingerprint
+                    .as_deref()
+                    .is_some_and(|fingerprint| {
+                        fingerprint.eq_ignore_ascii_case(&rotation.peer_ca_bundle_fingerprint)
+                    });
+            let candidate_ca_is_previous = peer
+                .previous_trust_bundle_fingerprint
+                .as_deref()
+                .is_some_and(|fingerprint| {
+                    fingerprint.eq_ignore_ascii_case(&rotation.peer_ca_bundle_fingerprint)
+                });
+            if candidate_ca_is_active || candidate_ca_is_previous {
+                return Ok(rejected(
+                    "candidate CA activation is already committed in the peer registry; rollback is forbidden",
+                ));
+            }
+        }
+        let previous = format!("{:?}", rotation.phase);
+        if let Err(error) = rotation.apply_event(event.clone(), expected_revision, at_ms) {
+            return Ok(rejected(&error));
+        }
+        let next = format!("{:?}", rotation.phase);
+        let audit = self.audit_event(
+            &actor,
+            &request_id,
+            "federation.trust_rotation.advance",
+            &rotation_id,
+            &previous,
+            &next,
+        );
+        self.task_store
+            .save_federated_control(
+                &request_id,
+                &payload,
+                format!("federated_trust_rotation:{rotation_id}"),
+                serde_json::to_vec(&rotation)?,
+                audit,
+            )
+            .await?;
+        Ok(accepted(
+            "Federated trust rotation advanced",
+            serde_json::to_value(rotation)?,
         ))
     }
 
@@ -3629,6 +4281,572 @@ mod tests {
         assert!(active.accepts_fingerprint(&"a".repeat(64), 122_999));
         assert!(!active.accepts_fingerprint(&"a".repeat(64), 123_000));
         assert!(active.accepts_fingerprint(&"b".repeat(64), 123_000));
+    }
+
+    #[tokio::test]
+    async fn staged_trust_bundle_can_roll_back_before_activation_but_not_after() {
+        let dir = tempdir().unwrap();
+        let store = TaskStore::new(RocksDbStore::open(dir.path()).unwrap());
+        let mut sm = MetaStateMachine::new(store.kv_store().clone());
+        let mut peer = federated_cluster("ca-abort-peer");
+        let old_pem =
+            include_str!("../../tests/fixtures/federation-trust-bundle/old-ca.pem").to_string();
+        let new_pem =
+            include_str!("../../tests/fixtures/federation-trust-bundle/new-ca.pem").to_string();
+        let old_fp = crate::federation::validate_trust_bundle(&old_pem).unwrap();
+        let new_fp = crate::federation::validate_trust_bundle(&new_pem).unwrap();
+        peer.trust_bundle_pem = Some(old_pem);
+        peer.trust_bundle_fingerprint = Some(old_fp.clone());
+        assert!(
+            sm.apply_command(Command::UpsertFederatedCluster {
+                cluster: peer,
+                request_id: "register-ca-abort-peer".into(),
+                actor: "operator".into(),
+            })
+            .await
+            .unwrap()
+            .success
+        );
+        assert!(
+            sm.apply_command(Command::StageFederatedTrustBundle {
+                cluster_id: "ca-abort-peer".into(),
+                current_fingerprint: old_fp.clone(),
+                bundle_pem: new_pem.clone(),
+                bundle_fingerprint: new_fp.clone(),
+                at_ms: 1_000,
+                request_id: "stage-ca-to-abort".into(),
+                actor: "operator".into(),
+            })
+            .await
+            .unwrap()
+            .success
+        );
+        assert!(
+            sm.apply_command(Command::AbortFederatedTrustBundle {
+                cluster_id: "ca-abort-peer".into(),
+                bundle_fingerprint: new_fp.clone(),
+                at_ms: 2_000,
+                request_id: "abort-staged-ca".into(),
+                actor: "operator".into(),
+            })
+            .await
+            .unwrap()
+            .success
+        );
+        let rolled_back = store
+            .get_federated_cluster("ca-abort-peer")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            rolled_back.trust_bundle_fingerprint.as_deref(),
+            Some(old_fp.as_str())
+        );
+        assert!(rolled_back.pending_trust_bundle_pem.is_none());
+
+        assert!(
+            sm.apply_command(Command::StageFederatedTrustBundle {
+                cluster_id: "ca-abort-peer".into(),
+                current_fingerprint: old_fp,
+                bundle_pem: new_pem,
+                bundle_fingerprint: new_fp.clone(),
+                at_ms: 3_000,
+                request_id: "stage-ca-to-activate".into(),
+                actor: "operator".into(),
+            })
+            .await
+            .unwrap()
+            .success
+        );
+        assert!(
+            sm.apply_command(Command::ActivateFederatedTrustBundle {
+                cluster_id: "ca-abort-peer".into(),
+                bundle_fingerprint: new_fp.clone(),
+                at_ms: 4_000,
+                overlap_ms: 60_000,
+                request_id: "activate-ca-before-abort-attempt".into(),
+                actor: "operator".into(),
+            })
+            .await
+            .unwrap()
+            .success
+        );
+        let rejected = sm
+            .apply_command(Command::AbortFederatedTrustBundle {
+                cluster_id: "ca-abort-peer".into(),
+                bundle_fingerprint: new_fp,
+                at_ms: 5_000,
+                request_id: "reject-abort-after-activation".into(),
+                actor: "operator".into(),
+            })
+            .await
+            .unwrap();
+        assert!(!rejected.success);
+    }
+
+    #[tokio::test]
+    async fn federated_leaf_rotation_abort_and_rollback_preserve_the_correct_identity() {
+        let dir = tempdir().unwrap();
+        let store = TaskStore::new(RocksDbStore::open(dir.path()).unwrap());
+        let mut sm = MetaStateMachine::new(store.kv_store().clone());
+        let mut peer = federated_cluster("leaf-rollback-peer");
+        let old = peer.identity_fingerprint.clone();
+        let new = "f".repeat(64);
+        assert!(
+            sm.apply_command(Command::UpsertFederatedCluster {
+                cluster: peer.clone(),
+                request_id: "register-leaf-rollback-peer".into(),
+                actor: "operator".into(),
+            })
+            .await
+            .unwrap()
+            .success
+        );
+        assert!(
+            sm.apply_command(Command::StageFederatedCertificateRotation {
+                cluster_id: peer.cluster_id.clone(),
+                current_fingerprint: old.clone(),
+                new_fingerprint: new.clone(),
+                at_ms: 1_000,
+                grace_period_ms: 60_000,
+                request_id: "stage-leaf-to-abort".into(),
+                actor: "operator".into(),
+            })
+            .await
+            .unwrap()
+            .success
+        );
+        assert!(
+            sm.apply_command(Command::AbortFederatedCertificateRotation {
+                cluster_id: peer.cluster_id.clone(),
+                new_fingerprint: new.clone(),
+                at_ms: 2_000,
+                request_id: "abort-pending-leaf".into(),
+                actor: "operator".into(),
+            })
+            .await
+            .unwrap()
+            .success
+        );
+        peer = store
+            .get_federated_cluster(&peer.cluster_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(peer.identity_fingerprint, old);
+        assert!(peer.pending_identity_fingerprint.is_none());
+
+        assert!(
+            sm.apply_command(Command::StageFederatedCertificateRotation {
+                cluster_id: peer.cluster_id.clone(),
+                current_fingerprint: old.clone(),
+                new_fingerprint: new.clone(),
+                at_ms: 3_000,
+                grace_period_ms: 60_000,
+                request_id: "stage-leaf-to-complete".into(),
+                actor: "operator".into(),
+            })
+            .await
+            .unwrap()
+            .success
+        );
+        assert!(
+            sm.apply_command(Command::CompleteFederatedCertificateRotation {
+                cluster_id: peer.cluster_id.clone(),
+                new_fingerprint: new.clone(),
+                at_ms: 4_000,
+                request_id: "complete-leaf-before-rollback".into(),
+                actor: "operator".into(),
+            })
+            .await
+            .unwrap()
+            .success
+        );
+        assert!(
+            sm.apply_command(Command::RollbackFederatedCertificateRotation {
+                cluster_id: peer.cluster_id.clone(),
+                new_fingerprint: new.clone(),
+                at_ms: 5_000,
+                request_id: "rollback-completed-leaf".into(),
+                actor: "operator".into(),
+            })
+            .await
+            .unwrap()
+            .success
+        );
+        let restored = store
+            .get_federated_cluster(&peer.cluster_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(restored.identity_fingerprint, old);
+        assert!(restored.previous_identity_fingerprint.is_none());
+        assert!(restored.pending_identity_fingerprint.is_none());
+    }
+
+    #[tokio::test]
+    async fn federated_trust_rotation_barrier_recovery_and_retirement_are_raft_persisted() {
+        use crate::federation::{
+            FederatedTrustRotation, FederatedTrustRotationEvent, FederatedTrustRotationPhase,
+        };
+
+        let dir = tempdir().unwrap();
+        let db = RocksDbStore::open(dir.path()).unwrap();
+        let store = TaskStore::new(db);
+        let mut sm = MetaStateMachine::new(store.kv_store().clone());
+        let mut peer = federated_cluster("coordinator-peer");
+        let current_peer_ca =
+            include_str!("../../tests/fixtures/federation-test-ca.pem").to_string();
+        let current_peer_fingerprint =
+            crate::federation::validate_trust_bundle(&current_peer_ca).unwrap();
+        peer.trust_bundle_pem = Some(current_peer_ca);
+        peer.trust_bundle_fingerprint = Some(current_peer_fingerprint.clone());
+        assert!(
+            sm.apply_command(Command::UpsertFederatedCluster {
+                cluster: peer,
+                request_id: "register-coordinator-peer".into(),
+                actor: "operator".into(),
+            })
+            .await
+            .unwrap()
+            .success
+        );
+
+        let local_ca = include_str!("../../tests/fixtures/federation-rotation/ca.pem").to_string();
+        let peer_ca = include_str!("../../tests/fixtures/federation-rotation/ca.pem").to_string();
+        let local_fingerprint = crate::federation::validate_trust_bundle(&local_ca).unwrap();
+        let peer_fingerprint = crate::federation::validate_trust_bundle(&peer_ca).unwrap();
+        let rotation = FederatedTrustRotation {
+            rotation_id: "rotation-coordinator-e2e".into(),
+            peer_cluster_id: "coordinator-peer".into(),
+            current_peer_ca_fingerprint: Some(current_peer_fingerprint.clone()),
+            local_ca_bundle_pem: local_ca,
+            local_ca_bundle_fingerprint: local_fingerprint.clone(),
+            peer_ca_bundle_pem: peer_ca,
+            peer_ca_bundle_fingerprint: peer_fingerprint.clone(),
+            local_leaf_fingerprint: "d".repeat(64),
+            peer_leaf_fingerprint: "e".repeat(64),
+            overlap_ms: 60_000,
+            phase: FederatedTrustRotationPhase::Staging,
+            local_staged: false,
+            peer_staged: false,
+            local_deployment_ready: false,
+            peer_deployment_ready: false,
+            activation_barrier_committed: false,
+            local_activation_expires_at_ms: None,
+            peer_activation_expires_at_ms: None,
+            local_retired: false,
+            peer_retired: false,
+            rollback_reason: None,
+            last_error: None,
+            revision: 0,
+            created_at_ms: 1_000,
+            updated_at_ms: 1_000,
+        };
+        let create = Command::CreateFederatedTrustRotation {
+            rotation: Box::new(rotation),
+            at_ms: 1_000,
+            request_id: "create-bilateral-rotation".into(),
+            actor: "operator".into(),
+        };
+        assert!(sm.apply_command(create.clone()).await.unwrap().success);
+        assert!(sm.apply_command(create).await.unwrap().success);
+
+        assert!(
+            sm.apply_command(Command::StageFederatedTrustBundle {
+                cluster_id: "coordinator-peer".into(),
+                current_fingerprint: current_peer_fingerprint.clone(),
+                bundle_pem: include_str!("../../tests/fixtures/federation-rotation/ca.pem").into(),
+                bundle_fingerprint: peer_fingerprint.clone(),
+                at_ms: 1_900,
+                request_id: "stage-coordinator-peer-ca".into(),
+                actor: "rotation-controller".into(),
+            })
+            .await
+            .unwrap()
+            .success
+        );
+
+        let revision = std::cell::Cell::new(0_u64);
+        let advance = |event, request_id: &str, at_ms| {
+            let expected_revision = revision.get();
+            let command = Command::AdvanceFederatedTrustRotation {
+                rotation_id: "rotation-coordinator-e2e".into(),
+                expected_revision,
+                event,
+                at_ms,
+                request_id: request_id.into(),
+                actor: "rotation-controller".into(),
+            };
+            revision.set(expected_revision + 1);
+            command
+        };
+        let events = [
+            (
+                FederatedTrustRotationEvent::LocalStaged {
+                    fingerprint: peer_fingerprint.clone(),
+                },
+                "local-staged",
+                2_000,
+            ),
+            (
+                FederatedTrustRotationEvent::PeerStaged {
+                    fingerprint: local_fingerprint.clone(),
+                },
+                "peer-staged",
+                2_100,
+            ),
+            (
+                FederatedTrustRotationEvent::LocalDeploymentReady {
+                    leaf_fingerprint: "d".repeat(64),
+                },
+                "local-ready",
+                3_000,
+            ),
+            (
+                FederatedTrustRotationEvent::PeerDeploymentReady {
+                    leaf_fingerprint: "e".repeat(64),
+                },
+                "peer-ready",
+                3_100,
+            ),
+            (
+                FederatedTrustRotationEvent::AuthorizeActivation,
+                "activation-barrier",
+                4_000,
+            ),
+            (
+                FederatedTrustRotationEvent::LocalActivated {
+                    previous_expires_at_ms: 65_000,
+                },
+                "local-activated",
+                5_000,
+            ),
+            (
+                FederatedTrustRotationEvent::MarkRecoveryRequired {
+                    reason: "peer activation acknowledgement lost".into(),
+                },
+                "forward-recovery",
+                5_500,
+            ),
+            (
+                FederatedTrustRotationEvent::PeerActivated {
+                    previous_expires_at_ms: 66_000,
+                },
+                "peer-activated",
+                6_000,
+            ),
+        ];
+        for (event, request, at_ms) in events {
+            if request == "activation-barrier" {
+                let premature = sm
+                    .apply_command(Command::ActivateFederatedTrustBundle {
+                        cluster_id: "coordinator-peer".into(),
+                        bundle_fingerprint: peer_fingerprint.clone(),
+                        at_ms: 4_000,
+                        overlap_ms: 60_000,
+                        request_id: "reject-ca-activation-before-barrier".into(),
+                        actor: "rotation-controller".into(),
+                    })
+                    .await
+                    .unwrap();
+                assert!(!premature.success);
+            }
+            if request == "local-activated" {
+                let activated_ca = sm
+                    .apply_command(Command::ActivateFederatedTrustBundle {
+                        cluster_id: "coordinator-peer".into(),
+                        bundle_fingerprint: peer_fingerprint.clone(),
+                        at_ms: 5_000,
+                        overlap_ms: 60_000,
+                        request_id: "activate-ca-after-barrier".into(),
+                        actor: "rotation-controller".into(),
+                    })
+                    .await
+                    .unwrap();
+                assert!(activated_ca.success, "{}", activated_ca.message);
+                let rollback_race = sm
+                    .apply_command(Command::AdvanceFederatedTrustRotation {
+                        rotation_id: "rotation-coordinator-e2e".into(),
+                        expected_revision: revision.get(),
+                        event: FederatedTrustRotationEvent::BeginRollback {
+                            reason: "rollback races activation".into(),
+                        },
+                        at_ms: 5_001,
+                        request_id: "reject-rollback-after-ca-commit".into(),
+                        actor: "rotation-controller".into(),
+                    })
+                    .await
+                    .unwrap();
+                assert!(!rollback_race.success);
+            }
+            let response = sm
+                .apply_command(advance(event, request, at_ms))
+                .await
+                .unwrap();
+            assert!(response.success, "{}", response.message);
+        }
+        // A lost acknowledgement for an early event may be replayed after later
+        // events have advanced the revision; request identity remains idempotent.
+        let replay = sm
+            .apply_command(Command::AdvanceFederatedTrustRotation {
+                rotation_id: "rotation-coordinator-e2e".into(),
+                expected_revision: 0,
+                event: FederatedTrustRotationEvent::LocalStaged {
+                    fingerprint: peer_fingerprint.clone(),
+                },
+                at_ms: 2_000,
+                request_id: "local-staged".into(),
+                actor: "rotation-controller".into(),
+            })
+            .await
+            .unwrap();
+        assert!(replay.success, "{}", replay.message);
+        let barrier_replay = sm
+            .apply_command(Command::AdvanceFederatedTrustRotation {
+                rotation_id: "rotation-coordinator-e2e".into(),
+                expected_revision: revision.get(),
+                event: FederatedTrustRotationEvent::AuthorizeActivation,
+                at_ms: 6_100,
+                request_id: "activation-barrier-replay".into(),
+                actor: "rotation-controller".into(),
+            })
+            .await
+            .unwrap();
+        assert!(barrier_replay.success, "{}", barrier_replay.message);
+        revision.set(revision.get() + 1);
+        let state = store
+            .get_federated_trust_rotation("rotation-coordinator-e2e")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.phase, FederatedTrustRotationPhase::Overlap);
+        assert_eq!(state.local_activation_expires_at_ms, Some(65_000));
+        assert_eq!(state.peer_activation_expires_at_ms, Some(66_000));
+        let mark_recovery = sm
+            .apply_command(Command::AdvanceFederatedTrustRotation {
+                rotation_id: "rotation-coordinator-e2e".into(),
+                expected_revision: revision.get(),
+                event: FederatedTrustRotationEvent::MarkRecoveryRequired {
+                    reason: "reconcile lost final completion acknowledgement".into(),
+                },
+                at_ms: 6_200,
+                request_id: "mark-recovery-after-both-activated".into(),
+                actor: "rotation-controller".into(),
+            })
+            .await
+            .unwrap();
+        assert!(mark_recovery.success, "{}", mark_recovery.message);
+        revision.set(revision.get() + 1);
+        let resume_forward = sm
+            .apply_command(Command::AdvanceFederatedTrustRotation {
+                rotation_id: "rotation-coordinator-e2e".into(),
+                expected_revision: revision.get(),
+                event: FederatedTrustRotationEvent::AuthorizeActivation,
+                at_ms: 6_300,
+                request_id: "resume-forward-recovery".into(),
+                actor: "rotation-controller".into(),
+            })
+            .await
+            .unwrap();
+        assert!(resume_forward.success, "{}", resume_forward.message);
+        revision.set(revision.get() + 1);
+        let recovered_state = store
+            .get_federated_trust_rotation("rotation-coordinator-e2e")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered_state.phase, FederatedTrustRotationPhase::Overlap);
+        let rollback_after_barrier = sm
+            .apply_command(Command::AdvanceFederatedTrustRotation {
+                rotation_id: "rotation-coordinator-e2e".into(),
+                expected_revision: revision.get(),
+                event: FederatedTrustRotationEvent::BeginRollback {
+                    reason: "unsafe rollback".into(),
+                },
+                at_ms: 6_100,
+                request_id: "rollback-after-activation-barrier".into(),
+                actor: "rotation-controller".into(),
+            })
+            .await
+            .unwrap();
+        assert!(!rollback_after_barrier.success);
+        let too_early = sm
+            .apply_command(Command::AdvanceFederatedTrustRotation {
+                rotation_id: "rotation-coordinator-e2e".into(),
+                expected_revision: revision.get(),
+                event: FederatedTrustRotationEvent::LocalRetired,
+                at_ms: 65_999,
+                request_id: "retire-too-early".into(),
+                actor: "rotation-controller".into(),
+            })
+            .await
+            .unwrap();
+        assert!(!too_early.success);
+
+        drop(sm);
+        drop(store);
+        let reopened = TaskStore::new(RocksDbStore::open(dir.path()).unwrap());
+        let recovered = reopened
+            .get_federated_trust_rotation("rotation-coordinator-e2e")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered.phase, FederatedTrustRotationPhase::Overlap);
+        assert_eq!(recovered.revision, revision.get());
+        assert_eq!(recovered.local_activation_expires_at_ms, Some(65_000));
+        assert_eq!(recovered.peer_activation_expires_at_ms, Some(66_000));
+        let mut sm = MetaStateMachine::new(reopened.kv_store().clone());
+        let premature_ca_retire = sm
+            .apply_command(Command::RetireFederatedTrustBundle {
+                cluster_id: "coordinator-peer".into(),
+                at_ms: 65_999,
+                request_id: "retire-peer-ca-too-early".into(),
+                actor: "rotation-controller".into(),
+            })
+            .await
+            .unwrap();
+        assert!(!premature_ca_retire.success);
+        let ca_retired = sm
+            .apply_command(Command::RetireFederatedTrustBundle {
+                cluster_id: "coordinator-peer".into(),
+                at_ms: 66_000,
+                request_id: "retire-peer-ca-after-both-deadlines".into(),
+                actor: "rotation-controller".into(),
+            })
+            .await
+            .unwrap();
+        assert!(ca_retired.success, "{}", ca_retired.message);
+        let peer_after_retire = reopened
+            .get_federated_cluster("coordinator-peer")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(peer_after_retire.previous_trust_bundle_pem.is_none());
+        let retire_local = Command::AdvanceFederatedTrustRotation {
+            rotation_id: "rotation-coordinator-e2e".into(),
+            expected_revision: revision.get(),
+            event: FederatedTrustRotationEvent::LocalRetired,
+            at_ms: 66_000,
+            request_id: "retire-local-after-overlap".into(),
+            actor: "rotation-controller".into(),
+        };
+        assert!(sm.apply_command(retire_local).await.unwrap().success);
+        let retire_peer = Command::AdvanceFederatedTrustRotation {
+            rotation_id: "rotation-coordinator-e2e".into(),
+            expected_revision: revision.get() + 1,
+            event: FederatedTrustRotationEvent::PeerRetired,
+            at_ms: 66_000,
+            request_id: "retire-peer-after-overlap".into(),
+            actor: "rotation-controller".into(),
+        };
+        assert!(sm.apply_command(retire_peer).await.unwrap().success);
+        let completed = reopened
+            .get_federated_trust_rotation("rotation-coordinator-e2e")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(completed.phase, FederatedTrustRotationPhase::Completed);
     }
 
     #[tokio::test]

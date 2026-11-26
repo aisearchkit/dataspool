@@ -253,6 +253,22 @@ pub enum Command {
         request_id: String,
         actor: String,
     },
+    /// Abort a staged peer leaf identity before CA activation.
+    AbortFederatedCertificateRotation {
+        cluster_id: String,
+        new_fingerprint: String,
+        at_ms: i64,
+        request_id: String,
+        actor: String,
+    },
+    /// Restore the previous peer leaf identity during a pre-activation rollback.
+    RollbackFederatedCertificateRotation {
+        cluster_id: String,
+        new_fingerprint: String,
+        at_ms: i64,
+        request_id: String,
+        actor: String,
+    },
     /// Stage a validated CA bundle without changing the currently trusted roots.
     StageFederatedTrustBundle {
         cluster_id: String,
@@ -275,6 +291,30 @@ pub enum Command {
     /// Retire old CA material only after the committed overlap deadline.
     RetireFederatedTrustBundle {
         cluster_id: String,
+        at_ms: i64,
+        request_id: String,
+        actor: String,
+    },
+    /// Abort a staged CA candidate before either side activates it.
+    AbortFederatedTrustBundle {
+        cluster_id: String,
+        bundle_fingerprint: String,
+        at_ms: i64,
+        request_id: String,
+        actor: String,
+    },
+    /// Create the durable, bilateral certificate lifecycle workflow.
+    CreateFederatedTrustRotation {
+        rotation: Box<crate::federation::FederatedTrustRotation>,
+        at_ms: i64,
+        request_id: String,
+        actor: String,
+    },
+    /// Advance one side of the bilateral lifecycle with revision fencing.
+    AdvanceFederatedTrustRotation {
+        rotation_id: String,
+        expected_revision: u64,
+        event: crate::federation::FederatedTrustRotationEvent,
         at_ms: i64,
         request_id: String,
         actor: String,
@@ -469,6 +509,12 @@ impl Command {
             Command::CompleteFederatedCertificateRotation { cluster_id, .. } => {
                 format!("CompleteFederatedCertificateRotation({})", cluster_id)
             }
+            Command::AbortFederatedCertificateRotation { cluster_id, .. } => {
+                format!("AbortFederatedCertificateRotation({})", cluster_id)
+            }
+            Command::RollbackFederatedCertificateRotation { cluster_id, .. } => {
+                format!("RollbackFederatedCertificateRotation({})", cluster_id)
+            }
             Command::StageFederatedTrustBundle { cluster_id, .. } => {
                 format!("StageFederatedTrustBundle({})", cluster_id)
             }
@@ -477,6 +523,17 @@ impl Command {
             }
             Command::RetireFederatedTrustBundle { cluster_id, .. } => {
                 format!("RetireFederatedTrustBundle({})", cluster_id)
+            }
+            Command::AbortFederatedTrustBundle { cluster_id, .. } => {
+                format!("AbortFederatedTrustBundle({})", cluster_id)
+            }
+            Command::CreateFederatedTrustRotation { rotation, .. } => {
+                format!("CreateFederatedTrustRotation({})", rotation.rotation_id)
+            }
+            Command::AdvanceFederatedTrustRotation {
+                rotation_id, event, ..
+            } => {
+                format!("AdvanceFederatedTrustRotation({rotation_id}, {event:?})")
             }
             Command::TransitionFederatedMigration {
                 migration_id,

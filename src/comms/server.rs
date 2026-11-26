@@ -194,7 +194,7 @@ impl GrpcServer {
         }
         let now = chrono::Utc::now().timestamp_millis();
         for peer in peers {
-            if let Some(bundle) = peer.effective_trust_bundle(now)
+            if let Some(bundle) = peer.handshake_trust_bundle(now)
                 && !bundles.contains(&bundle)
             {
                 bundles.push(bundle);
@@ -404,6 +404,39 @@ async fn verify_peer_identity<T>(
         .map_err(raft_status)?;
     }
     Ok(Some(peer_cluster.to_string()))
+}
+
+fn invert_trust_rotation_event(
+    event: crate::federation::FederatedTrustRotationEvent,
+) -> crate::federation::FederatedTrustRotationEvent {
+    use crate::federation::FederatedTrustRotationEvent as Event;
+    match event {
+        Event::LocalStaged { fingerprint } => Event::PeerStaged { fingerprint },
+        Event::PeerStaged { fingerprint } => Event::LocalStaged { fingerprint },
+        Event::LocalDeploymentReady { leaf_fingerprint } => {
+            Event::PeerDeploymentReady { leaf_fingerprint }
+        }
+        Event::PeerDeploymentReady { leaf_fingerprint } => {
+            Event::LocalDeploymentReady { leaf_fingerprint }
+        }
+        Event::AuthorizeActivation => Event::AuthorizeActivation,
+        Event::LocalActivated {
+            previous_expires_at_ms,
+        } => Event::PeerActivated {
+            previous_expires_at_ms,
+        },
+        Event::PeerActivated {
+            previous_expires_at_ms,
+        } => Event::LocalActivated {
+            previous_expires_at_ms,
+        },
+        Event::LocalRetired => Event::PeerRetired,
+        Event::PeerRetired => Event::LocalRetired,
+        Event::BeginRollback { reason } => Event::BeginRollback { reason },
+        Event::LocalRolledBack => Event::PeerRolledBack,
+        Event::PeerRolledBack => Event::LocalRolledBack,
+        Event::MarkRecoveryRequired { reason } => Event::MarkRecoveryRequired { reason },
+    }
 }
 
 // ==================== ClusterService Implementation ====================
@@ -994,6 +1027,592 @@ impl task::task_service_server::TaskService for Arc<RwLock<TaskServiceImpl>> {
             .into(),
             previous_fingerprint_expires_at_ms: now.saturating_add(grace_period_ms),
             message: result.message,
+        }))
+    }
+
+    async fn create_federated_trust_rotation(
+        &self,
+        request: Request<task::FederatedTrustRotationRequest>,
+    ) -> std::result::Result<Response<task::FederatedTrustRotationResponse>, Status> {
+        let peer = verify_peer_identity(self, &request).await?.ok_or_else(|| {
+            Status::unauthenticated("Trust rotation requires an authenticated federation peer")
+        })?;
+        let req = request.into_inner();
+        if req.rotation_id.trim().is_empty()
+            || req.rotation_id.len() > 96
+            || req.request_id.trim().is_empty()
+            || req.request_id.len() > 128
+            || !(60_000..=604_800_000).contains(&req.overlap_ms)
+        {
+            return Err(Status::invalid_argument(
+                "rotation_id, request_id and a 1-minute to 7-day overlap are required",
+            ));
+        }
+        let local_ca_fingerprint =
+            crate::federation::validate_trust_bundle(&req.peer_ca_bundle_pem)
+                .map_err(Status::invalid_argument)?;
+        let peer_ca_fingerprint =
+            crate::federation::validate_trust_bundle(&req.local_ca_bundle_pem)
+                .map_err(Status::invalid_argument)?;
+        let (store, raft) = {
+            let service = self.read().await;
+            (service.task_store.clone(), service.raft_node.clone())
+        };
+        let raft = raft.ok_or_else(|| Status::unavailable("Trust rotation requires Raft"))?;
+        raft.ensure_linearizable().await.map_err(raft_status)?;
+        let registered_peers = store
+            .list_federated_clusters()
+            .await
+            .map_err(|error| Status::internal(error.to_string()))?;
+        if registered_peers
+            .iter()
+            .any(|registered| registered.trust_bundle_pem.is_none())
+        {
+            return Err(Status::failed_precondition(
+                "all registered federation peers must have Raft-managed CA bundles before rotation; static CA fallback would retain trust in a retired root",
+            ));
+        }
+        let registered = store
+            .get_federated_cluster(&peer)
+            .await
+            .map_err(|error| Status::internal(error.to_string()))?
+            .ok_or_else(|| Status::unauthenticated("Peer cluster is not registered"))?;
+        if registered.trust_bundle_fingerprint.is_none() {
+            return Err(Status::failed_precondition(
+                "peer CA trust must be bootstrapped before bilateral rotation",
+            ));
+        }
+        let now = chrono::Utc::now().timestamp_millis();
+        let rotation = crate::federation::FederatedTrustRotation {
+            rotation_id: req.rotation_id.clone(),
+            peer_cluster_id: peer.clone(),
+            current_peer_ca_fingerprint: registered.trust_bundle_fingerprint.clone(),
+            local_ca_bundle_pem: req.peer_ca_bundle_pem,
+            local_ca_bundle_fingerprint: local_ca_fingerprint,
+            peer_ca_bundle_pem: req.local_ca_bundle_pem,
+            peer_ca_bundle_fingerprint: peer_ca_fingerprint,
+            local_leaf_fingerprint: req.peer_leaf_fingerprint,
+            peer_leaf_fingerprint: req.local_leaf_fingerprint.clone(),
+            overlap_ms: req.overlap_ms,
+            phase: crate::federation::FederatedTrustRotationPhase::Staging,
+            local_staged: false,
+            peer_staged: false,
+            local_deployment_ready: false,
+            peer_deployment_ready: false,
+            activation_barrier_committed: false,
+            local_activation_expires_at_ms: None,
+            peer_activation_expires_at_ms: None,
+            local_retired: false,
+            peer_retired: false,
+            rollback_reason: None,
+            last_error: None,
+            revision: 0,
+            created_at_ms: now,
+            updated_at_ms: now,
+        };
+        let created = raft
+            .propose(crate::raft::Command::CreateFederatedTrustRotation {
+                rotation: Box::new(rotation),
+                at_ms: now,
+                request_id: req.request_id.clone(),
+                actor: format!("federation-peer:{peer}"),
+            })
+            .await
+            .map_err(raft_status)?;
+        if !registered
+            .pending_identity_fingerprint
+            .as_deref()
+            .is_some_and(|fingerprint| {
+                fingerprint.eq_ignore_ascii_case(&req.local_leaf_fingerprint)
+            })
+            && !registered
+                .identity_fingerprint
+                .eq_ignore_ascii_case(&req.local_leaf_fingerprint)
+        {
+            let staged_identity = raft
+                .propose(crate::raft::Command::StageFederatedCertificateRotation {
+                    cluster_id: peer.clone(),
+                    current_fingerprint: registered.identity_fingerprint.clone(),
+                    new_fingerprint: req.local_leaf_fingerprint.clone(),
+                    at_ms: now,
+                    grace_period_ms: req.overlap_ms,
+                    request_id: format!(
+                        "federation-trust:{}:stage-peer-leaf-local",
+                        req.rotation_id
+                    ),
+                    actor: format!("federation-peer:{peer}"),
+                })
+                .await
+                .map_err(raft_status)?;
+            if !staged_identity.success {
+                return Ok(Response::new(task::FederatedTrustRotationResponse {
+                    accepted: false,
+                    state_json: String::new(),
+                    message: staged_identity.message,
+                }));
+            }
+        }
+        let mut rotation = store
+            .get_federated_trust_rotation(&req.rotation_id)
+            .await
+            .map_err(|error| Status::internal(error.to_string()))?
+            .ok_or_else(|| {
+                Status::internal(
+                    if created.success {
+                        "created trust rotation was not persisted"
+                    } else {
+                        created.message.as_str()
+                    }
+                    .to_string(),
+                )
+            })?;
+        if !rotation.local_staged {
+            let staged = raft
+                .propose(crate::raft::Command::StageFederatedTrustBundle {
+                    cluster_id: peer.clone(),
+                    current_fingerprint: rotation
+                        .current_peer_ca_fingerprint
+                        .clone()
+                        .unwrap_or_default(),
+                    bundle_pem: rotation.peer_ca_bundle_pem.clone(),
+                    bundle_fingerprint: rotation.peer_ca_bundle_fingerprint.clone(),
+                    at_ms: now,
+                    request_id: format!("federation-trust:{}:stage-local", req.rotation_id),
+                    actor: format!("federation-peer:{peer}"),
+                })
+                .await
+                .map_err(raft_status)?;
+            if !staged.success {
+                return Ok(Response::new(task::FederatedTrustRotationResponse {
+                    accepted: false,
+                    state_json: serde_json::to_string(&rotation).unwrap_or_default(),
+                    message: staged.message,
+                }));
+            }
+            let event = crate::federation::FederatedTrustRotationEvent::LocalStaged {
+                fingerprint: rotation.peer_ca_bundle_fingerprint.clone(),
+            };
+            let applied = raft
+                .propose(crate::raft::Command::AdvanceFederatedTrustRotation {
+                    rotation_id: req.rotation_id.clone(),
+                    expected_revision: rotation.revision,
+                    event,
+                    at_ms: now,
+                    request_id: format!("federation-trust:{}:event-local-staged", req.rotation_id),
+                    actor: format!("federation-peer:{peer}"),
+                })
+                .await
+                .map_err(raft_status)?;
+            if !applied.success {
+                return Ok(Response::new(task::FederatedTrustRotationResponse {
+                    accepted: false,
+                    state_json: serde_json::to_string(&rotation).unwrap_or_default(),
+                    message: applied.message,
+                }));
+            }
+            rotation = store
+                .get_federated_trust_rotation(&req.rotation_id)
+                .await
+                .map_err(|error| Status::internal(error.to_string()))?
+                .ok_or_else(|| Status::internal("trust rotation disappeared after stage"))?;
+        }
+        Ok(Response::new(task::FederatedTrustRotationResponse {
+            accepted: true,
+            state_json: serde_json::to_string(&rotation)
+                .map_err(|error| Status::internal(error.to_string()))?,
+            message: "peer CA bundle staged; bilateral rotation record is durable".into(),
+        }))
+    }
+
+    async fn advance_federated_trust_rotation(
+        &self,
+        request: Request<task::FederatedTrustRotationRequest>,
+    ) -> std::result::Result<Response<task::FederatedTrustRotationResponse>, Status> {
+        let incoming: crate::federation::FederatedTrustRotationEvent =
+            serde_json::from_str(&request.get_ref().event_json).map_err(|error| {
+                Status::invalid_argument(format!("invalid trust rotation event: {error}"))
+            })?;
+        let presented_fingerprint = request
+            .peer_certs()
+            .and_then(|certs| {
+                certs
+                    .first()
+                    .map(|cert| format!("{:x}", Sha256::digest(cert.as_ref())))
+            })
+            .ok_or_else(|| {
+                Status::unauthenticated("Trust rotation requires an mTLS client certificate")
+            })?;
+        let peer = match verify_peer_identity(self, &request).await {
+            Ok(Some(peer)) => peer,
+            Ok(None) => {
+                return Err(Status::unauthenticated(
+                    "Trust rotation requires an authenticated federation peer",
+                ));
+            }
+            Err(status)
+                if status.code() == tonic::Code::Unauthenticated
+                    && matches!(
+                        incoming,
+                        crate::federation::FederatedTrustRotationEvent::LocalDeploymentReady { .. }
+                    ) =>
+            {
+                let peer = request
+                    .metadata()
+                    .get("x-dataspool-peer-cluster")
+                    .and_then(|value| value.to_str().ok())
+                    .filter(|value| !value.trim().is_empty() && value.len() <= 128)
+                    .ok_or_else(|| Status::unauthenticated("Peer cluster identity is required"))?
+                    .to_string();
+                let (store, raft) = {
+                    let service = self.read().await;
+                    (service.task_store.clone(), service.raft_node.clone())
+                };
+                let raft =
+                    raft.ok_or_else(|| Status::unavailable("Trust rotation requires Raft"))?;
+                raft.ensure_linearizable().await.map_err(raft_status)?;
+                let registered = store
+                    .get_federated_cluster(&peer)
+                    .await
+                    .map_err(|error| Status::internal(error.to_string()))?
+                    .ok_or_else(|| Status::unauthenticated("Peer cluster is not registered"))?;
+                let rotation = store
+                    .get_federated_trust_rotation(&request.get_ref().rotation_id)
+                    .await
+                    .map_err(|error| Status::internal(error.to_string()))?
+                    .filter(|rotation| rotation.peer_cluster_id == peer)
+                    .ok_or_else(|| Status::not_found("trust rotation not found for peer"))?;
+                let requested_leaf = match &incoming {
+                    crate::federation::FederatedTrustRotationEvent::LocalDeploymentReady {
+                        leaf_fingerprint,
+                    } => leaf_fingerprint,
+                    _ => unreachable!(),
+                };
+                if !requested_leaf.eq_ignore_ascii_case(&presented_fingerprint)
+                    || !rotation
+                        .peer_leaf_fingerprint
+                        .eq_ignore_ascii_case(&presented_fingerprint)
+                    || !registered
+                        .pending_identity_fingerprint
+                        .as_deref()
+                        .is_some_and(|pending| pending.eq_ignore_ascii_case(&presented_fingerprint))
+                {
+                    return Err(Status::unauthenticated(
+                        "deployment readiness must prove possession of the staged peer leaf certificate",
+                    ));
+                }
+                let completed = raft
+                    .propose(crate::raft::Command::CompleteFederatedCertificateRotation {
+                        cluster_id: peer.clone(),
+                        new_fingerprint: presented_fingerprint.clone(),
+                        at_ms: chrono::Utc::now().timestamp_millis(),
+                        request_id: format!(
+                            "federation-trust:{}:complete-peer-leaf",
+                            request.get_ref().rotation_id
+                        ),
+                        actor: format!("federation-peer:{peer}:leaf-proof"),
+                    })
+                    .await
+                    .map_err(raft_status)?;
+                if !completed.success {
+                    return Err(Status::unauthenticated(completed.message));
+                }
+                peer
+            }
+            Err(status) => return Err(status),
+        };
+        if let crate::federation::FederatedTrustRotationEvent::LocalDeploymentReady {
+            leaf_fingerprint,
+        } = &incoming
+            && !leaf_fingerprint.eq_ignore_ascii_case(&presented_fingerprint)
+        {
+            return Err(Status::unauthenticated(
+                "deployment readiness leaf fingerprint does not match the presented mTLS certificate",
+            ));
+        }
+        let req = request.into_inner();
+        if req.rotation_id.trim().is_empty()
+            || req.request_id.trim().is_empty()
+            || req.request_id.len() > 128
+        {
+            return Err(Status::invalid_argument(
+                "rotation_id and request_id are required",
+            ));
+        }
+        let incoming: crate::federation::FederatedTrustRotationEvent =
+            serde_json::from_str(&req.event_json).map_err(|error| {
+                Status::invalid_argument(format!("invalid trust rotation event: {error}"))
+            })?;
+        let (store, raft) = {
+            let service = self.read().await;
+            (service.task_store.clone(), service.raft_node.clone())
+        };
+        let raft = raft.ok_or_else(|| Status::unavailable("Trust rotation requires Raft"))?;
+        raft.ensure_linearizable().await.map_err(raft_status)?;
+        let rotation = store
+            .get_federated_trust_rotation(&req.rotation_id)
+            .await
+            .map_err(|error| Status::internal(error.to_string()))?
+            .filter(|rotation| rotation.peer_cluster_id == peer)
+            .ok_or_else(|| {
+                Status::not_found("federated trust rotation not found for authenticated peer")
+            })?;
+        let event = invert_trust_rotation_event(incoming);
+        let payload = format!(
+            "federated-trust-rotation-event:{}:{event:?}",
+            req.rotation_id
+        );
+        if let Some(existing) = store
+            .get_control_request(&req.request_id)
+            .await
+            .map_err(|error| Status::internal(error.to_string()))?
+        {
+            if existing == payload {
+                let current = store
+                    .get_federated_trust_rotation(&req.rotation_id)
+                    .await
+                    .map_err(|error| Status::internal(error.to_string()))?;
+                return Ok(Response::new(task::FederatedTrustRotationResponse {
+                    accepted: true,
+                    state_json: serde_json::to_string(&current)
+                        .map_err(|error| Status::internal(error.to_string()))?,
+                    message: "federated trust rotation event already committed".into(),
+                }));
+            }
+            return Err(Status::already_exists(
+                "request_id was already used for a different trust rotation event",
+            ));
+        }
+        let now = chrono::Utc::now().timestamp_millis();
+        let event_at_ms = match &event {
+            crate::federation::FederatedTrustRotationEvent::LocalActivated {
+                previous_expires_at_ms,
+            }
+            | crate::federation::FederatedTrustRotationEvent::PeerActivated {
+                previous_expires_at_ms,
+            } => previous_expires_at_ms.saturating_sub(rotation.overlap_ms),
+            _ => now,
+        };
+        match &event {
+            crate::federation::FederatedTrustRotationEvent::LocalActivated { .. }
+                if !rotation.activation_barrier_committed
+                    || !matches!(
+                        rotation.phase,
+                        crate::federation::FederatedTrustRotationPhase::Activating
+                            | crate::federation::FederatedTrustRotationPhase::RecoveryRequired
+                    ) =>
+            {
+                return Err(Status::failed_precondition(
+                    "remote activation barrier is not committed",
+                ));
+            }
+            crate::federation::FederatedTrustRotationEvent::LocalRetired
+                if rotation.local_activation_expires_at_ms.is_none()
+                    || rotation.peer_activation_expires_at_ms.is_none()
+                    || now
+                        < rotation
+                            .local_activation_expires_at_ms
+                            .unwrap()
+                            .max(rotation.peer_activation_expires_at_ms.unwrap()) =>
+            {
+                return Err(Status::failed_precondition(
+                    "both activation deadlines must expire before remote retirement",
+                ));
+            }
+            crate::federation::FederatedTrustRotationEvent::LocalRolledBack
+                if rotation.local_activation_expires_at_ms.is_some()
+                    || rotation.peer_activation_expires_at_ms.is_some()
+                    || rotation.phase
+                        != crate::federation::FederatedTrustRotationPhase::RollingBack =>
+            {
+                return Err(Status::failed_precondition(
+                    "remote rollback is permitted only before activation",
+                ));
+            }
+            _ => {}
+        }
+        match &event {
+            crate::federation::FederatedTrustRotationEvent::LocalActivated {
+                previous_expires_at_ms,
+            } => {
+                let activated = raft
+                    .propose(crate::raft::Command::ActivateFederatedTrustBundle {
+                        cluster_id: peer.clone(),
+                        bundle_fingerprint: rotation.peer_ca_bundle_fingerprint.clone(),
+                        at_ms: event_at_ms,
+                        overlap_ms: rotation.overlap_ms,
+                        request_id: format!("federation-trust:{}:activate-local", req.rotation_id),
+                        actor: format!("federation-peer:{peer}"),
+                    })
+                    .await
+                    .map_err(raft_status)?;
+                if !activated.success {
+                    return Ok(Response::new(task::FederatedTrustRotationResponse {
+                        accepted: false,
+                        state_json: serde_json::to_string(&rotation).unwrap_or_default(),
+                        message: activated.message,
+                    }));
+                }
+                if event_at_ms.saturating_add(rotation.overlap_ms) != *previous_expires_at_ms {
+                    return Err(Status::failed_precondition(
+                        "activation expiry does not match the agreed overlap",
+                    ));
+                }
+            }
+            crate::federation::FederatedTrustRotationEvent::LocalRetired => {
+                let retired = raft
+                    .propose(crate::raft::Command::RetireFederatedTrustBundle {
+                        cluster_id: peer.clone(),
+                        at_ms: now,
+                        request_id: format!("federation-trust:{}:retire-local", req.rotation_id),
+                        actor: format!("federation-peer:{peer}"),
+                    })
+                    .await
+                    .map_err(raft_status)?;
+                if !retired.success {
+                    return Ok(Response::new(task::FederatedTrustRotationResponse {
+                        accepted: false,
+                        state_json: serde_json::to_string(&rotation).unwrap_or_default(),
+                        message: retired.message,
+                    }));
+                }
+            }
+            crate::federation::FederatedTrustRotationEvent::LocalRolledBack => {
+                let registered = store
+                    .get_federated_cluster(&peer)
+                    .await
+                    .map_err(|error| Status::internal(error.to_string()))?
+                    .ok_or_else(|| Status::not_found("peer cluster disappeared during rollback"))?;
+                if registered
+                    .pending_identity_fingerprint
+                    .as_deref()
+                    .is_some_and(|fingerprint| {
+                        fingerprint.eq_ignore_ascii_case(&rotation.peer_leaf_fingerprint)
+                    })
+                {
+                    let aborted_leaf = raft
+                        .propose(crate::raft::Command::AbortFederatedCertificateRotation {
+                            cluster_id: peer.clone(),
+                            new_fingerprint: rotation.peer_leaf_fingerprint.clone(),
+                            at_ms: now,
+                            request_id: format!(
+                                "federation-trust:{}:abort-local-leaf",
+                                req.rotation_id
+                            ),
+                            actor: format!("federation-peer:{peer}"),
+                        })
+                        .await
+                        .map_err(raft_status)?;
+                    if !aborted_leaf.success {
+                        return Ok(Response::new(task::FederatedTrustRotationResponse {
+                            accepted: false,
+                            state_json: serde_json::to_string(&rotation).unwrap_or_default(),
+                            message: aborted_leaf.message,
+                        }));
+                    }
+                } else if registered
+                    .identity_fingerprint
+                    .eq_ignore_ascii_case(&rotation.peer_leaf_fingerprint)
+                {
+                    let rolled_back_leaf = raft
+                        .propose(crate::raft::Command::RollbackFederatedCertificateRotation {
+                            cluster_id: peer.clone(),
+                            new_fingerprint: rotation.peer_leaf_fingerprint.clone(),
+                            at_ms: now,
+                            request_id: format!(
+                                "federation-trust:{}:rollback-local-leaf",
+                                req.rotation_id
+                            ),
+                            actor: format!("federation-peer:{peer}"),
+                        })
+                        .await
+                        .map_err(raft_status)?;
+                    if !rolled_back_leaf.success {
+                        return Ok(Response::new(task::FederatedTrustRotationResponse {
+                            accepted: false,
+                            state_json: serde_json::to_string(&rotation).unwrap_or_default(),
+                            message: rolled_back_leaf.message,
+                        }));
+                    }
+                }
+                let aborted = raft
+                    .propose(crate::raft::Command::AbortFederatedTrustBundle {
+                        cluster_id: peer.clone(),
+                        bundle_fingerprint: rotation.peer_ca_bundle_fingerprint.clone(),
+                        at_ms: now,
+                        request_id: format!("federation-trust:{}:abort-local", req.rotation_id),
+                        actor: format!("federation-peer:{peer}"),
+                    })
+                    .await
+                    .map_err(raft_status)?;
+                if !aborted.success {
+                    return Ok(Response::new(task::FederatedTrustRotationResponse {
+                        accepted: false,
+                        state_json: serde_json::to_string(&rotation).unwrap_or_default(),
+                        message: aborted.message,
+                    }));
+                }
+            }
+            _ => {}
+        }
+        let advanced = raft
+            .propose(crate::raft::Command::AdvanceFederatedTrustRotation {
+                rotation_id: req.rotation_id.clone(),
+                expected_revision: rotation.revision,
+                event,
+                at_ms: event_at_ms,
+                request_id: req.request_id,
+                actor: format!("federation-peer:{peer}"),
+            })
+            .await
+            .map_err(raft_status)?;
+        let state = store
+            .get_federated_trust_rotation(&req.rotation_id)
+            .await
+            .map_err(|error| Status::internal(error.to_string()))?;
+        Ok(Response::new(task::FederatedTrustRotationResponse {
+            accepted: advanced.success,
+            state_json: serde_json::to_string(&state)
+                .map_err(|error| Status::internal(error.to_string()))?,
+            message: advanced.message,
+        }))
+    }
+
+    async fn get_federated_trust_rotation(
+        &self,
+        request: Request<task::FederatedTrustRotationRequest>,
+    ) -> std::result::Result<Response<task::FederatedTrustRotationResponse>, Status> {
+        let peer = verify_peer_identity(self, &request).await?.ok_or_else(|| {
+            Status::unauthenticated("Trust rotation requires an authenticated federation peer")
+        })?;
+        let req = request.into_inner();
+        let store = self.read().await.task_store.clone();
+        let rotation = store
+            .get_federated_trust_rotation(&req.rotation_id)
+            .await
+            .map_err(|error| Status::internal(error.to_string()))?
+            .filter(|rotation| rotation.peer_cluster_id == peer)
+            .ok_or_else(|| {
+                Status::not_found("federated trust rotation not found for authenticated peer")
+            })?;
+        let peer_record = store
+            .get_federated_cluster(&peer)
+            .await
+            .map_err(|error| Status::internal(error.to_string()))?
+            .ok_or_else(|| Status::not_found("registered peer cluster not found"))?;
+        let snapshot = crate::federation::FederatedTrustRotationSnapshot {
+            rotation,
+            peer_active_ca_fingerprint: peer_record.trust_bundle_fingerprint,
+            peer_pending_ca_fingerprint: peer_record.pending_trust_bundle_fingerprint,
+            peer_previous_ca_fingerprint: peer_record.previous_trust_bundle_fingerprint,
+            peer_previous_ca_expires_at_ms: peer_record.previous_trust_bundle_expires_at_ms,
+            peer_active_identity_fingerprint: peer_record.identity_fingerprint,
+            peer_pending_identity_fingerprint: peer_record.pending_identity_fingerprint,
+        };
+        Ok(Response::new(task::FederatedTrustRotationResponse {
+            accepted: true,
+            state_json: serde_json::to_string(&snapshot)
+                .map_err(|error| Status::internal(error.to_string()))?,
+            message: "federated trust rotation and peer registry snapshot".into(),
         }))
     }
 

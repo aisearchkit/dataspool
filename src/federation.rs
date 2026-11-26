@@ -139,6 +139,336 @@ pub struct FederatedMigration {
     pub timeout_policy: MigrationTimeoutPolicy,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FederatedTrustRotationPhase {
+    Staging,
+    AwaitingDeployment,
+    ActivationBarrier,
+    Activating,
+    Overlap,
+    Retiring,
+    Completed,
+    RollingBack,
+    RolledBack,
+    RecoveryRequired,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FederatedTrustRotation {
+    pub rotation_id: String,
+    pub peer_cluster_id: String,
+    /// Current peer CA pin observed when this rotation was created; prevents stale starts.
+    pub current_peer_ca_fingerprint: Option<String>,
+    /// The CA bundle this cluster must install on the peer to trust our new leaves.
+    pub local_ca_bundle_pem: String,
+    pub local_ca_bundle_fingerprint: String,
+    /// The CA bundle this cluster installs locally to trust the peer's new leaves.
+    pub peer_ca_bundle_pem: String,
+    pub peer_ca_bundle_fingerprint: String,
+    pub local_leaf_fingerprint: String,
+    pub peer_leaf_fingerprint: String,
+    pub overlap_ms: i64,
+    pub phase: FederatedTrustRotationPhase,
+    pub local_staged: bool,
+    pub peer_staged: bool,
+    pub local_deployment_ready: bool,
+    pub peer_deployment_ready: bool,
+    pub activation_barrier_committed: bool,
+    pub local_activation_expires_at_ms: Option<i64>,
+    pub peer_activation_expires_at_ms: Option<i64>,
+    pub local_retired: bool,
+    pub peer_retired: bool,
+    pub rollback_reason: Option<String>,
+    pub last_error: Option<String>,
+    pub revision: u64,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+}
+
+/// Linearizable remote view used to decide whether pre-activation rollback is safe.
+/// Rotation events and peer registry writes are separate Raft commands, so callers
+/// inspect the actual trust pin as well as the workflow record.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FederatedTrustRotationSnapshot {
+    pub rotation: FederatedTrustRotation,
+    pub peer_active_ca_fingerprint: Option<String>,
+    pub peer_pending_ca_fingerprint: Option<String>,
+    pub peer_previous_ca_fingerprint: Option<String>,
+    pub peer_previous_ca_expires_at_ms: Option<i64>,
+    pub peer_active_identity_fingerprint: String,
+    pub peer_pending_identity_fingerprint: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case", tag = "event", content = "data")]
+pub enum FederatedTrustRotationEvent {
+    LocalStaged { fingerprint: String },
+    PeerStaged { fingerprint: String },
+    LocalDeploymentReady { leaf_fingerprint: String },
+    PeerDeploymentReady { leaf_fingerprint: String },
+    AuthorizeActivation,
+    LocalActivated { previous_expires_at_ms: i64 },
+    PeerActivated { previous_expires_at_ms: i64 },
+    LocalRetired,
+    PeerRetired,
+    BeginRollback { reason: String },
+    LocalRolledBack,
+    PeerRolledBack,
+    MarkRecoveryRequired { reason: String },
+}
+
+impl FederatedTrustRotation {
+    pub fn apply_event(
+        &mut self,
+        event: FederatedTrustRotationEvent,
+        expected_revision: u64,
+        at_ms: i64,
+    ) -> Result<(), String> {
+        if self.revision != expected_revision {
+            return Err(format!(
+                "stale trust rotation revision: expected {}, current {}",
+                expected_revision, self.revision
+            ));
+        }
+        match event {
+            FederatedTrustRotationEvent::LocalStaged { fingerprint } => {
+                if self.phase != FederatedTrustRotationPhase::Staging
+                    || !fingerprint.eq_ignore_ascii_case(&self.peer_ca_bundle_fingerprint)
+                {
+                    return Err("local staged CA fingerprint or phase is invalid".into());
+                }
+                self.local_staged = true;
+                if self.peer_staged {
+                    self.phase = FederatedTrustRotationPhase::AwaitingDeployment;
+                }
+            }
+            FederatedTrustRotationEvent::PeerStaged { fingerprint } => {
+                if self.phase != FederatedTrustRotationPhase::Staging
+                    || !fingerprint.eq_ignore_ascii_case(&self.local_ca_bundle_fingerprint)
+                {
+                    return Err("peer staged CA fingerprint or phase is invalid".into());
+                }
+                self.peer_staged = true;
+                if self.local_staged {
+                    self.phase = FederatedTrustRotationPhase::AwaitingDeployment;
+                }
+            }
+            FederatedTrustRotationEvent::LocalDeploymentReady { leaf_fingerprint } => {
+                if self.phase != FederatedTrustRotationPhase::AwaitingDeployment
+                    || !self.local_staged
+                    || !self.peer_staged
+                    || !leaf_fingerprint.eq_ignore_ascii_case(&self.local_leaf_fingerprint)
+                {
+                    return Err("local deployment readiness requires both staged bundles and the expected leaf".into());
+                }
+                self.local_deployment_ready = true;
+                if self.peer_deployment_ready {
+                    self.phase = FederatedTrustRotationPhase::ActivationBarrier;
+                }
+            }
+            FederatedTrustRotationEvent::PeerDeploymentReady { leaf_fingerprint } => {
+                if self.phase != FederatedTrustRotationPhase::AwaitingDeployment
+                    || !self.local_staged
+                    || !self.peer_staged
+                    || !leaf_fingerprint.eq_ignore_ascii_case(&self.peer_leaf_fingerprint)
+                {
+                    return Err("peer deployment readiness requires both staged bundles and the expected leaf".into());
+                }
+                self.peer_deployment_ready = true;
+                if self.local_deployment_ready {
+                    self.phase = FederatedTrustRotationPhase::ActivationBarrier;
+                }
+            }
+            FederatedTrustRotationEvent::AuthorizeActivation => {
+                if !self.local_deployment_ready || !self.peer_deployment_ready {
+                    return Err(
+                        "activation barrier requires deployment readiness on both sides".into(),
+                    );
+                }
+                if self.activation_barrier_committed {
+                    if !matches!(
+                        self.phase,
+                        FederatedTrustRotationPhase::Activating
+                            | FederatedTrustRotationPhase::RecoveryRequired
+                            | FederatedTrustRotationPhase::Overlap
+                            | FederatedTrustRotationPhase::Retiring
+                            | FederatedTrustRotationPhase::Completed
+                    ) {
+                        return Err(
+                            "committed activation barrier has an invalid workflow phase".into()
+                        );
+                    }
+                    if self.phase == FederatedTrustRotationPhase::RecoveryRequired {
+                        self.phase = if self.local_activation_expires_at_ms.is_some()
+                            && self.peer_activation_expires_at_ms.is_some()
+                        {
+                            FederatedTrustRotationPhase::Overlap
+                        } else {
+                            FederatedTrustRotationPhase::Activating
+                        };
+                    }
+                } else {
+                    if !matches!(
+                        self.phase,
+                        FederatedTrustRotationPhase::ActivationBarrier
+                            | FederatedTrustRotationPhase::RecoveryRequired
+                    ) {
+                        return Err(
+                            "activation barrier requires both deployment-ready acknowledgements"
+                                .into(),
+                        );
+                    }
+                    self.activation_barrier_committed = true;
+                    self.phase = FederatedTrustRotationPhase::Activating;
+                }
+            }
+            FederatedTrustRotationEvent::LocalActivated {
+                previous_expires_at_ms,
+            } => {
+                self.apply_activation(true, previous_expires_at_ms, at_ms)?;
+            }
+            FederatedTrustRotationEvent::PeerActivated {
+                previous_expires_at_ms,
+            } => {
+                self.apply_activation(false, previous_expires_at_ms, at_ms)?;
+            }
+            FederatedTrustRotationEvent::LocalRetired => {
+                self.apply_retirement(true, at_ms)?;
+            }
+            FederatedTrustRotationEvent::PeerRetired => {
+                self.apply_retirement(false, at_ms)?;
+            }
+            FederatedTrustRotationEvent::BeginRollback { reason } => {
+                if self.local_activation_expires_at_ms.is_some()
+                    || self.peer_activation_expires_at_ms.is_some()
+                    || matches!(
+                        self.phase,
+                        FederatedTrustRotationPhase::Completed
+                            | FederatedTrustRotationPhase::RolledBack
+                            | FederatedTrustRotationPhase::RecoveryRequired
+                    )
+                {
+                    return Err("rollback is forbidden after either side activates; forward recovery is required".into());
+                }
+                if reason.trim().is_empty() || reason.len() > 1024 {
+                    return Err("rollback reason must contain 1-1024 characters".into());
+                }
+                self.rollback_reason = Some(reason);
+                self.phase = FederatedTrustRotationPhase::RollingBack;
+            }
+            FederatedTrustRotationEvent::LocalRolledBack => {
+                if self.phase != FederatedTrustRotationPhase::RollingBack {
+                    return Err("local rollback acknowledgement requires rolling_back phase".into());
+                }
+                self.local_staged = false;
+                if !self.peer_staged {
+                    self.phase = FederatedTrustRotationPhase::RolledBack;
+                }
+            }
+            FederatedTrustRotationEvent::PeerRolledBack => {
+                if self.phase != FederatedTrustRotationPhase::RollingBack {
+                    return Err("peer rollback acknowledgement requires rolling_back phase".into());
+                }
+                self.peer_staged = false;
+                if !self.local_staged {
+                    self.phase = FederatedTrustRotationPhase::RolledBack;
+                }
+            }
+            FederatedTrustRotationEvent::MarkRecoveryRequired { reason } => {
+                if (!self.activation_barrier_committed
+                    && self.phase != FederatedTrustRotationPhase::ActivationBarrier)
+                    || matches!(
+                        self.phase,
+                        FederatedTrustRotationPhase::Completed
+                            | FederatedTrustRotationPhase::RolledBack
+                    )
+                {
+                    return Err(
+                        "recovery-required is valid only after the activation barrier".into(),
+                    );
+                }
+                if reason.trim().is_empty() || reason.len() > 1024 {
+                    return Err("recovery reason must contain 1-1024 characters".into());
+                }
+                self.last_error = Some(reason);
+                self.phase = FederatedTrustRotationPhase::RecoveryRequired;
+            }
+        }
+        self.revision = self.revision.saturating_add(1);
+        self.updated_at_ms = at_ms;
+        if !matches!(self.phase, FederatedTrustRotationPhase::RecoveryRequired) {
+            self.last_error = None;
+        }
+        Ok(())
+    }
+
+    fn apply_activation(
+        &mut self,
+        local: bool,
+        previous_expires_at_ms: i64,
+        at_ms: i64,
+    ) -> Result<(), String> {
+        if !self.activation_barrier_committed
+            || !matches!(
+                self.phase,
+                FederatedTrustRotationPhase::Activating
+                    | FederatedTrustRotationPhase::RecoveryRequired
+            )
+            || previous_expires_at_ms != at_ms.saturating_add(self.overlap_ms)
+        {
+            return Err(
+                "activation requires the committed barrier and the exact overlap deadline".into(),
+            );
+        }
+        let deadline = if local {
+            &mut self.local_activation_expires_at_ms
+        } else {
+            &mut self.peer_activation_expires_at_ms
+        };
+        match deadline {
+            Some(existing) if *existing == previous_expires_at_ms => {}
+            Some(_) => return Err("replayed activation cannot change the original expiry".into()),
+            None => *deadline = Some(previous_expires_at_ms),
+        }
+        if self.local_activation_expires_at_ms.is_some()
+            && self.peer_activation_expires_at_ms.is_some()
+        {
+            self.phase = FederatedTrustRotationPhase::Overlap;
+        }
+        Ok(())
+    }
+
+    fn apply_retirement(&mut self, local: bool, at_ms: i64) -> Result<(), String> {
+        if self.local_activation_expires_at_ms.is_none()
+            || self.peer_activation_expires_at_ms.is_none()
+            || !matches!(
+                self.phase,
+                FederatedTrustRotationPhase::Overlap | FederatedTrustRotationPhase::Retiring
+            )
+        {
+            return Err("retirement requires both sides to activate".into());
+        }
+        let deadline = self
+            .local_activation_expires_at_ms
+            .unwrap()
+            .max(self.peer_activation_expires_at_ms.unwrap());
+        if at_ms < deadline {
+            return Err("both CA overlap deadlines must expire before retirement".into());
+        }
+        self.phase = FederatedTrustRotationPhase::Retiring;
+        if local {
+            self.local_retired = true;
+        } else {
+            self.peer_retired = true;
+        }
+        if self.local_retired && self.peer_retired {
+            self.phase = FederatedTrustRotationPhase::Completed;
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum MigrationTimeoutPolicy {
@@ -229,6 +559,29 @@ impl FederatedCluster {
             Some(previous) => format!("{}\n{}", active.trim_end(), previous.trim_start()),
             None => active.to_string(),
         })
+    }
+
+    /// Return all roots usable during a TLS handshake, including a staged candidate.
+    /// Staging expands trust for pre-activation deployment checks without changing the
+    /// active CA pin recorded by the federation state machine.
+    pub fn handshake_trust_bundle(&self, now_ms: i64) -> Option<String> {
+        let mut bundles = Vec::new();
+        if let Some(active) = self.trust_bundle_pem.as_deref() {
+            bundles.push(active.trim().to_string());
+        }
+        if let Some(pending) = self.pending_trust_bundle_pem.as_deref() {
+            bundles.push(pending.trim().to_string());
+        }
+        if let Some(previous) = self
+            .previous_trust_bundle_expires_at_ms
+            .filter(|expires| now_ms < *expires)
+            .and(self.previous_trust_bundle_pem.as_deref())
+        {
+            bundles.push(previous.trim().to_string());
+        }
+        bundles.sort();
+        bundles.dedup();
+        (!bundles.is_empty()).then(|| bundles.join("\n"))
     }
 
     pub fn accepts_fingerprint(&self, fingerprint: &str, now_ms: i64) -> bool {
@@ -331,6 +684,359 @@ pub fn validate_cluster(cluster: &FederatedCluster) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn trust_rotation_fixture() -> FederatedTrustRotation {
+        FederatedTrustRotation {
+            rotation_id: "rotate-peer-1".into(),
+            peer_cluster_id: "peer-1".into(),
+            current_peer_ca_fingerprint: Some("a".repeat(64)),
+            local_ca_bundle_pem: "local-ca-pem".into(),
+            local_ca_bundle_fingerprint: "b".repeat(64),
+            peer_ca_bundle_pem: "peer-ca-pem".into(),
+            peer_ca_bundle_fingerprint: "c".repeat(64),
+            local_leaf_fingerprint: "d".repeat(64),
+            peer_leaf_fingerprint: "e".repeat(64),
+            overlap_ms: 60_000,
+            phase: FederatedTrustRotationPhase::Staging,
+            local_staged: false,
+            peer_staged: false,
+            local_deployment_ready: false,
+            peer_deployment_ready: false,
+            activation_barrier_committed: false,
+            local_activation_expires_at_ms: None,
+            peer_activation_expires_at_ms: None,
+            local_retired: false,
+            peer_retired: false,
+            rollback_reason: None,
+            last_error: None,
+            revision: 0,
+            created_at_ms: 1,
+            updated_at_ms: 1,
+        }
+    }
+
+    #[test]
+    fn bilateral_trust_rotation_requires_both_stages_and_both_deployments_before_activation() {
+        let mut rotation = trust_rotation_fixture();
+        assert!(
+            rotation
+                .apply_event(FederatedTrustRotationEvent::AuthorizeActivation, 0, 10,)
+                .is_err()
+        );
+        rotation
+            .apply_event(
+                FederatedTrustRotationEvent::LocalStaged {
+                    fingerprint: "c".repeat(64),
+                },
+                0,
+                11,
+            )
+            .unwrap();
+        assert_eq!(rotation.phase, FederatedTrustRotationPhase::Staging);
+        rotation
+            .apply_event(
+                FederatedTrustRotationEvent::PeerStaged {
+                    fingerprint: "b".repeat(64),
+                },
+                1,
+                12,
+            )
+            .unwrap();
+        assert_eq!(
+            rotation.phase,
+            FederatedTrustRotationPhase::AwaitingDeployment
+        );
+        rotation
+            .apply_event(
+                FederatedTrustRotationEvent::LocalDeploymentReady {
+                    leaf_fingerprint: "d".repeat(64),
+                },
+                2,
+                13,
+            )
+            .unwrap();
+        assert_eq!(
+            rotation.phase,
+            FederatedTrustRotationPhase::AwaitingDeployment
+        );
+        assert!(
+            rotation
+                .apply_event(FederatedTrustRotationEvent::AuthorizeActivation, 3, 14,)
+                .is_err()
+        );
+        rotation
+            .apply_event(
+                FederatedTrustRotationEvent::PeerDeploymentReady {
+                    leaf_fingerprint: "e".repeat(64),
+                },
+                3,
+                15,
+            )
+            .unwrap();
+        assert_eq!(
+            rotation.phase,
+            FederatedTrustRotationPhase::ActivationBarrier
+        );
+        rotation
+            .apply_event(FederatedTrustRotationEvent::AuthorizeActivation, 4, 16)
+            .unwrap();
+        assert!(rotation.activation_barrier_committed);
+        assert_eq!(rotation.phase, FederatedTrustRotationPhase::Activating);
+    }
+
+    #[test]
+    fn trust_rotation_expiry_is_immutable_and_retirement_waits_for_both_sides() {
+        let mut rotation = trust_rotation_fixture();
+        for (event, revision, at) in [
+            (
+                FederatedTrustRotationEvent::LocalStaged {
+                    fingerprint: "c".repeat(64),
+                },
+                0,
+                10,
+            ),
+            (
+                FederatedTrustRotationEvent::PeerStaged {
+                    fingerprint: "b".repeat(64),
+                },
+                1,
+                11,
+            ),
+            (
+                FederatedTrustRotationEvent::LocalDeploymentReady {
+                    leaf_fingerprint: "d".repeat(64),
+                },
+                2,
+                12,
+            ),
+            (
+                FederatedTrustRotationEvent::PeerDeploymentReady {
+                    leaf_fingerprint: "e".repeat(64),
+                },
+                3,
+                13,
+            ),
+            (FederatedTrustRotationEvent::AuthorizeActivation, 4, 14),
+        ] {
+            rotation.apply_event(event, revision, at).unwrap();
+        }
+        rotation
+            .apply_event(
+                FederatedTrustRotationEvent::LocalActivated {
+                    previous_expires_at_ms: 60_015,
+                },
+                5,
+                15,
+            )
+            .unwrap();
+        assert!(
+            rotation
+                .apply_event(
+                    FederatedTrustRotationEvent::LocalActivated {
+                        previous_expires_at_ms: 90_015
+                    },
+                    6,
+                    15,
+                )
+                .is_err()
+        );
+        rotation
+            .apply_event(
+                FederatedTrustRotationEvent::PeerActivated {
+                    previous_expires_at_ms: 60_020,
+                },
+                6,
+                20,
+            )
+            .unwrap();
+        assert_eq!(rotation.phase, FederatedTrustRotationPhase::Overlap);
+        assert!(
+            rotation
+                .apply_event(FederatedTrustRotationEvent::LocalRetired, 7, 60_019)
+                .is_err()
+        );
+        rotation
+            .apply_event(FederatedTrustRotationEvent::LocalRetired, 7, 60_020)
+            .unwrap();
+        assert_eq!(rotation.phase, FederatedTrustRotationPhase::Retiring);
+        rotation
+            .apply_event(FederatedTrustRotationEvent::PeerRetired, 8, 60_020)
+            .unwrap();
+        assert_eq!(rotation.phase, FederatedTrustRotationPhase::Completed);
+    }
+
+    #[test]
+    fn trust_rotation_rollback_is_allowed_only_before_any_side_activates() {
+        let mut rotation = trust_rotation_fixture();
+        rotation
+            .apply_event(
+                FederatedTrustRotationEvent::LocalStaged {
+                    fingerprint: "c".repeat(64),
+                },
+                0,
+                10,
+            )
+            .unwrap();
+        rotation
+            .apply_event(
+                FederatedTrustRotationEvent::PeerStaged {
+                    fingerprint: "b".repeat(64),
+                },
+                1,
+                11,
+            )
+            .unwrap();
+        rotation
+            .apply_event(
+                FederatedTrustRotationEvent::BeginRollback {
+                    reason: "peer deployment failed".into(),
+                },
+                2,
+                12,
+            )
+            .unwrap();
+        rotation
+            .apply_event(FederatedTrustRotationEvent::LocalRolledBack, 3, 13)
+            .unwrap();
+        assert_eq!(rotation.phase, FederatedTrustRotationPhase::RollingBack);
+        rotation
+            .apply_event(FederatedTrustRotationEvent::PeerRolledBack, 4, 14)
+            .unwrap();
+        assert_eq!(rotation.phase, FederatedTrustRotationPhase::RolledBack);
+
+        let mut active = trust_rotation_fixture();
+        for (event, revision, at) in [
+            (
+                FederatedTrustRotationEvent::LocalStaged {
+                    fingerprint: "c".repeat(64),
+                },
+                0,
+                10,
+            ),
+            (
+                FederatedTrustRotationEvent::PeerStaged {
+                    fingerprint: "b".repeat(64),
+                },
+                1,
+                11,
+            ),
+            (
+                FederatedTrustRotationEvent::LocalDeploymentReady {
+                    leaf_fingerprint: "d".repeat(64),
+                },
+                2,
+                12,
+            ),
+            (
+                FederatedTrustRotationEvent::PeerDeploymentReady {
+                    leaf_fingerprint: "e".repeat(64),
+                },
+                3,
+                13,
+            ),
+            (FederatedTrustRotationEvent::AuthorizeActivation, 4, 14),
+            (
+                FederatedTrustRotationEvent::LocalActivated {
+                    previous_expires_at_ms: 60_015,
+                },
+                5,
+                15,
+            ),
+        ] {
+            active.apply_event(event, revision, at).unwrap();
+        }
+        assert!(
+            active
+                .apply_event(
+                    FederatedTrustRotationEvent::BeginRollback {
+                        reason: "unsafe rollback".into()
+                    },
+                    6,
+                    16,
+                )
+                .is_err()
+        );
+        active
+            .apply_event(
+                FederatedTrustRotationEvent::MarkRecoveryRequired {
+                    reason: "peer activation response lost".into(),
+                },
+                6,
+                16,
+            )
+            .unwrap();
+        assert_eq!(active.phase, FederatedTrustRotationPhase::RecoveryRequired);
+    }
+
+    #[test]
+    fn staged_ca_is_handshake_trusted_without_becoming_the_active_pin() {
+        let active = include_str!("../tests/fixtures/federation-trust-bundle/old-ca.pem");
+        let pending = include_str!("../tests/fixtures/federation-trust-bundle/new-ca.pem");
+        let mut cluster = FederatedCluster {
+            cluster_id: "staged-peer".into(),
+            endpoint: "https://127.0.0.1:9443".into(),
+            identity_fingerprint: "a".repeat(64),
+            previous_identity_fingerprint: None,
+            previous_identity_expires_at_ms: None,
+            pending_identity_fingerprint: None,
+            rotation_started_at_ms: None,
+            pending_rotation_grace_period_ms: None,
+            trust_bundle_pem: Some(active.to_string()),
+            trust_bundle_fingerprint: Some(validate_trust_bundle(active).unwrap()),
+            pending_trust_bundle_pem: Some(pending.to_string()),
+            pending_trust_bundle_fingerprint: Some(validate_trust_bundle(pending).unwrap()),
+            trust_bundle_staged_at_ms: Some(10),
+            previous_trust_bundle_pem: None,
+            previous_trust_bundle_fingerprint: None,
+            previous_trust_bundle_expires_at_ms: None,
+            version: "0.1.0".into(),
+            capabilities: BTreeSet::new(),
+            status: FederatedClusterStatus::Healthy,
+            last_seen_at_ms: 10,
+            updated_at_ms: 10,
+        };
+        assert_eq!(
+            cluster.trust_bundle_fingerprint.as_deref(),
+            Some(validate_trust_bundle(active).unwrap().as_str())
+        );
+        assert_eq!(
+            cluster
+                .effective_trust_bundle(11)
+                .unwrap()
+                .matches("BEGIN CERTIFICATE")
+                .count(),
+            1
+        );
+        assert_eq!(
+            cluster
+                .handshake_trust_bundle(11)
+                .unwrap()
+                .matches("BEGIN CERTIFICATE")
+                .count(),
+            2
+        );
+        cluster.trust_bundle_pem = Some(pending.to_string());
+        cluster.trust_bundle_fingerprint = cluster.pending_trust_bundle_fingerprint.take();
+        cluster.previous_trust_bundle_pem = Some(active.to_string());
+        cluster.previous_trust_bundle_expires_at_ms = Some(100);
+        cluster.pending_trust_bundle_pem = None;
+        assert_eq!(
+            cluster
+                .handshake_trust_bundle(99)
+                .unwrap()
+                .matches("BEGIN CERTIFICATE")
+                .count(),
+            2
+        );
+        assert_eq!(
+            cluster
+                .handshake_trust_bundle(100)
+                .unwrap()
+                .matches("BEGIN CERTIFICATE")
+                .count(),
+            1
+        );
+    }
 
     #[test]
     fn legacy_registry_records_deserialize_without_rotation_fields() {
@@ -533,3 +1239,6 @@ mod tests {
 
 #[path = "federation/orchestrator.rs"]
 pub mod orchestrator;
+
+#[path = "federation/trust_rotation.rs"]
+pub mod trust_rotation;

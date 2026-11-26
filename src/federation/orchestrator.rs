@@ -551,7 +551,7 @@ impl FederatedOrchestrator {
             )));
         }
         let peer = if let Some(bundle) =
-            cluster.effective_trust_bundle(chrono::Utc::now().timestamp_millis())
+            cluster.handshake_trust_bundle(chrono::Utc::now().timestamp_millis())
         {
             GrpcClient::connect_mtls_with_ca_pem(
                 &cluster.endpoint,

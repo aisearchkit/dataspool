@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 
 use crate::{
+    FederatedTrustRotationCoordinator,
     drivers::factory::{SinkConfig, create_sink},
     federation::{
         FederatedCluster, FederatedClusterStatus, FederatedMigration, MigrationState,
@@ -38,6 +39,7 @@ struct ApiState<S: KvStore + Clone> {
     token: Arc<[u8]>,
     operation_lock: Arc<tokio::sync::Mutex<()>>,
     raft: Option<Arc<RaftNode>>,
+    trust_rotation_coordinator: Option<Arc<FederatedTrustRotationCoordinator>>,
 }
 
 /// DLQ REST API. The UI shell is public; every data endpoint requires a bearer token.
@@ -60,12 +62,21 @@ impl<S: KvStore + Clone + 'static> DlqApi<S> {
                 token: Arc::from(token.into_bytes()),
                 operation_lock: Arc::new(tokio::sync::Mutex::new(())),
                 raft: None,
+                trust_rotation_coordinator: None,
             },
         })
     }
 
     pub fn with_raft(mut self, raft: Arc<RaftNode>) -> Self {
         self.state.raft = Some(raft);
+        self
+    }
+
+    pub fn with_trust_rotation_coordinator(
+        mut self,
+        coordinator: Arc<FederatedTrustRotationCoordinator>,
+    ) -> Self {
+        self.state.trust_rotation_coordinator = Some(coordinator);
         self
     }
 
@@ -105,6 +116,34 @@ impl<S: KvStore + Clone + 'static> DlqApi<S> {
             .route(
                 "/api/v1/federation/clusters/{cluster_id}/trust-bundle/retire",
                 post(retire_federated_trust_bundle),
+            )
+            .route(
+                "/api/v1/federation/trust-rotations",
+                get(list_federated_trust_rotations).post(create_federated_trust_rotation),
+            )
+            .route(
+                "/api/v1/federation/trust-rotations/{rotation_id}",
+                get(get_federated_trust_rotation),
+            )
+            .route(
+                "/api/v1/federation/trust-rotations/{rotation_id}/deployment-ready",
+                post(mark_trust_rotation_deployment_ready),
+            )
+            .route(
+                "/api/v1/federation/trust-rotations/{rotation_id}/authorize-activation",
+                post(authorize_trust_rotation_activation),
+            )
+            .route(
+                "/api/v1/federation/trust-rotations/{rotation_id}/activate",
+                post(activate_trust_rotation),
+            )
+            .route(
+                "/api/v1/federation/trust-rotations/{rotation_id}/retire",
+                post(retire_trust_rotation),
+            )
+            .route(
+                "/api/v1/federation/trust-rotations/{rotation_id}/rollback",
+                post(rollback_trust_rotation),
             )
             .route(
                 "/api/v1/federation/migrations",
@@ -155,6 +194,171 @@ struct RegisterFederatedClusterRequest {
     #[serde(default)]
     capabilities: std::collections::BTreeSet<String>,
     request_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateFederatedTrustRotationRequest {
+    rotation_id: String,
+    peer_cluster_id: String,
+    local_ca_bundle_pem: String,
+    peer_ca_bundle_pem: String,
+    local_leaf_fingerprint: String,
+    peer_leaf_fingerprint: String,
+    overlap_ms: i64,
+    request_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct TrustRotationActionRequest {
+    request_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct TrustRotationRollbackRequest {
+    request_id: String,
+    reason: String,
+}
+
+async fn create_federated_trust_rotation<S: KvStore + Clone>(
+    State(state): State<ApiState<S>>,
+    headers: axum::http::HeaderMap,
+    Json(request): Json<CreateFederatedTrustRotationRequest>,
+) -> Response {
+    let Some(coordinator) = state.trust_rotation_coordinator else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match coordinator
+        .start_rotation(
+            &request.rotation_id,
+            &request.peer_cluster_id,
+            request.local_ca_bundle_pem,
+            request.peer_ca_bundle_pem,
+            &request.local_leaf_fingerprint,
+            &request.peer_leaf_fingerprint,
+            request.overlap_ms,
+            &request.request_id,
+            &request_actor(&headers),
+        )
+        .await
+    {
+        Ok(rotation) => Json(rotation).into_response(),
+        Err(error) => (StatusCode::CONFLICT, error.to_string()).into_response(),
+    }
+}
+
+async fn list_federated_trust_rotations<S: KvStore + Clone>(
+    State(state): State<ApiState<S>>,
+) -> Response {
+    match state.tasks.list_federated_trust_rotations().await {
+        Ok(rotations) => Json(rotations).into_response(),
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+    }
+}
+
+async fn get_federated_trust_rotation<S: KvStore + Clone>(
+    State(state): State<ApiState<S>>,
+    Path(rotation_id): Path<String>,
+) -> Response {
+    match state.tasks.get_federated_trust_rotation(&rotation_id).await {
+        Ok(Some(rotation)) => Json(rotation).into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+    }
+}
+
+async fn mark_trust_rotation_deployment_ready<S: KvStore + Clone>(
+    State(state): State<ApiState<S>>,
+    Path(rotation_id): Path<String>,
+    headers: axum::http::HeaderMap,
+    Json(request): Json<TrustRotationActionRequest>,
+) -> Response {
+    let Some(coordinator) = state.trust_rotation_coordinator else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match coordinator
+        .mark_local_deployment_ready(&rotation_id, &request.request_id, &request_actor(&headers))
+        .await
+    {
+        Ok(rotation) => Json(rotation).into_response(),
+        Err(error) => (StatusCode::CONFLICT, error.to_string()).into_response(),
+    }
+}
+
+async fn authorize_trust_rotation_activation<S: KvStore + Clone>(
+    State(state): State<ApiState<S>>,
+    Path(rotation_id): Path<String>,
+    headers: axum::http::HeaderMap,
+    Json(request): Json<TrustRotationActionRequest>,
+) -> Response {
+    let Some(coordinator) = state.trust_rotation_coordinator else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match coordinator
+        .authorize_activation(&rotation_id, &request.request_id, &request_actor(&headers))
+        .await
+    {
+        Ok(rotation) => Json(rotation).into_response(),
+        Err(error) => (StatusCode::CONFLICT, error.to_string()).into_response(),
+    }
+}
+
+async fn activate_trust_rotation<S: KvStore + Clone>(
+    State(state): State<ApiState<S>>,
+    Path(rotation_id): Path<String>,
+    headers: axum::http::HeaderMap,
+    Json(request): Json<TrustRotationActionRequest>,
+) -> Response {
+    let Some(coordinator) = state.trust_rotation_coordinator else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match coordinator
+        .activate_both(&rotation_id, &request.request_id, &request_actor(&headers))
+        .await
+    {
+        Ok(rotation) => Json(rotation).into_response(),
+        Err(error) => (StatusCode::CONFLICT, error.to_string()).into_response(),
+    }
+}
+
+async fn retire_trust_rotation<S: KvStore + Clone>(
+    State(state): State<ApiState<S>>,
+    Path(rotation_id): Path<String>,
+    headers: axum::http::HeaderMap,
+    Json(request): Json<TrustRotationActionRequest>,
+) -> Response {
+    let Some(coordinator) = state.trust_rotation_coordinator else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match coordinator
+        .retire_both(&rotation_id, &request.request_id, &request_actor(&headers))
+        .await
+    {
+        Ok(rotation) => Json(rotation).into_response(),
+        Err(error) => (StatusCode::CONFLICT, error.to_string()).into_response(),
+    }
+}
+
+async fn rollback_trust_rotation<S: KvStore + Clone>(
+    State(state): State<ApiState<S>>,
+    Path(rotation_id): Path<String>,
+    headers: axum::http::HeaderMap,
+    Json(request): Json<TrustRotationRollbackRequest>,
+) -> Response {
+    let Some(coordinator) = state.trust_rotation_coordinator else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match coordinator
+        .rollback_before_activation(
+            &rotation_id,
+            &request.reason,
+            &request.request_id,
+            &request_actor(&headers),
+        )
+        .await
+    {
+        Ok(rotation) => Json(rotation).into_response(),
+        Err(error) => (StatusCode::CONFLICT, error.to_string()).into_response(),
+    }
 }
 
 #[derive(Debug, Deserialize)]

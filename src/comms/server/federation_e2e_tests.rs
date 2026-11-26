@@ -5,6 +5,7 @@
 
 use super::*;
 use crate::{
+    FederatedTrustRotationCoordinator,
     federation::{
         FederatedCluster, FederatedClusterStatus, FederatedMigration,
         FederatedRemoteOperationState, MigrationState, MigrationTimeoutPolicy,
@@ -2096,6 +2097,557 @@ async fn federated_trust_bundle_rotation_converges_across_two_three_member_raft_
             ),
         }
     }
+
+    source_shutdown.cancel();
+    target_shutdown.cancel();
+    source_server.await.unwrap();
+    target_server.await.unwrap();
+    source.shutdown_all().await;
+    target.shutdown_all().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn bilateral_trust_rotation_coordinator_proves_new_leaves_and_activates_both_clusters() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let mut source = TestRaftGroup::start("federation-coordinator-source").await;
+    let mut target = TestRaftGroup::start("federation-coordinator-target").await;
+    let source_leader = source.wait_for_leader(None).await;
+    let target_leader = target.wait_for_leader(None).await;
+
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/federation-trust-bundle");
+    let old_ca = std::fs::read(fixture.join("old-ca.pem")).unwrap();
+    let new_ca = std::fs::read(fixture.join("new-ca.pem")).unwrap();
+    let old_ca_pem = String::from_utf8(old_ca.clone()).unwrap();
+    let new_ca_pem = String::from_utf8(new_ca.clone()).unwrap();
+    let old_ca_fingerprint = crate::federation::validate_trust_bundle(&old_ca_pem).unwrap();
+    let new_ca_fingerprint = crate::federation::validate_trust_bundle(&new_ca_pem).unwrap();
+    let old_leaf_fingerprint = trust_bundle_old_client_fingerprint();
+    let new_leaf_fingerprint = trust_bundle_new_client_fingerprint();
+
+    let source_dir = tempfile::tempdir().unwrap();
+    let target_dir = tempfile::tempdir().unwrap();
+    let write = |directory: &std::path::Path, name: &str, bytes: &[u8]| {
+        let path = directory.join(name);
+        std::fs::write(&path, bytes).unwrap();
+        path
+    };
+    let source_server_cert = write(
+        source_dir.path(),
+        "server.pem",
+        include_bytes!("../../../tests/fixtures/federation-trust-bundle/old-server.pem"),
+    );
+    let source_server_key = write(
+        source_dir.path(),
+        "server.key.pem",
+        include_bytes!("../../../tests/fixtures/federation-trust-bundle/old-server.key.pem"),
+    );
+    let source_client_cert = write(
+        source_dir.path(),
+        "client.pem",
+        include_bytes!("../../../tests/fixtures/federation-trust-bundle/old-client.pem"),
+    );
+    let source_client_key = write(
+        source_dir.path(),
+        "client.key.pem",
+        include_bytes!("../../../tests/fixtures/federation-trust-bundle/old-client.key.pem"),
+    );
+    let old_source_client_cert = write(
+        source_dir.path(),
+        "old-client.pem",
+        include_bytes!("../../../tests/fixtures/federation-trust-bundle/old-client.pem"),
+    );
+    let old_source_client_key = write(
+        source_dir.path(),
+        "old-client.key.pem",
+        include_bytes!("../../../tests/fixtures/federation-trust-bundle/old-client.key.pem"),
+    );
+    let source_ca = write(source_dir.path(), "ca.pem", &old_ca);
+    let target_server_cert = write(
+        target_dir.path(),
+        "server.pem",
+        include_bytes!("../../../tests/fixtures/federation-trust-bundle/old-server.pem"),
+    );
+    let target_server_key = write(
+        target_dir.path(),
+        "server.key.pem",
+        include_bytes!("../../../tests/fixtures/federation-trust-bundle/old-server.key.pem"),
+    );
+    let target_client_cert = write(
+        target_dir.path(),
+        "client.pem",
+        include_bytes!("../../../tests/fixtures/federation-trust-bundle/old-client.pem"),
+    );
+    let target_client_key = write(
+        target_dir.path(),
+        "client.key.pem",
+        include_bytes!("../../../tests/fixtures/federation-trust-bundle/old-client.key.pem"),
+    );
+    let target_ca = write(target_dir.path(), "ca.pem", &old_ca);
+
+    let source_probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let source_addr = source_probe.local_addr().unwrap().to_string();
+    drop(source_probe);
+    let target_probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let target_addr = target_probe.local_addr().unwrap().to_string();
+    drop(target_probe);
+
+    for (group, leader, peer_id, endpoint) in [
+        (
+            &source,
+            source_leader,
+            "target",
+            format!("https://{target_addr}"),
+        ),
+        (
+            &target,
+            target_leader,
+            "source",
+            format!("https://{source_addr}"),
+        ),
+    ] {
+        let now = chrono::Utc::now().timestamp_millis();
+        let result = group
+            .node(leader)
+            .propose(Command::UpsertFederatedCluster {
+                cluster: FederatedCluster {
+                    cluster_id: peer_id.into(),
+                    endpoint,
+                    identity_fingerprint: old_leaf_fingerprint.clone(),
+                    previous_identity_fingerprint: None,
+                    previous_identity_expires_at_ms: None,
+                    pending_identity_fingerprint: None,
+                    rotation_started_at_ms: None,
+                    pending_rotation_grace_period_ms: None,
+                    trust_bundle_pem: Some(old_ca_pem.clone()),
+                    trust_bundle_fingerprint: Some(old_ca_fingerprint.clone()),
+                    pending_trust_bundle_pem: None,
+                    pending_trust_bundle_fingerprint: None,
+                    trust_bundle_staged_at_ms: None,
+                    previous_trust_bundle_pem: None,
+                    previous_trust_bundle_fingerprint: None,
+                    previous_trust_bundle_expires_at_ms: None,
+                    version: env!("CARGO_PKG_VERSION").into(),
+                    capabilities: BTreeSet::new(),
+                    status: FederatedClusterStatus::Healthy,
+                    last_seen_at_ms: now,
+                    updated_at_ms: now,
+                },
+                request_id: format!("register-coordinator-{peer_id}"),
+                actor: "trust-rotation-e2e".into(),
+            })
+            .await
+            .unwrap();
+        assert!(result.success, "{}", result.message);
+    }
+
+    let (source_shutdown, source_server) = spawn_managed_trust_server(
+        &source,
+        source_leader,
+        &source_addr,
+        &source_server_cert,
+        &source_server_key,
+        &source_ca,
+    )
+    .await;
+    let (target_shutdown, target_server) = spawn_managed_trust_server(
+        &target,
+        target_leader,
+        &target_addr,
+        &target_server_cert,
+        &target_server_key,
+        &target_ca,
+    )
+    .await;
+
+    let source_coordinator = FederatedTrustRotationCoordinator::new(
+        source.task_store(source_leader),
+        Arc::new(source.node(source_leader).clone()),
+        "source",
+        source_ca.clone(),
+        source_client_cert.clone(),
+        source_client_key.clone(),
+    );
+    let target_coordinator = FederatedTrustRotationCoordinator::new(
+        target.task_store(target_leader),
+        Arc::new(target.node(target_leader).clone()),
+        "target",
+        target_ca.clone(),
+        target_client_cert.clone(),
+        target_client_key.clone(),
+    );
+
+    let rotation = source_coordinator
+        .start_rotation(
+            "bilateral-ca-rotation-e2e",
+            "target",
+            new_ca_pem.clone(),
+            new_ca_pem.clone(),
+            &new_leaf_fingerprint,
+            &new_leaf_fingerprint,
+            60_000,
+            "start-bilateral-rotation",
+            "operator",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rotation.phase,
+        crate::federation::FederatedTrustRotationPhase::AwaitingDeployment
+    );
+    for (group, peer_id) in [(&source, "target"), (&target, "source")] {
+        let peer = group
+            .task_store(group.wait_for_leader(None).await)
+            .get_federated_cluster(peer_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            peer.pending_trust_bundle_fingerprint.as_deref(),
+            Some(new_ca_fingerprint.as_str())
+        );
+        assert_eq!(
+            peer.pending_identity_fingerprint.as_deref(),
+            Some(new_leaf_fingerprint.as_str())
+        );
+    }
+
+    // Deploy the new server and client leaf certificates while both old and staged
+    // CA roots are accepted. Readiness is proven by a real new-leaf mTLS RPC.
+    for (directory, server_cert, server_key, client_cert, client_key) in [
+        (
+            source_dir.path(),
+            include_bytes!("../../../tests/fixtures/federation-trust-bundle/new-server.pem")
+                .as_slice(),
+            include_bytes!("../../../tests/fixtures/federation-trust-bundle/new-server.key.pem")
+                .as_slice(),
+            include_bytes!("../../../tests/fixtures/federation-trust-bundle/new-client.pem")
+                .as_slice(),
+            include_bytes!("../../../tests/fixtures/federation-trust-bundle/new-client.key.pem")
+                .as_slice(),
+        ),
+        (
+            target_dir.path(),
+            include_bytes!("../../../tests/fixtures/federation-trust-bundle/new-server.pem")
+                .as_slice(),
+            include_bytes!("../../../tests/fixtures/federation-trust-bundle/new-server.key.pem")
+                .as_slice(),
+            include_bytes!("../../../tests/fixtures/federation-trust-bundle/new-client.pem")
+                .as_slice(),
+            include_bytes!("../../../tests/fixtures/federation-trust-bundle/new-client.key.pem")
+                .as_slice(),
+        ),
+    ] {
+        for (name, bytes) in [
+            ("server.pem", server_cert),
+            ("server.key.pem", server_key),
+            ("client.pem", client_cert),
+            ("client.key.pem", client_key),
+        ] {
+            let next = directory.join(format!("{name}.next"));
+            std::fs::write(&next, bytes).unwrap();
+            std::fs::rename(next, directory.join(name)).unwrap();
+        }
+    }
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    let source_ready = source_coordinator
+        .mark_local_deployment_ready(
+            "bilateral-ca-rotation-e2e",
+            "source-deployment-ready",
+            "operator",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        source_ready.phase,
+        crate::federation::FederatedTrustRotationPhase::AwaitingDeployment
+    );
+    let target_ready = target_coordinator
+        .mark_local_deployment_ready(
+            "bilateral-ca-rotation-e2e",
+            "target-deployment-ready",
+            "operator",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        target_ready.phase,
+        crate::federation::FederatedTrustRotationPhase::ActivationBarrier
+    );
+    let source_ready = source_coordinator
+        .get_rotation("bilateral-ca-rotation-e2e")
+        .await
+        .unwrap();
+    assert_eq!(
+        source_ready.phase,
+        crate::federation::FederatedTrustRotationPhase::ActivationBarrier
+    );
+    assert_eq!(source_ready.local_leaf_fingerprint, new_leaf_fingerprint);
+    assert_eq!(source_ready.peer_leaf_fingerprint, new_leaf_fingerprint);
+
+    let authorized = source_coordinator
+        .authorize_activation(
+            "bilateral-ca-rotation-e2e",
+            "authorize-bilateral-activation",
+            "operator",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        authorized.phase,
+        crate::federation::FederatedTrustRotationPhase::Activating
+    );
+    let authorized_replay = source_coordinator
+        .authorize_activation(
+            "bilateral-ca-rotation-e2e",
+            "authorize-bilateral-activation-replay",
+            "operator",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        authorized_replay.phase,
+        crate::federation::FederatedTrustRotationPhase::Activating
+    );
+    let activated = source_coordinator
+        .activate_both(
+            "bilateral-ca-rotation-e2e",
+            "activate-bilateral-ca",
+            "operator",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        activated.phase,
+        crate::federation::FederatedTrustRotationPhase::Overlap
+    );
+    assert_eq!(
+        activated.local_activation_expires_at_ms,
+        activated.peer_activation_expires_at_ms
+    );
+    let replayed = source_coordinator
+        .activate_both(
+            "bilateral-ca-rotation-e2e",
+            "activate-bilateral-ca-replay",
+            "operator",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        replayed.local_activation_expires_at_ms,
+        activated.local_activation_expires_at_ms
+    );
+    assert_eq!(
+        replayed.peer_activation_expires_at_ms,
+        activated.peer_activation_expires_at_ms
+    );
+
+    let deadline = activated
+        .local_activation_expires_at_ms
+        .unwrap()
+        .max(activated.peer_activation_expires_at_ms.unwrap());
+    let wait_ms = deadline
+        .saturating_sub(chrono::Utc::now().timestamp_millis())
+        .max(0) as u64
+        + 100;
+    tokio::time::sleep(Duration::from_millis(wait_ms)).await;
+    let completed = source_coordinator
+        .retire_both(
+            "bilateral-ca-rotation-e2e",
+            "retire-bilateral-ca",
+            "operator",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        completed.phase,
+        crate::federation::FederatedTrustRotationPhase::Completed
+    );
+    for (group, peer_id) in [(&source, "target"), (&target, "source")] {
+        let peer = group
+            .task_store(group.wait_for_leader(None).await)
+            .get_federated_cluster(peer_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            peer.trust_bundle_fingerprint.as_deref(),
+            Some(new_ca_fingerprint.as_str())
+        );
+        assert!(peer.previous_trust_bundle_pem.is_none());
+        assert!(peer.pending_trust_bundle_pem.is_none());
+        assert_eq!(peer.identity_fingerprint, new_leaf_fingerprint);
+        assert!(!peer.accepts_fingerprint(&old_leaf_fingerprint, deadline + 1));
+    }
+
+    // Exercise the pre-activation rollback path after both peers have deployed
+    // and proved the candidate leaf, but before either CA is activated.
+    let rollback_rotation = source_coordinator
+        .start_rotation(
+            "bilateral-ca-rollback-e2e",
+            "target",
+            old_ca_pem.clone(),
+            old_ca_pem.clone(),
+            &old_leaf_fingerprint,
+            &old_leaf_fingerprint,
+            60_000,
+            "start-bilateral-rollback-test",
+            "operator",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rollback_rotation.phase,
+        crate::federation::FederatedTrustRotationPhase::AwaitingDeployment
+    );
+    for directory in [source_dir.path(), target_dir.path()] {
+        for (name, bytes) in [
+            (
+                "server.pem",
+                include_bytes!("../../../tests/fixtures/federation-trust-bundle/old-server.pem")
+                    .as_slice(),
+            ),
+            (
+                "server.key.pem",
+                include_bytes!(
+                    "../../../tests/fixtures/federation-trust-bundle/old-server.key.pem"
+                )
+                .as_slice(),
+            ),
+            (
+                "client.pem",
+                include_bytes!("../../../tests/fixtures/federation-trust-bundle/old-client.pem")
+                    .as_slice(),
+            ),
+            (
+                "client.key.pem",
+                include_bytes!(
+                    "../../../tests/fixtures/federation-trust-bundle/old-client.key.pem"
+                )
+                .as_slice(),
+            ),
+        ] {
+            let next = directory.join(format!("{name}.rollback-next"));
+            std::fs::write(&next, bytes).unwrap();
+            std::fs::rename(next, directory.join(name)).unwrap();
+        }
+    }
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    source_coordinator
+        .mark_local_deployment_ready(
+            "bilateral-ca-rollback-e2e",
+            "source-rollback-deployment-ready",
+            "operator",
+        )
+        .await
+        .unwrap();
+    let rollback_ready = target_coordinator
+        .mark_local_deployment_ready(
+            "bilateral-ca-rollback-e2e",
+            "target-rollback-deployment-ready",
+            "operator",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rollback_ready.phase,
+        crate::federation::FederatedTrustRotationPhase::ActivationBarrier
+    );
+
+    // Restore the pre-rotation (currently active) leaves before rolling back the
+    // trust/identity pins. The old candidate remains staged and handshake-trusted.
+    for directory in [source_dir.path(), target_dir.path()] {
+        for (name, bytes) in [
+            (
+                "server.pem",
+                include_bytes!("../../../tests/fixtures/federation-trust-bundle/new-server.pem")
+                    .as_slice(),
+            ),
+            (
+                "server.key.pem",
+                include_bytes!(
+                    "../../../tests/fixtures/federation-trust-bundle/new-server.key.pem"
+                )
+                .as_slice(),
+            ),
+            (
+                "client.pem",
+                include_bytes!("../../../tests/fixtures/federation-trust-bundle/new-client.pem")
+                    .as_slice(),
+            ),
+            (
+                "client.key.pem",
+                include_bytes!(
+                    "../../../tests/fixtures/federation-trust-bundle/new-client.key.pem"
+                )
+                .as_slice(),
+            ),
+        ] {
+            let next = directory.join(format!("{name}.restore-next"));
+            std::fs::write(&next, bytes).unwrap();
+            std::fs::rename(next, directory.join(name)).unwrap();
+        }
+    }
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    let rolled_back = source_coordinator
+        .rollback_before_activation(
+            "bilateral-ca-rollback-e2e",
+            "candidate deployment failed validation",
+            "rollback-bilateral-trust-rotation",
+            "operator",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rolled_back.phase,
+        crate::federation::FederatedTrustRotationPhase::RolledBack
+    );
+    for (group, peer_id) in [(&source, "target"), (&target, "source")] {
+        let peer = group
+            .task_store(group.wait_for_leader(None).await)
+            .get_federated_cluster(peer_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            peer.trust_bundle_fingerprint.as_deref(),
+            Some(new_ca_fingerprint.as_str())
+        );
+        assert!(peer.pending_trust_bundle_pem.is_none());
+        assert_eq!(peer.identity_fingerprint, new_leaf_fingerprint);
+        assert!(peer.pending_identity_fingerprint.is_none());
+        assert!(peer.previous_identity_fingerprint.is_none());
+    }
+
+    let old_and_new_ca = write(
+        source_dir.path(),
+        "old-and-new-ca.pem",
+        &[old_ca, new_ca].concat(),
+    );
+    assert!(
+        crate::comms::GrpcClient::connect_mtls(
+            &format!("https://{target_addr}"),
+            &old_and_new_ca,
+            &old_source_client_cert,
+            &old_source_client_key,
+        )
+        .await
+        .is_err()
+    );
+    let mut new_client = connect_trust_bundle_client(
+        &format!("https://{target_addr}"),
+        &old_and_new_ca,
+        &source_client_cert,
+        &source_client_key,
+    )
+    .await;
+    assert!(
+        new_client
+            .get_remote_task("00000000-0000-0000-0000-000000000001", "source")
+            .await
+            .unwrap()
+            .is_none()
+    );
 
     source_shutdown.cancel();
     target_shutdown.cancel();
