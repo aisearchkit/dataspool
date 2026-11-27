@@ -956,18 +956,19 @@ impl<S: KvStore + Clone> MetaStateMachine<S> {
                 && rotation
                     .peer_leaf_fingerprint
                     .eq_ignore_ascii_case(&new_fingerprint)
-                && (!rotation.activation_barrier_committed
-                    || !matches!(
-                        rotation.phase,
-                        crate::federation::FederatedTrustRotationPhase::Activating
-                            | crate::federation::FederatedTrustRotationPhase::RecoveryRequired
-                            | crate::federation::FederatedTrustRotationPhase::Overlap
-                            | crate::federation::FederatedTrustRotationPhase::Retiring
-                            | crate::federation::FederatedTrustRotationPhase::Completed
-                    ))
+                && !matches!(
+                    rotation.phase,
+                    crate::federation::FederatedTrustRotationPhase::AwaitingDeployment
+                        | crate::federation::FederatedTrustRotationPhase::ActivationBarrier
+                        | crate::federation::FederatedTrustRotationPhase::Activating
+                        | crate::federation::FederatedTrustRotationPhase::RecoveryRequired
+                        | crate::federation::FederatedTrustRotationPhase::Overlap
+                        | crate::federation::FederatedTrustRotationPhase::Retiring
+                        | crate::federation::FederatedTrustRotationPhase::Completed
+                )
             {
                 return Ok(rejected(
-                    "bilateral leaf proof can complete only after the activation barrier enters forward recovery",
+                    "bilateral leaf proof is not valid in the current trust rotation phase",
                 ));
             }
         }
