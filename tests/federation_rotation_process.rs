@@ -935,11 +935,10 @@ async fn run_six_member_child() {
         .with_mtls_files(&server_cert, &server_key, &client_ca)
         .await
         .unwrap();
-        if cluster == "target" {
+        let ack_marker = PathBuf::from(std::env::var("DATASPOOL_TRUST_HA_ACK_MARKER").unwrap());
+        if cluster == "target" && !ack_marker.exists() {
             grpc = grpc
-                .with_rotation_event_ack_drop_marker(PathBuf::from(
-                    std::env::var("DATASPOOL_TRUST_HA_ACK_MARKER").unwrap(),
-                ))
+                .with_rotation_event_ack_drop_marker(ack_marker)
                 .with_rotation_event_ack_gate(PathBuf::from(
                     std::env::var("DATASPOOL_TRUST_HA_ACK_GATE").unwrap(),
                 ))
@@ -985,6 +984,50 @@ async fn run_six_member_child() {
             .unwrap();
         }
         let command = std::fs::read_to_string(&control).unwrap_or_default();
+        if command != last_command
+            && let Some(expected) = command.strip_prefix("verify-partial-recovery:")
+        {
+            let expected_expiry: i64 = expected.parse().unwrap();
+            tokio::time::timeout(Duration::from_secs(25), async {
+                loop {
+                    let peer = store.get_federated_cluster(peer_id).await.unwrap();
+                    let rotation = store.get_federated_trust_rotation("coordinator-process-rotation").await.unwrap();
+                    let recovered = match (cluster.as_str(), peer, rotation) {
+                        ("source", Some(peer), Some(rotation)) => {
+                            rotation.phase == FederatedTrustRotationPhase::Activating
+                                && rotation.local_activation_expires_at_ms == Some(expected_expiry)
+                                && rotation.peer_activation_expires_at_ms.is_none()
+                                && peer.trust_bundle_fingerprint.as_deref() == Some(NEW_CA_FINGERPRINT)
+                                && peer.previous_trust_bundle_fingerprint.as_deref() == Some(OLD_FINGERPRINT_CA)
+                                && peer.pending_trust_bundle_pem.is_none()
+                                && peer.previous_trust_bundle_expires_at_ms == Some(expected_expiry)
+                        }
+                        ("target", Some(peer), Some(rotation)) => {
+                            rotation.phase == FederatedTrustRotationPhase::Overlap
+                                && rotation.local_activation_expires_at_ms == Some(expected_expiry)
+                                && rotation.peer_activation_expires_at_ms == Some(expected_expiry)
+                                && peer.trust_bundle_fingerprint.as_deref() == Some(NEW_CA_FINGERPRINT)
+                                && peer.previous_trust_bundle_fingerprint.as_deref() == Some(OLD_FINGERPRINT_CA)
+                                && peer.pending_trust_bundle_pem.is_none()
+                                && peer.previous_trust_bundle_expires_at_ms == Some(expected_expiry)
+                        }
+                        _ => false,
+                    };
+                    if recovered {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(40)).await;
+                }
+            })
+            .await
+            .expect("each restarted Raft member must recover its own durable partial-activation state before coordinator replay");
+            std::fs::write(
+                markers.join(format!("{cluster}.partial-recovered-{member}")),
+                b"partial-state-recovered",
+            )
+            .unwrap();
+            last_command = command.clone();
+        }
         if command != last_command
             && let Some(expected) = command.strip_prefix("verify-coordinator:")
         {
@@ -1583,6 +1626,80 @@ async fn federated_trust_rotation_coordinator_process_recovers_after_remote_acti
         target_before_restart.peer_previous_ca_expires_at_ms,
         Some(expiry)
     );
+
+    // Stop every Raft member in both clusters as well as the coordinator.
+    // No graceful shutdown is allowed here: this is a process-level power-loss
+    // simulation and all six member-local RocksDB/Raft directories must survive.
+    for (cluster, _, control, children) in &mut groups {
+        write_control(control, "hold");
+        std::fs::remove_file(markers.join(format!("{cluster}.leader"))).unwrap();
+        for member in 0..3 {
+            std::fs::remove_file(ready.join(format!("{cluster}-{member}.ready"))).unwrap();
+        }
+        for child in children {
+            assert_sigkill(
+                child,
+                "SIGKILL all Raft members for full-cluster restart recovery",
+            );
+        }
+    }
+
+    // Restart all six members in a deliberately interleaved order. Each process
+    // opens the exact same persistent directory and listener address; no Raft
+    // state or application database is recreated.
+    for cluster in ["target", "source"] {
+        let group = groups.iter_mut().find(|group| group.0 == cluster).unwrap();
+        for member in [2usize, 0, 1] {
+            let member_root = root.path().join(cluster).join(format!("member-{member}"));
+            let address_list = group.1.join(";");
+            group.3[member] = coordinator_raft_child_process(
+                cluster,
+                member,
+                &member_root,
+                &address_list,
+                &ready,
+                &group.2,
+                &markers,
+                if cluster == "source" {
+                    &source_grpc
+                } else {
+                    &target_grpc
+                },
+                if cluster == "source" {
+                    &target_grpc
+                } else {
+                    &source_grpc
+                },
+                &cert_dir,
+                &ack_marker,
+                &ack_gate,
+            );
+        }
+    }
+    for (cluster, _, _, children) in &mut groups {
+        for member in 0..3 {
+            let pid = children[member].id();
+            wait_for_file(
+                &ready.join(format!("{cluster}-{member}-{pid}.ready")),
+                children,
+            )
+            .await;
+        }
+        wait_for_file(&markers.join(format!("{cluster}.leader")), children).await;
+    }
+
+    // Check the asymmetric durable commit boundary on every restarted member
+    // before allowing the coordinator to issue any recovery command.
+    for (cluster, _, control, children) in &mut groups {
+        write_control(control, &format!("verify-partial-recovery:{expiry}"));
+        for member in 0..3 {
+            wait_for_file(
+                &markers.join(format!("{cluster}.partial-recovered-{member}")),
+                children,
+            )
+            .await;
+        }
+    }
 
     let mut recovered = coordinator_process_child(
         "recover",

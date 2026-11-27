@@ -1,0 +1,66 @@
+name: Federation Process E2E
+
+on:
+  push:
+    branches: [ main, develop ]
+    paths:
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'build.rs'
+      - 'rust-toolchain*'
+      - '.cargo/**'
+      - '.github/workflows/federation-process-e2e.yml'
+      - 'proto/**'
+      - 'src/lib.rs'
+      - 'src/comms/**'
+      - 'src/federation/**'
+      - 'src/raft/**'
+      - 'src/storage/**'
+      - 'src/task/**'
+      - 'tests/federation_rotation_process.rs'
+  pull_request:
+    branches: [ main, develop ]
+    paths:
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'build.rs'
+      - 'rust-toolchain*'
+      - '.cargo/**'
+      - '.github/workflows/federation-process-e2e.yml'
+      - 'proto/**'
+      - 'src/lib.rs'
+      - 'src/comms/**'
+      - 'src/federation/**'
+      - 'src/raft/**'
+      - 'src/storage/**'
+      - 'src/task/**'
+      - 'tests/federation_rotation_process.rs'
+  schedule:
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: federation-process-e2e-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  CXXFLAGS: -include cstdint
+
+jobs:
+  federation-process-e2e:
+    name: Six-member Raft and coordinator process recovery
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install native build dependencies
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler clang libclang-dev llvm-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run federated CA lifecycle process-crash integration
+        run: cargo test --test federation_rotation_process --all-features -- --nocapture --test-threads=1
