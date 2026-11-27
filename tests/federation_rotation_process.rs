@@ -780,6 +780,17 @@ fn write_control(path: &Path, value: &str) {
     std::fs::rename(next, path).unwrap();
 }
 
+fn write_atomic_marker(path: &Path, value: &str) {
+    let name = path.file_name().unwrap().to_string_lossy();
+    let next = path.with_file_name(format!(".{name}.{}.tmp", std::process::id()));
+    std::fs::write(&next, value).unwrap();
+    std::fs::rename(next, path).unwrap();
+}
+
+fn read_marker_index(path: &Path) -> Option<usize> {
+    std::fs::read_to_string(path).ok()?.trim().parse().ok()
+}
+
 async fn wait_for_file(path: &Path, children: &mut [Child]) {
     tokio::time::timeout(Duration::from_secs(35), async {
         loop {
@@ -1104,16 +1115,14 @@ async fn run_six_member_child() {
         {
             previous_leader = Some(leader);
             let leader_index = leader.saturating_sub(base_id) as usize;
-            std::fs::write(
-                markers.join(format!("{cluster}.leader")),
-                leader_index.to_string(),
-            )
-            .unwrap();
-            std::fs::write(
-                markers.join(format!("{cluster}.member-{member}.leader")),
-                leader_index.to_string(),
-            )
-            .unwrap();
+            write_atomic_marker(
+                &markers.join(format!("{cluster}.leader")),
+                &leader_index.to_string(),
+            );
+            write_atomic_marker(
+                &markers.join(format!("{cluster}.member-{member}.leader")),
+                &leader_index.to_string(),
+            );
         }
         if !markers
             .join(format!("{cluster}.member-{member}-{process_id}.candidate"))
@@ -1565,11 +1574,11 @@ async fn federated_trust_bundle_rotation_survives_sigkill_of_both_three_member_r
         let leader_file = markers.join(format!("{cluster}.leader"));
         tokio::time::timeout(Duration::from_secs(20), async {
             loop {
-                if let Ok(value) = std::fs::read_to_string(&leader_file) {
-                    let index: usize = value.parse().unwrap();
-                    if children[index].try_wait().unwrap().is_none() {
-                        return;
-                    }
+                if let Some(index) = read_marker_index(&leader_file)
+                    && index < children.len()
+                    && children[index].try_wait().unwrap().is_none()
+                {
+                    return;
                 }
                 tokio::time::sleep(Duration::from_millis(40)).await;
             }
@@ -1644,11 +1653,11 @@ async fn federated_trust_bundle_rotation_survives_sigkill_of_both_three_member_r
         let leader_file = markers.join(format!("{cluster}.leader"));
         tokio::time::timeout(Duration::from_secs(20), async {
             loop {
-                if let Ok(value) = std::fs::read_to_string(&leader_file) {
-                    let index: usize = value.parse().unwrap();
-                    if children[index].try_wait().unwrap().is_none() {
-                        return;
-                    }
+                if let Some(index) = read_marker_index(&leader_file)
+                    && index < children.len()
+                    && children[index].try_wait().unwrap().is_none()
+                {
+                    return;
                 }
                 tokio::time::sleep(Duration::from_millis(40)).await;
             }
@@ -2029,10 +2038,18 @@ async fn federated_trust_rotation_coordinator_process_recovers_after_remote_acti
     // quorum, then stop that leader before stopping the follower quorum.
     for (cluster, addresses, control, children) in &mut groups {
         let leader_file = markers.join(format!("{cluster}.leader"));
-        let isolated_leader: usize = std::fs::read_to_string(&leader_file)
-            .expect("current leader marker")
-            .parse()
-            .unwrap();
+        let isolated_leader = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(leader) = read_marker_index(&leader_file)
+                    && leader < 3
+                {
+                    return leader;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("current leader marker must contain a valid member index");
         for member in 0..3 {
             std::fs::remove_file(markers.join(format!("{cluster}.isolated-follower-{member}")))
                 .ok();
@@ -2142,10 +2159,18 @@ async fn federated_trust_rotation_coordinator_process_recovers_after_remote_acti
             if member != isolated_leader {
                 let member_leader = markers.join(format!("{cluster}.member-{member}.leader"));
                 wait_for_file(&member_leader, children).await;
-                let observed: usize = std::fs::read_to_string(member_leader)
-                    .unwrap()
-                    .parse()
-                    .unwrap();
+                let observed = tokio::time::timeout(Duration::from_secs(5), async {
+                    loop {
+                        if let Some(leader) = read_marker_index(&member_leader)
+                            && leader < 3
+                        {
+                            return leader;
+                        }
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                })
+                .await
+                .expect("member leader marker must contain a valid member index");
                 assert_ne!(observed, isolated_leader);
                 assert!(quorum_leader.is_none_or(|leader| leader == observed));
                 quorum_leader = Some(observed);
