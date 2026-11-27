@@ -32,9 +32,6 @@ const ROTATION_SERVER_CERT: &[u8] = include_bytes!("fixtures/federation-rotation
 const ROTATION_SERVER_KEY: &[u8] = include_bytes!("fixtures/federation-rotation/server.key.pem");
 const ROTATION_OLD_CERT: &[u8] = include_bytes!("fixtures/federation-rotation/old-client.pem");
 const ROTATION_OLD_KEY: &[u8] = include_bytes!("fixtures/federation-rotation/old-client.key.pem");
-const ROTATION_NEW_CERT: &[u8] = include_bytes!("fixtures/federation-trust-bundle/new-client.pem");
-const ROTATION_NEW_KEY: &[u8] =
-    include_bytes!("fixtures/federation-trust-bundle/new-client.key.pem");
 const ROTATION_NEW_CA: &[u8] = include_bytes!("fixtures/federation-trust-bundle/new-ca.pem");
 const ASYMMETRIC_SOURCE_CA: &[u8] = include_bytes!("fixtures/federation-trust-bundle/old-ca.pem");
 const ASYMMETRIC_SOURCE_CERT: &[u8] =
@@ -229,6 +226,50 @@ async fn run_child_process() {
     } else {
         "source-process"
     };
+    // Each side trusts the other side's independent CA. The new trust bundle
+    // and leaf are deliberately crossed: Source moves to old-ca/old-client,
+    // while Target moves to new-ca/new-client.
+    let (
+        current_identity,
+        candidate_identity,
+        current_ca_pem,
+        candidate_ca_pem,
+        server_cert_pem,
+        server_key_pem,
+        candidate_peer_cert,
+        candidate_peer_key,
+    ) = if role == "source" {
+        (
+            NEW_FINGERPRINT,
+            OLD_FINGERPRINT,
+            ASYMMETRIC_TARGET_CA,
+            ASYMMETRIC_SOURCE_CA,
+            ASYMMETRIC_SOURCE_CERT,
+            ASYMMETRIC_SOURCE_KEY,
+            ASYMMETRIC_SOURCE_CLIENT,
+            ASYMMETRIC_SOURCE_CLIENT_KEY,
+        )
+    } else {
+        (
+            OLD_FINGERPRINT,
+            NEW_FINGERPRINT,
+            ASYMMETRIC_SOURCE_CA,
+            ASYMMETRIC_TARGET_CA,
+            ASYMMETRIC_TARGET_CERT,
+            ASYMMETRIC_TARGET_KEY,
+            ASYMMETRIC_TARGET_CLIENT,
+            ASYMMETRIC_TARGET_CLIENT_KEY,
+        )
+    };
+    let current_ca_fingerprint =
+        dataspool::federation::validate_trust_bundle(std::str::from_utf8(current_ca_pem).unwrap())
+            .unwrap();
+    let candidate_ca_fingerprint = dataspool::federation::validate_trust_bundle(
+        std::str::from_utf8(candidate_ca_pem).unwrap(),
+    )
+    .unwrap();
+    assert_ne!(current_identity, candidate_identity);
+    assert_ne!(current_ca_fingerprint, candidate_ca_fingerprint);
     let db = RocksDbStore::open(root.join("app")).expect("open durable application store");
     let store = TaskStore::new(db.clone());
     let node = RaftNode::new(
@@ -267,19 +308,14 @@ async fn run_child_process() {
         let cluster = FederatedCluster {
             cluster_id: peer_id.into(),
             endpoint: "https://127.0.0.1:1".into(),
-            identity_fingerprint: OLD_FINGERPRINT.into(),
+            identity_fingerprint: current_identity.into(),
             previous_identity_fingerprint: None,
             previous_identity_expires_at_ms: None,
             pending_identity_fingerprint: None,
             rotation_started_at_ms: None,
             pending_rotation_grace_period_ms: None,
-            trust_bundle_pem: Some(String::from_utf8(ROTATION_CA.to_vec()).unwrap()),
-            trust_bundle_fingerprint: Some(
-                dataspool::federation::validate_trust_bundle(
-                    std::str::from_utf8(ROTATION_CA).unwrap(),
-                )
-                .unwrap(),
-            ),
+            trust_bundle_pem: Some(String::from_utf8(current_ca_pem.to_vec()).unwrap()),
+            trust_bundle_fingerprint: Some(current_ca_fingerprint.clone()),
             pending_trust_bundle_pem: None,
             pending_trust_bundle_fingerprint: None,
             trust_bundle_staged_at_ms: None,
@@ -304,8 +340,8 @@ async fn run_child_process() {
         let staged = node
             .propose(Command::StageFederatedCertificateRotation {
                 cluster_id: peer_id.into(),
-                current_fingerprint: OLD_FINGERPRINT.into(),
-                new_fingerprint: NEW_FINGERPRINT.into(),
+                current_fingerprint: current_identity.into(),
+                new_fingerprint: candidate_identity.into(),
                 at_ms: now,
                 grace_period_ms: 300_000,
                 request_id: format!("stage-process-{role}"),
@@ -317,15 +353,15 @@ async fn run_child_process() {
         let persisted = store.get_federated_cluster(peer_id).await.unwrap().unwrap();
         assert_eq!(
             persisted.pending_identity_fingerprint.as_deref(),
-            Some(NEW_FINGERPRINT)
+            Some(candidate_identity)
         );
-        let new_ca_pem = String::from_utf8(ROTATION_NEW_CA.to_vec()).unwrap();
+        let new_ca_pem = String::from_utf8(candidate_ca_pem.to_vec()).unwrap();
         let staged_ca = node
             .propose(Command::StageFederatedTrustBundle {
                 cluster_id: peer_id.into(),
                 current_fingerprint: persisted.trust_bundle_fingerprint.clone().unwrap(),
                 bundle_pem: new_ca_pem,
-                bundle_fingerprint: NEW_CA_FINGERPRINT.into(),
+                bundle_fingerprint: candidate_ca_fingerprint.clone(),
                 at_ms: now,
                 request_id: format!("stage-ca-process-{role}"),
                 actor: "process-crash-e2e".into(),
@@ -336,25 +372,25 @@ async fn run_child_process() {
         let persisted = store.get_federated_cluster(peer_id).await.unwrap().unwrap();
         assert_eq!(
             persisted.pending_trust_bundle_fingerprint.as_deref(),
-            Some(NEW_CA_FINGERPRINT)
+            Some(candidate_ca_fingerprint.as_str())
         );
         std::fs::write(&marker, b"stage-committed").unwrap();
     } else if phase == "proof" {
         let staged = store.get_federated_cluster(peer_id).await.unwrap().unwrap();
-        assert_eq!(staged.identity_fingerprint, OLD_FINGERPRINT);
+        assert_eq!(staged.identity_fingerprint, current_identity);
         assert_eq!(
             staged.pending_identity_fingerprint.as_deref(),
-            Some(NEW_FINGERPRINT)
+            Some(candidate_identity)
         );
         assert_eq!(
             staged.pending_trust_bundle_fingerprint.as_deref(),
-            Some(NEW_CA_FINGERPRINT)
+            Some(candidate_ca_fingerprint.as_str())
         );
         let activated_at = chrono::Utc::now().timestamp_millis();
         let activated_ca = node
             .propose(Command::ActivateFederatedTrustBundle {
                 cluster_id: peer_id.into(),
-                bundle_fingerprint: NEW_CA_FINGERPRINT.into(),
+                bundle_fingerprint: candidate_ca_fingerprint.clone(),
                 at_ms: activated_at,
                 overlap_ms: 60_000,
                 request_id: format!("activate-ca-process-{role}"),
@@ -366,11 +402,11 @@ async fn run_child_process() {
         let activated = store.get_federated_cluster(peer_id).await.unwrap().unwrap();
         assert_eq!(
             activated.trust_bundle_fingerprint.as_deref(),
-            Some(NEW_CA_FINGERPRINT)
+            Some(candidate_ca_fingerprint.as_str())
         );
         assert_eq!(
             activated.previous_trust_bundle_fingerprint.as_deref(),
-            Some(OLD_FINGERPRINT_CA)
+            Some(current_ca_fingerprint.as_str())
         );
         assert_eq!(
             activated.previous_trust_bundle_expires_at_ms,
@@ -383,11 +419,11 @@ async fn run_child_process() {
         let ca = cert_dir.join("ca.pem");
         let new_cert = cert_dir.join("new-client.pem");
         let new_key = cert_dir.join("new-client.key.pem");
-        std::fs::write(&server_cert, ROTATION_SERVER_CERT).unwrap();
-        std::fs::write(&server_key, ROTATION_SERVER_KEY).unwrap();
-        std::fs::write(&ca, ROTATION_CA).unwrap();
-        std::fs::write(&new_cert, ROTATION_NEW_CERT).unwrap();
-        std::fs::write(&new_key, ROTATION_NEW_KEY).unwrap();
+        std::fs::write(&server_cert, server_cert_pem).unwrap();
+        std::fs::write(&server_key, server_key_pem).unwrap();
+        std::fs::write(&ca, candidate_ca_pem).unwrap();
+        std::fs::write(&new_cert, candidate_peer_cert).unwrap();
+        std::fs::write(&new_key, candidate_peer_key).unwrap();
         let dropped_ack = root.join("proof-ack-dropped");
         let grpc = GrpcServer::new(
             &grpc_addr,
@@ -410,7 +446,7 @@ async fn run_child_process() {
         let proof = new_client
             .prove_federated_certificate_rotation(
                 peer_id,
-                NEW_FINGERPRINT,
+                candidate_identity,
                 &format!("proof-process-{role}"),
             )
             .await;
@@ -423,10 +459,10 @@ async fn run_child_process() {
             "Proof handler must commit before ACK is dropped"
         );
         let persisted = store.get_federated_cluster(peer_id).await.unwrap().unwrap();
-        assert_eq!(persisted.identity_fingerprint, NEW_FINGERPRINT);
+        assert_eq!(persisted.identity_fingerprint, candidate_identity);
         assert_eq!(
             persisted.previous_identity_fingerprint.as_deref(),
-            Some(OLD_FINGERPRINT)
+            Some(current_identity)
         );
         // The handler committed Proof, then the test-only gRPC middleware
         // replaced its successful response with UNAVAILABLE. The parent now
@@ -434,19 +470,19 @@ async fn run_child_process() {
         std::fs::write(&marker, b"proof-committed-response-dropped").unwrap();
     } else if phase == "verify" {
         let active = store.get_federated_cluster(peer_id).await.unwrap().unwrap();
-        assert_eq!(active.identity_fingerprint, NEW_FINGERPRINT);
+        assert_eq!(active.identity_fingerprint, candidate_identity);
         assert_eq!(
             active.previous_identity_fingerprint.as_deref(),
-            Some(OLD_FINGERPRINT)
+            Some(current_identity)
         );
         assert!(active.pending_identity_fingerprint.is_none());
         assert_eq!(
             active.trust_bundle_fingerprint.as_deref(),
-            Some(NEW_CA_FINGERPRINT)
+            Some(candidate_ca_fingerprint.as_str())
         );
         assert_eq!(
             active.previous_trust_bundle_fingerprint.as_deref(),
-            Some(OLD_FINGERPRINT_CA)
+            Some(current_ca_fingerprint.as_str())
         );
         let ca_expiry = active.previous_trust_bundle_expires_at_ms.unwrap();
         assert!(
@@ -458,7 +494,7 @@ async fn run_child_process() {
         let replay_ca = node
             .propose(Command::ActivateFederatedTrustBundle {
                 cluster_id: peer_id.into(),
-                bundle_fingerprint: NEW_CA_FINGERPRINT.into(),
+                bundle_fingerprint: candidate_ca_fingerprint.clone(),
                 at_ms: ca_expiry + 60_000,
                 overlap_ms: 60_000,
                 request_id: format!("activate-ca-process-{role}"),
@@ -474,19 +510,19 @@ async fn run_child_process() {
         );
         assert_eq!(
             after_ca_replay.effective_trust_bundle(ca_expiry).unwrap(),
-            String::from_utf8(ROTATION_NEW_CA.to_vec()).unwrap()
+            String::from_utf8(candidate_ca_pem.to_vec()).unwrap()
         );
         let expiry = active.previous_identity_expires_at_ms.unwrap();
-        assert!(active.accepts_fingerprint(OLD_FINGERPRINT, expiry - 1));
-        assert!(!active.accepts_fingerprint(OLD_FINGERPRINT, expiry));
-        assert!(active.accepts_fingerprint(NEW_FINGERPRINT, expiry));
+        assert!(active.accepts_fingerprint(current_identity, expiry - 1));
+        assert!(!active.accepts_fingerprint(current_identity, expiry));
+        assert!(active.accepts_fingerprint(candidate_identity, expiry));
 
         // A restarted former leader replaying the old Stage operation cannot
         // re-authorize the old certificate or overwrite the committed identity.
         let stale_stage = node
             .propose(Command::StageFederatedCertificateRotation {
                 cluster_id: peer_id.into(),
-                current_fingerprint: OLD_FINGERPRINT.into(),
+                current_fingerprint: current_identity.into(),
                 new_fingerprint: "c".repeat(64),
                 at_ms: expiry,
                 grace_period_ms: 60_000,
@@ -505,7 +541,7 @@ async fn run_child_process() {
         let replay = node
             .propose(Command::CompleteFederatedCertificateRotation {
                 cluster_id: peer_id.into(),
-                new_fingerprint: NEW_FINGERPRINT.into(),
+                new_fingerprint: candidate_identity.into(),
                 at_ms: expiry + 60_000,
                 request_id: format!("proof-process-{role}"),
                 actor: "proof-replay-after-restart".into(),
@@ -515,15 +551,15 @@ async fn run_child_process() {
         assert!(replay.success, "{}", replay.message);
         let after_replay = store.get_federated_cluster(peer_id).await.unwrap().unwrap();
         assert_eq!(after_replay.previous_identity_expires_at_ms, Some(expiry));
-        assert!(!after_replay.accepts_fingerprint(OLD_FINGERPRINT, expiry + 60_000));
+        assert!(!after_replay.accepts_fingerprint(current_identity, expiry + 60_000));
         let cert_dir = root.join("rotation-certs");
         std::fs::create_dir_all(&cert_dir).unwrap();
         let cert = cert_dir.join("server.pem");
         let key = cert_dir.join("server.key.pem");
         let ca = cert_dir.join("ca.pem");
-        std::fs::write(&cert, ROTATION_SERVER_CERT).unwrap();
-        std::fs::write(&key, ROTATION_SERVER_KEY).unwrap();
-        std::fs::write(&ca, ROTATION_CA).unwrap();
+        std::fs::write(&cert, server_cert_pem).unwrap();
+        std::fs::write(&key, server_key_pem).unwrap();
+        std::fs::write(&ca, candidate_ca_pem).unwrap();
         let grpc = GrpcServer::new(
             &grpc_addr,
             std::sync::Arc::new(store.clone()),
@@ -2771,19 +2807,40 @@ async fn federated_certificate_rotation_recovers_after_sigkill_across_both_raft_
         std::fs::write(&path, bytes).unwrap();
         path
     };
-    let ca = write("ca.pem", ROTATION_CA);
-    let old_cert = write("old-client.pem", ROTATION_OLD_CERT);
-    let old_key = write("old-client.key.pem", ROTATION_OLD_KEY);
-    let new_cert = write("new-client.pem", ROTATION_NEW_CERT);
-    let new_key = write("new-client.key.pem", ROTATION_NEW_KEY);
+    let source_ca = write("source-ca.pem", ASYMMETRIC_SOURCE_CA);
+    let target_ca = write("target-ca.pem", ASYMMETRIC_TARGET_CA);
+    let source_client = write("source-client.pem", ASYMMETRIC_SOURCE_CLIENT);
+    let source_client_key = write("source-client.key.pem", ASYMMETRIC_SOURCE_CLIENT_KEY);
+    let target_client = write("target-client.pem", ASYMMETRIC_TARGET_CLIENT);
+    let target_client_key = write("target-client.key.pem", ASYMMETRIC_TARGET_CLIENT_KEY);
 
-    for (endpoint, peer_id) in [
-        (format!("https://{source_grpc_addr}"), "target-process"),
-        (format!("https://{target_grpc_addr}"), "source-process"),
-    ] {
-        // The old CA is no longer in the effective inbound trust bundle, so
-        // a fresh TLS handshake using its old client leaf must fail outright.
-        match GrpcClient::connect_mtls(&endpoint, &ca, &old_cert, &old_key).await {
+    let endpoints = [
+        (
+            format!("https://{source_grpc_addr}"),
+            "target-process",
+            &source_ca,
+            &target_client,
+            &target_client_key,
+            &source_client,
+            &source_client_key,
+            OLD_FINGERPRINT,
+        ),
+        (
+            format!("https://{target_grpc_addr}"),
+            "source-process",
+            &target_ca,
+            &source_client,
+            &source_client_key,
+            &target_client,
+            &target_client_key,
+            NEW_FINGERPRINT,
+        ),
+    ];
+    for (endpoint, peer_id, ca, old_cert, old_key, new_cert, new_key, new_fingerprint) in endpoints
+    {
+        // Each endpoint now trusts a different root. The old peer leaf chains
+        // to the previous root and must fail a fresh mTLS handshake.
+        match GrpcClient::connect_mtls(&endpoint, ca, old_cert, old_key).await {
             Err(_) => {}
             Ok(mut expired_old) => assert!(
                 expired_old
@@ -2794,14 +2851,13 @@ async fn federated_certificate_rotation_recovers_after_sigkill_across_both_raft_
             ),
         }
 
-        // The new active certificate can reconnect and replay the completed
-        // proof. The server must return the committed result without extending
-        // the previous-certificate deadline.
-        let mut active_new = connect_mtls_retry(&endpoint, &ca, &new_cert, &new_key).await;
+        // The role-specific new peer leaf chains to the endpoint's new active
+        // trust root. Proof replay must not extend the previous-CA deadline.
+        let mut active_new = connect_mtls_retry(&endpoint, ca, new_cert, new_key).await;
         let replay = active_new
             .prove_federated_certificate_rotation(
                 peer_id,
-                NEW_FINGERPRINT,
+                new_fingerprint,
                 if peer_id == "target-process" {
                     "proof-process-source"
                 } else {
