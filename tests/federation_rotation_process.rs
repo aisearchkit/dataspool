@@ -683,6 +683,25 @@ async fn run_rollback_coordinator_process() {
     assert!(source.rotation.peer_activation_expires_at_ms.is_none());
     assert!(target.rotation.local_activation_expires_at_ms.is_none());
     assert!(target.rotation.peer_activation_expires_at_ms.is_none());
+
+    // A replay after the terminal state is durable must be a pure read: no
+    // revision changes, no new stage, and no activation deadline appears.
+    let source_revision = source.rotation.revision;
+    let target_revision = target.rotation.revision;
+    let (source_replay, target_replay) = coordinator
+        .rollback_before_activation("operator requested rollback before activation")
+        .await
+        .unwrap();
+    assert_eq!(source_replay.rotation.revision, source_revision);
+    assert_eq!(target_replay.rotation.revision, target_revision);
+    assert_eq!(
+        source_replay.rotation.phase,
+        FederatedTrustRotationPhase::RolledBack
+    );
+    assert_eq!(
+        target_replay.rotation.phase,
+        FederatedTrustRotationPhase::RolledBack
+    );
     std::fs::write(&marker, b"bilateral-rollback-recovered").unwrap();
 }
 
