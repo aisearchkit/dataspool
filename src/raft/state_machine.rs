@@ -869,6 +869,24 @@ impl<S: KvStore + Clone> MetaStateMachine<S> {
                 ))
             };
         }
+        for rotation in self.task_store.list_federated_trust_rotations().await? {
+            if rotation.peer_cluster_id == cluster_id
+                && !matches!(
+                    rotation.phase,
+                    crate::federation::FederatedTrustRotationPhase::Completed
+                        | crate::federation::FederatedTrustRotationPhase::RolledBack
+                )
+                && (!rotation
+                    .peer_leaf_fingerprint
+                    .eq_ignore_ascii_case(&new_fingerprint)
+                    || rotation.phase
+                        == crate::federation::FederatedTrustRotationPhase::RollingBack)
+            {
+                return Ok(rejected(
+                    "leaf staging conflicts with the active bilateral trust rotation",
+                ));
+            }
+        }
         cluster.pending_identity_fingerprint = Some(new_fingerprint.clone());
         cluster.rotation_started_at_ms = Some(at_ms);
         cluster.pending_rotation_grace_period_ms = Some(grace_period_ms);
@@ -932,6 +950,26 @@ impl<S: KvStore + Clone> MetaStateMachine<S> {
             return Ok(rejected(
                 "new certificate has not been staged for this cluster",
             ));
+        }
+        for rotation in self.task_store.list_federated_trust_rotations().await? {
+            if rotation.peer_cluster_id == cluster_id
+                && rotation
+                    .peer_leaf_fingerprint
+                    .eq_ignore_ascii_case(&new_fingerprint)
+                && (!rotation.activation_barrier_committed
+                    || !matches!(
+                        rotation.phase,
+                        crate::federation::FederatedTrustRotationPhase::Activating
+                            | crate::federation::FederatedTrustRotationPhase::RecoveryRequired
+                            | crate::federation::FederatedTrustRotationPhase::Overlap
+                            | crate::federation::FederatedTrustRotationPhase::Retiring
+                            | crate::federation::FederatedTrustRotationPhase::Completed
+                    ))
+            {
+                return Ok(rejected(
+                    "bilateral leaf proof can complete only after the activation barrier enters forward recovery",
+                ));
+            }
         }
         let grace_period_ms = cluster.pending_rotation_grace_period_ms.unwrap_or_default();
         if !(60_000..=604_800_000).contains(&grace_period_ms) {
@@ -1249,6 +1287,19 @@ impl<S: KvStore + Clone> MetaStateMachine<S> {
                         "bilateral trust rotation is not ready for CA retirement",
                     ));
                 }
+                let previous_pin_matches = match (
+                    cluster.previous_trust_bundle_fingerprint.as_deref(),
+                    rotation.current_peer_ca_fingerprint.as_deref(),
+                ) {
+                    (Some(previous), Some(expected)) => previous.eq_ignore_ascii_case(expected),
+                    (None, None) => true,
+                    _ => false,
+                };
+                if !previous_pin_matches {
+                    return Ok(rejected(
+                        "previous CA pin does not match the bilateral rotation's recorded starting trust",
+                    ));
+                }
                 let bilateral_deadline = rotation
                     .local_activation_expires_at_ms
                     .zip(rotation.peer_activation_expires_at_ms)
@@ -1329,6 +1380,20 @@ impl<S: KvStore + Clone> MetaStateMachine<S> {
         {
             return Ok(rejected("requested leaf identity is not pending"));
         }
+        for rotation in self.task_store.list_federated_trust_rotations().await? {
+            if rotation.peer_cluster_id == cluster_id
+                && rotation
+                    .peer_leaf_fingerprint
+                    .eq_ignore_ascii_case(&new_fingerprint)
+                && (rotation.phase != crate::federation::FederatedTrustRotationPhase::RollingBack
+                    || rotation.local_activation_expires_at_ms.is_some()
+                    || rotation.peer_activation_expires_at_ms.is_some())
+            {
+                return Ok(rejected(
+                    "bilateral leaf abort requires a committed pre-activation RollingBack state",
+                ));
+            }
+        }
         cluster.pending_identity_fingerprint = None;
         cluster.rotation_started_at_ms = None;
         cluster.pending_rotation_grace_period_ms = None;
@@ -1402,6 +1467,20 @@ impl<S: KvStore + Clone> MetaStateMachine<S> {
             .is_some_and(|expires| at_ms < expires)
         {
             return Ok(rejected("previous leaf identity grace period has expired"));
+        }
+        for rotation in self.task_store.list_federated_trust_rotations().await? {
+            if rotation.peer_cluster_id == cluster_id
+                && rotation
+                    .peer_leaf_fingerprint
+                    .eq_ignore_ascii_case(&new_fingerprint)
+                && (rotation.phase != crate::federation::FederatedTrustRotationPhase::RollingBack
+                    || rotation.local_activation_expires_at_ms.is_some()
+                    || rotation.peer_activation_expires_at_ms.is_some())
+            {
+                return Ok(rejected(
+                    "bilateral leaf rollback requires a committed pre-activation RollingBack state",
+                ));
+            }
         }
         cluster.identity_fingerprint = previous;
         cluster.previous_identity_fingerprint = None;
@@ -1480,6 +1559,20 @@ impl<S: KvStore + Clone> MetaStateMachine<S> {
             .is_some_and(|pending| pending.eq_ignore_ascii_case(&bundle_fingerprint))
         {
             return Ok(rejected("the requested CA bundle is not staged"));
+        }
+        for rotation in self.task_store.list_federated_trust_rotations().await? {
+            if rotation.peer_cluster_id == cluster_id
+                && rotation
+                    .peer_ca_bundle_fingerprint
+                    .eq_ignore_ascii_case(&bundle_fingerprint)
+                && (rotation.phase != crate::federation::FederatedTrustRotationPhase::RollingBack
+                    || rotation.local_activation_expires_at_ms.is_some()
+                    || rotation.peer_activation_expires_at_ms.is_some())
+            {
+                return Ok(rejected(
+                    "bilateral CA abort requires a committed pre-activation RollingBack state",
+                ));
+            }
         }
         cluster.pending_trust_bundle_pem = None;
         cluster.pending_trust_bundle_fingerprint = None;
@@ -1645,6 +1738,13 @@ impl<S: KvStore + Clone> MetaStateMachine<S> {
             })
         {
             return Ok(rejected("candidate peer CA bundle is already active"));
+        }
+        if peer.pending_identity_fingerprint.is_some()
+            || peer.pending_trust_bundle_fingerprint.is_some()
+        {
+            return Ok(rejected(
+                "peer already has staged certificate or CA material outside this rotation",
+            ));
         }
         if self
             .task_store
@@ -4543,6 +4643,8 @@ mod tests {
             created_at_ms: 1_000,
             updated_at_ms: 1_000,
         };
+        let mut conflicting_rotation = rotation.clone();
+        conflicting_rotation.rotation_id = "rotation-coordinator-conflict".into();
         let create = Command::CreateFederatedTrustRotation {
             rotation: Box::new(rotation),
             at_ms: 1_000,
@@ -4551,6 +4653,19 @@ mod tests {
         };
         assert!(sm.apply_command(create.clone()).await.unwrap().success);
         assert!(sm.apply_command(create).await.unwrap().success);
+        let concurrent_rotation = sm
+            .apply_command(Command::CreateFederatedTrustRotation {
+                rotation: Box::new(conflicting_rotation),
+                at_ms: 1_001,
+                request_id: "create-conflicting-bilateral-rotation".into(),
+                actor: "operator".into(),
+            })
+            .await
+            .unwrap();
+        assert!(
+            !concurrent_rotation.success,
+            "a second Rotation ID must not concurrently control the same peer"
+        );
 
         assert!(
             sm.apply_command(Command::StageFederatedTrustBundle {
@@ -4565,6 +4680,64 @@ mod tests {
             .await
             .unwrap()
             .success
+        );
+        let wrong_leaf_stage = sm
+            .apply_command(Command::StageFederatedCertificateRotation {
+                cluster_id: "coordinator-peer".into(),
+                current_fingerprint: "a".repeat(64),
+                new_fingerprint: "f".repeat(64),
+                at_ms: 1_899,
+                grace_period_ms: 60_000,
+                request_id: "reject-wrong-bilateral-leaf".into(),
+                actor: "operator".into(),
+            })
+            .await
+            .unwrap();
+        assert!(
+            !wrong_leaf_stage.success,
+            "a bilateral rotation must pin the expected peer leaf fingerprint"
+        );
+        assert!(
+            sm.apply_command(Command::StageFederatedCertificateRotation {
+                cluster_id: "coordinator-peer".into(),
+                current_fingerprint: "a".repeat(64),
+                new_fingerprint: "e".repeat(64),
+                at_ms: 1_900,
+                grace_period_ms: 60_000,
+                request_id: "stage-coordinator-peer-leaf".into(),
+                actor: "rotation-controller".into(),
+            })
+            .await
+            .unwrap()
+            .success
+        );
+        let direct_ca_abort = sm
+            .apply_command(Command::AbortFederatedTrustBundle {
+                cluster_id: "coordinator-peer".into(),
+                bundle_fingerprint: peer_fingerprint.clone(),
+                at_ms: 1_950,
+                request_id: "reject-uncoordinated-ca-abort".into(),
+                actor: "operator".into(),
+            })
+            .await
+            .unwrap();
+        assert!(
+            !direct_ca_abort.success,
+            "CA abort must require bilateral RollingBack"
+        );
+        let direct_leaf_abort = sm
+            .apply_command(Command::AbortFederatedCertificateRotation {
+                cluster_id: "coordinator-peer".into(),
+                new_fingerprint: "e".repeat(64),
+                at_ms: 1_950,
+                request_id: "reject-uncoordinated-leaf-abort".into(),
+                actor: "operator".into(),
+            })
+            .await
+            .unwrap();
+        assert!(
+            !direct_leaf_abort.success,
+            "leaf abort must require bilateral RollingBack"
         );
 
         let revision = std::cell::Cell::new(0_u64);
@@ -4685,6 +4858,64 @@ mod tests {
                 .await
                 .unwrap();
             assert!(response.success, "{}", response.message);
+            if request == "local-activated" {
+                let changed_expiry = sm
+                    .apply_command(Command::AdvanceFederatedTrustRotation {
+                        rotation_id: "rotation-coordinator-e2e".into(),
+                        expected_revision: revision.get(),
+                        event: FederatedTrustRotationEvent::LocalActivated {
+                            previous_expires_at_ms: 66_000,
+                        },
+                        at_ms: 6_000,
+                        request_id: "reject-local-expiry-change".into(),
+                        actor: "rotation-controller".into(),
+                    })
+                    .await
+                    .unwrap();
+                assert!(
+                    !changed_expiry.success,
+                    "a replay must not replace the first committed local expiry"
+                );
+                let direct_abort_after_activate = sm
+                    .apply_command(Command::AbortFederatedCertificateRotation {
+                        cluster_id: "coordinator-peer".into(),
+                        new_fingerprint: "e".repeat(64),
+                        at_ms: 5_001,
+                        request_id: "reject-leaf-abort-after-activate".into(),
+                        actor: "operator".into(),
+                    })
+                    .await
+                    .unwrap();
+                assert!(
+                    !direct_abort_after_activate.success,
+                    "a committed Activate must permanently close the abort path"
+                );
+                let completed_leaf = sm
+                    .apply_command(Command::CompleteFederatedCertificateRotation {
+                        cluster_id: "coordinator-peer".into(),
+                        new_fingerprint: "e".repeat(64),
+                        at_ms: 5_001,
+                        request_id: "complete-leaf-after-activate".into(),
+                        actor: "rotation-controller".into(),
+                    })
+                    .await
+                    .unwrap();
+                assert!(completed_leaf.success, "{}", completed_leaf.message);
+                let rollback_leaf_after_activate = sm
+                    .apply_command(Command::RollbackFederatedCertificateRotation {
+                        cluster_id: "coordinator-peer".into(),
+                        new_fingerprint: "e".repeat(64),
+                        at_ms: 5_002,
+                        request_id: "reject-leaf-rollback-after-activate".into(),
+                        actor: "operator".into(),
+                    })
+                    .await
+                    .unwrap();
+                assert!(
+                    !rollback_leaf_after_activate.success,
+                    "a committed Activate must permanently close the leaf rollback path"
+                );
+            }
         }
         // A lost acknowledgement for an early event may be replayed after later
         // events have advanced the revision; request identity remains idempotent.
