@@ -137,6 +137,210 @@ impl FederatedTrustRotationProcessCoordinator {
         self.activate_both_with_expiry(Some(expiry_ms)).await
     }
 
+    /// Resume a bilateral pre-activation rollback using only the two durable
+    /// Raft endpoints. Every event and request ID is stable across coordinator
+    /// restarts; the peer RPC also performs the corresponding local leaf/CA abort.
+    pub async fn rollback_before_activation(
+        &mut self,
+        reason: &str,
+    ) -> crate::Result<(
+        FederatedTrustRotationSnapshot,
+        FederatedTrustRotationSnapshot,
+    )> {
+        if reason.trim().is_empty() || reason.len() > 1024 {
+            return Err(crate::DatspoolError::Configuration(
+                "rollback reason must contain 1-1024 bytes".into(),
+            ));
+        }
+        let (local_before, peer_before) = self.read_snapshots().await?;
+        for snapshot in [&local_before, &peer_before] {
+            let rotation = &snapshot.rotation;
+            let candidate_is_active =
+                snapshot
+                    .peer_active_ca_fingerprint
+                    .as_deref()
+                    .is_some_and(|fingerprint| {
+                        fingerprint.eq_ignore_ascii_case(&rotation.peer_ca_bundle_fingerprint)
+                    });
+            let candidate_was_active = snapshot
+                .peer_previous_ca_fingerprint
+                .as_deref()
+                .is_some_and(|fingerprint| {
+                    fingerprint.eq_ignore_ascii_case(&rotation.peer_ca_bundle_fingerprint)
+                });
+            if rotation.local_activation_expires_at_ms.is_some()
+                || rotation.peer_activation_expires_at_ms.is_some()
+                || candidate_is_active
+                || candidate_was_active
+                || rotation.phase == FederatedTrustRotationPhase::RecoveryRequired
+                || matches!(
+                    rotation.phase,
+                    FederatedTrustRotationPhase::Activating
+                        | FederatedTrustRotationPhase::Overlap
+                        | FederatedTrustRotationPhase::Retiring
+                        | FederatedTrustRotationPhase::Completed
+                )
+            {
+                return Err(crate::DatspoolError::Configuration(
+                    "rollback is forbidden after either side activates or activation is uncertain; forward recovery is required".into(),
+                ));
+            }
+            if !matches!(
+                rotation.phase,
+                FederatedTrustRotationPhase::Staging
+                    | FederatedTrustRotationPhase::AwaitingDeployment
+                    | FederatedTrustRotationPhase::ActivationBarrier
+                    | FederatedTrustRotationPhase::RollingBack
+                    | FederatedTrustRotationPhase::RolledBack
+            ) {
+                return Err(crate::DatspoolError::Configuration(format!(
+                    "rotation {} cannot roll back from phase {:?}",
+                    rotation.rotation_id, rotation.phase
+                )));
+            }
+        }
+        if local_before.rotation.overlap_ms != peer_before.rotation.overlap_ms {
+            return Err(crate::DatspoolError::Configuration(
+                "bilateral trust rotation overlap durations do not match".into(),
+            ));
+        }
+
+        let begin = FederatedTrustRotationEvent::BeginRollback {
+            reason: reason.to_string(),
+        };
+        if !matches!(
+            local_before.rotation.phase,
+            FederatedTrustRotationPhase::RollingBack | FederatedTrustRotationPhase::RolledBack
+        ) {
+            Self::ensure_remote_success(
+                self.local_client
+                    .advance_remote_trust_rotation(
+                        &self.peer_cluster_id,
+                        &self.rotation_id,
+                        &format!("{}:begin-local-rollback", self.request_prefix),
+                        &begin,
+                    )
+                    .await?,
+            )?;
+        }
+        if !matches!(
+            peer_before.rotation.phase,
+            FederatedTrustRotationPhase::RollingBack | FederatedTrustRotationPhase::RolledBack
+        ) {
+            Self::ensure_remote_success(
+                self.peer_client
+                    .advance_remote_trust_rotation(
+                        &self.local_cluster_id,
+                        &self.rotation_id,
+                        &format!("{}:begin-peer-rollback", self.request_prefix),
+                        &begin,
+                    )
+                    .await?,
+            )?;
+        }
+
+        // Re-read after both BeginRollback commits. A crash can occur after any
+        // one of the following four side-specific acknowledgements.
+        let (local_rolling, peer_rolling) = self.read_snapshots().await?;
+        if peer_rolling.rotation.phase == FederatedTrustRotationPhase::RollingBack {
+            if peer_rolling.rotation.local_staged {
+                Self::ensure_remote_success(
+                    self.peer_client
+                        .advance_remote_trust_rotation(
+                            &self.local_cluster_id,
+                            &self.rotation_id,
+                            &format!("{}:rollback-peer-local-material", self.request_prefix),
+                            &FederatedTrustRotationEvent::PeerRolledBack,
+                        )
+                        .await?,
+                )?;
+            }
+            if peer_rolling.rotation.peer_staged {
+                Self::ensure_remote_success(
+                    self.peer_client
+                        .advance_remote_trust_rotation(
+                            &self.local_cluster_id,
+                            &self.rotation_id,
+                            &format!("{}:rollback-peer-peer-ack", self.request_prefix),
+                            &FederatedTrustRotationEvent::LocalRolledBack,
+                        )
+                        .await?,
+                )?;
+            }
+        }
+        if local_rolling.rotation.phase == FederatedTrustRotationPhase::RollingBack {
+            if local_rolling.rotation.local_staged {
+                Self::ensure_remote_success(
+                    self.local_client
+                        .advance_remote_trust_rotation(
+                            &self.peer_cluster_id,
+                            &self.rotation_id,
+                            &format!("{}:rollback-local-local-material", self.request_prefix),
+                            &FederatedTrustRotationEvent::PeerRolledBack,
+                        )
+                        .await?,
+                )?;
+            }
+            if local_rolling.rotation.peer_staged {
+                Self::ensure_remote_success(
+                    self.local_client
+                        .advance_remote_trust_rotation(
+                            &self.peer_cluster_id,
+                            &self.rotation_id,
+                            &format!("{}:rollback-local-peer-ack", self.request_prefix),
+                            &FederatedTrustRotationEvent::LocalRolledBack,
+                        )
+                        .await?,
+                )?;
+            }
+        }
+
+        let (local_after, peer_after) = self.read_snapshots().await?;
+        for snapshot in [&local_after, &peer_after] {
+            if snapshot.rotation.phase != FederatedTrustRotationPhase::RolledBack
+                || snapshot.rotation.local_staged
+                || snapshot.rotation.peer_staged
+                || snapshot.rotation.local_activation_expires_at_ms.is_some()
+                || snapshot.rotation.peer_activation_expires_at_ms.is_some()
+                || snapshot
+                    .peer_active_ca_fingerprint
+                    .as_deref()
+                    .is_some_and(|fingerprint| {
+                        fingerprint
+                            .eq_ignore_ascii_case(&snapshot.rotation.peer_ca_bundle_fingerprint)
+                    })
+                || snapshot
+                    .peer_pending_ca_fingerprint
+                    .as_deref()
+                    .is_some_and(|fingerprint| {
+                        fingerprint
+                            .eq_ignore_ascii_case(&snapshot.rotation.peer_ca_bundle_fingerprint)
+                    })
+                || snapshot
+                    .peer_previous_ca_fingerprint
+                    .as_deref()
+                    .is_some_and(|fingerprint| {
+                        fingerprint
+                            .eq_ignore_ascii_case(&snapshot.rotation.peer_ca_bundle_fingerprint)
+                    })
+                || snapshot
+                    .peer_pending_identity_fingerprint
+                    .as_deref()
+                    .is_some_and(|fingerprint| {
+                        fingerprint.eq_ignore_ascii_case(&snapshot.rotation.peer_leaf_fingerprint)
+                    })
+                || snapshot
+                    .peer_active_identity_fingerprint
+                    .eq_ignore_ascii_case(&snapshot.rotation.peer_leaf_fingerprint)
+            {
+                return Err(crate::DatspoolError::Internal(
+                    "bilateral rollback did not converge to a clean RolledBack state".into(),
+                ));
+            }
+        }
+        Ok((local_after, peer_after))
+    }
+
     async fn activate_both_with_expiry(
         &mut self,
         requested_expiry: Option<i64>,

@@ -628,6 +628,126 @@ fn coordinator_raft_child_process(
         .expect("spawn three-member Raft node with federation gRPC endpoint")
 }
 
+async fn run_rollback_coordinator_process() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let phase = std::env::var("DATASPOOL_ROLLBACK_COORDINATOR_PHASE").unwrap();
+    let source_endpoint = std::env::var("DATASPOOL_ROLLBACK_SOURCE_ENDPOINT").unwrap();
+    let target_endpoint = std::env::var("DATASPOOL_ROLLBACK_TARGET_ENDPOINT").unwrap();
+    let cert_dir = PathBuf::from(std::env::var("DATASPOOL_ROLLBACK_CERT_DIR").unwrap());
+    let marker = PathBuf::from(std::env::var("DATASPOOL_ROLLBACK_MARKER").unwrap());
+    let ca = cert_dir.join("ca.pem");
+    let client_cert = cert_dir.join("client.pem");
+    let client_key = cert_dir.join("client.key.pem");
+    let mut coordinator = dataspool::FederatedTrustRotationProcessCoordinator::connect(
+        "source",
+        "target",
+        "rollback-process-rotation",
+        "rollback-process",
+        &source_endpoint,
+        &target_endpoint,
+        &ca,
+        &ca,
+        &client_cert,
+        &client_key,
+        &client_cert,
+        &client_key,
+    )
+    .await
+    .unwrap();
+    if phase == "initial" {
+        let result = coordinator
+            .rollback_before_activation("operator requested rollback before activation")
+            .await;
+        panic!("source BeginRollback ACK should be dropped after Raft commit: {result:?}");
+    }
+    let (source, target) = coordinator
+        .rollback_before_activation("operator requested rollback before activation")
+        .await
+        .unwrap();
+    assert_eq!(
+        source.rotation.phase,
+        FederatedTrustRotationPhase::RolledBack
+    );
+    assert_eq!(
+        target.rotation.phase,
+        FederatedTrustRotationPhase::RolledBack
+    );
+    assert!(!source.rotation.local_staged && !source.rotation.peer_staged);
+    assert!(!target.rotation.local_staged && !target.rotation.peer_staged);
+    assert!(source.rotation.local_activation_expires_at_ms.is_none());
+    assert!(source.rotation.peer_activation_expires_at_ms.is_none());
+    assert!(target.rotation.local_activation_expires_at_ms.is_none());
+    assert!(target.rotation.peer_activation_expires_at_ms.is_none());
+    std::fs::write(&marker, b"bilateral-rollback-recovered").unwrap();
+}
+
+fn rollback_coordinator_process_child(
+    phase: &str,
+    source_endpoint: &str,
+    target_endpoint: &str,
+    cert_dir: &Path,
+    marker: &Path,
+) -> Child {
+    ProcessCommand::new(std::env::current_exe().expect("integration test executable"))
+        .args([
+            "--exact",
+            "federated_trust_rotation_rollback_recovers_after_local_begin_ack_loss",
+            "--nocapture",
+        ])
+        .env("DATASPOOL_ROLLBACK_COORDINATOR_PHASE", phase)
+        .env("DATASPOOL_ROLLBACK_SOURCE_ENDPOINT", source_endpoint)
+        .env("DATASPOOL_ROLLBACK_TARGET_ENDPOINT", target_endpoint)
+        .env("DATASPOOL_ROLLBACK_CERT_DIR", cert_dir)
+        .env("DATASPOOL_ROLLBACK_MARKER", marker)
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .expect("spawn independent rollback coordinator process")
+}
+
+#[allow(clippy::too_many_arguments)]
+fn rollback_raft_child_process(
+    cluster: &str,
+    member: usize,
+    root: &Path,
+    addresses: &str,
+    ready_dir: &Path,
+    control: &Path,
+    markers: &Path,
+    grpc_addr: &str,
+    peer_grpc_addr: &str,
+    cert_dir: &Path,
+    ack_marker: &Path,
+    ack_gate: &Path,
+    drop_after: usize,
+) -> Child {
+    ProcessCommand::new(std::env::current_exe().expect("integration test executable"))
+        .args([
+            "--exact",
+            "federated_trust_rotation_rollback_recovers_after_local_begin_ack_loss",
+            "--nocapture",
+        ])
+        .env("DATASPOOL_TRUST_HA_CHILD", "1")
+        .env("DATASPOOL_TRUST_HA_CLUSTER", cluster)
+        .env("DATASPOOL_TRUST_HA_MEMBER", member.to_string())
+        .env("DATASPOOL_TRUST_HA_ROOT", root)
+        .env("DATASPOOL_TRUST_HA_ADDRESSES", addresses)
+        .env("DATASPOOL_TRUST_HA_READY_DIR", ready_dir)
+        .env("DATASPOOL_TRUST_HA_CONTROL", control)
+        .env("DATASPOOL_TRUST_HA_MARKERS", markers)
+        .env("DATASPOOL_TRUST_HA_GRPC_ADDR", grpc_addr)
+        .env("DATASPOOL_TRUST_HA_PEER_GRPC_ADDR", peer_grpc_addr)
+        .env("DATASPOOL_TRUST_HA_CERT_DIR", cert_dir)
+        .env("DATASPOOL_TRUST_HA_ACK_MARKER", ack_marker)
+        .env("DATASPOOL_TRUST_HA_ACK_GATE", ack_gate)
+        .env("DATASPOOL_TRUST_HA_ACK_DROP_AFTER", drop_after.to_string())
+        .env("DATASPOOL_TRUST_HA_COORDINATOR_MODE", "1")
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .expect("spawn rollback Raft member process")
+}
+
 fn coordinator_process_child(
     phase: &str,
     source_endpoint: &str,
@@ -690,6 +810,8 @@ async fn seed_coordinator_rotation(
     cluster_id: &str,
     peer_id: &str,
     peer_endpoint: &str,
+    rotation_id: &str,
+    authorize_activation: bool,
 ) {
     let now = chrono::Utc::now().timestamp_millis();
     let old_ca_pem = String::from_utf8(ROTATION_CA.to_vec()).unwrap();
@@ -727,7 +849,7 @@ async fn seed_coordinator_rotation(
     assert!(registered.success, "{}", registered.message);
 
     let rotation = FederatedTrustRotation {
-        rotation_id: "coordinator-process-rotation".into(),
+        rotation_id: rotation_id.into(),
         peer_cluster_id: peer_id.into(),
         current_peer_ca_fingerprint: Some(OLD_FINGERPRINT_CA.into()),
         local_ca_bundle_pem: new_ca_pem.clone(),
@@ -791,7 +913,7 @@ async fn seed_coordinator_rotation(
         .unwrap();
     assert!(staged_ca.success, "{}", staged_ca.message);
 
-    let events = [
+    let mut events = vec![
         FederatedTrustRotationEvent::LocalStaged {
             fingerprint: NEW_CA_FINGERPRINT.into(),
         },
@@ -804,11 +926,13 @@ async fn seed_coordinator_rotation(
         FederatedTrustRotationEvent::PeerDeploymentReady {
             leaf_fingerprint: NEW_FINGERPRINT.into(),
         },
-        FederatedTrustRotationEvent::AuthorizeActivation,
     ];
+    if authorize_activation {
+        events.push(FederatedTrustRotationEvent::AuthorizeActivation);
+    }
     for (index, event) in events.into_iter().enumerate() {
         let current = store
-            .get_federated_trust_rotation("coordinator-process-rotation")
+            .get_federated_trust_rotation(rotation_id)
             .await
             .unwrap()
             .unwrap();
@@ -818,7 +942,7 @@ async fn seed_coordinator_rotation(
                 expected_revision: current.revision,
                 event,
                 at_ms: now + index as i64,
-                request_id: format!("coordinator-process-event-{cluster_id}-{index}"),
+                request_id: format!("{rotation_id}-event-{cluster_id}-{index}"),
                 actor: "coordinator-process-e2e".into(),
             })
             .await
@@ -826,15 +950,22 @@ async fn seed_coordinator_rotation(
         assert!(result.success, "{}", result.message);
     }
     let final_rotation = store
-        .get_federated_trust_rotation("coordinator-process-rotation")
+        .get_federated_trust_rotation(rotation_id)
         .await
         .unwrap()
         .unwrap();
     assert_eq!(
         final_rotation.phase,
-        FederatedTrustRotationPhase::Activating
+        if authorize_activation {
+            FederatedTrustRotationPhase::Activating
+        } else {
+            FederatedTrustRotationPhase::ActivationBarrier
+        }
     );
-    assert!(final_rotation.activation_barrier_committed);
+    assert_eq!(
+        final_rotation.activation_barrier_committed,
+        authorize_activation
+    );
 }
 
 async fn run_six_member_child() {
@@ -938,13 +1069,19 @@ async fn run_six_member_child() {
         .await
         .unwrap();
         let ack_marker = PathBuf::from(std::env::var("DATASPOOL_TRUST_HA_ACK_MARKER").unwrap());
-        if cluster == "target" && !ack_marker.exists() {
+        let drop_after = std::env::var("DATASPOOL_TRUST_HA_ACK_DROP_AFTER")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .or_else(|| (cluster == "target").then_some(1));
+        if let Some(drop_after) = drop_after
+            && !ack_marker.exists()
+        {
             grpc = grpc
                 .with_rotation_event_ack_drop_marker(ack_marker)
                 .with_rotation_event_ack_gate(PathBuf::from(
                     std::env::var("DATASPOOL_TRUST_HA_ACK_GATE").unwrap(),
                 ))
-                .with_rotation_event_ack_drop_after(1);
+                .with_rotation_event_ack_drop_after(drop_after);
         }
         tokio::spawn(async move {
             grpc.serve()
@@ -1218,10 +1355,37 @@ async fn run_six_member_child() {
         if command != last_command && node.is_leader().await {
             if command.strip_prefix("seed:").is_some() {
                 let peer_endpoint = std::env::var("DATASPOOL_TRUST_HA_PEER_GRPC_ADDR").unwrap();
-                seed_coordinator_rotation(&node, &store, &cluster, peer_id, &peer_endpoint).await;
+                seed_coordinator_rotation(
+                    &node,
+                    &store,
+                    &cluster,
+                    peer_id,
+                    &peer_endpoint,
+                    "coordinator-process-rotation",
+                    true,
+                )
+                .await;
                 std::fs::write(
                     markers.join(format!("{cluster}.coordinator-seeded")),
                     b"seeded",
+                )
+                .unwrap();
+                last_command = command;
+            } else if command == "seed-rollback" {
+                let peer_endpoint = std::env::var("DATASPOOL_TRUST_HA_PEER_GRPC_ADDR").unwrap();
+                seed_coordinator_rotation(
+                    &node,
+                    &store,
+                    &cluster,
+                    peer_id,
+                    &peer_endpoint,
+                    "rollback-process-rotation",
+                    false,
+                )
+                .await;
+                std::fs::write(
+                    markers.join(format!("{cluster}.rollback-seeded")),
+                    b"seeded-before-activation-barrier",
                 )
                 .unwrap();
                 last_command = command;
@@ -2050,6 +2214,225 @@ async fn federated_trust_rotation_coordinator_process_recovers_after_remote_acti
                 "a Raft member process exited during uncommitted-entry recovery"
             );
             assert_sigkill(child, "cleanup coordinator recovery Raft member process");
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn federated_trust_rotation_rollback_recovers_after_local_begin_ack_loss() {
+    if std::env::var_os("DATASPOOL_TRUST_HA_CHILD").is_some() {
+        run_six_member_child().await;
+        return;
+    }
+    if std::env::var_os("DATASPOOL_ROLLBACK_COORDINATOR_PHASE").is_some() {
+        run_rollback_coordinator_process().await;
+        return;
+    }
+
+    let root = TempDir::new().unwrap();
+    let ready = root.path().join("ready");
+    let markers = root.path().join("markers");
+    let cert_dir = root.path().join("certs");
+    std::fs::create_dir_all(&ready).unwrap();
+    std::fs::create_dir_all(&markers).unwrap();
+    std::fs::create_dir_all(&cert_dir).unwrap();
+    for (name, bytes) in [
+        ("ca.pem", ROTATION_CA),
+        ("server.pem", ROTATION_SERVER_CERT),
+        ("server.key.pem", ROTATION_SERVER_KEY),
+        ("client.pem", ROTATION_OLD_CERT),
+        ("client.key.pem", ROTATION_OLD_KEY),
+    ] {
+        std::fs::write(cert_dir.join(name), bytes).unwrap();
+    }
+
+    let source_grpc = reserve_local_addr();
+    let target_grpc = reserve_local_addr();
+    let source_ack_marker = root.path().join("source-rollback-begin-committed.marker");
+    let source_ack_gate = root.path().join("source-rollback-begin-ack.release");
+    let target_ack_marker = root.path().join("target-unused-rollback-ack.marker");
+    let target_ack_gate = root.path().join("target-unused-rollback-ack.release");
+    let initial_marker = root.path().join("rollback-coordinator-initial.marker");
+    let recovered_marker = root.path().join("rollback-coordinator-recovered.marker");
+    let mut groups = Vec::new();
+    for cluster in ["source", "target"] {
+        let cluster_root = root.path().join(cluster);
+        std::fs::create_dir_all(&cluster_root).unwrap();
+        let addresses = (0..3).map(|_| reserve_local_addr()).collect::<Vec<_>>();
+        let address_list = addresses.join(";");
+        let control = root.path().join(format!("{cluster}.rollback.control"));
+        let mut children = Vec::new();
+        for member in 0..3 {
+            let member_root = cluster_root.join(format!("member-{member}"));
+            std::fs::create_dir_all(&member_root).unwrap();
+            let (grpc_addr, peer_grpc_addr, ack_marker, ack_gate, drop_after) =
+                if cluster == "source" {
+                    (
+                        &source_grpc,
+                        &target_grpc,
+                        &source_ack_marker,
+                        &source_ack_gate,
+                        0,
+                    )
+                } else {
+                    (
+                        &target_grpc,
+                        &source_grpc,
+                        &target_ack_marker,
+                        &target_ack_gate,
+                        100,
+                    )
+                };
+            children.push(rollback_raft_child_process(
+                cluster,
+                member,
+                &member_root,
+                &address_list,
+                &ready,
+                &control,
+                &markers,
+                grpc_addr,
+                peer_grpc_addr,
+                &cert_dir,
+                ack_marker,
+                ack_gate,
+                drop_after,
+            ));
+        }
+        groups.push((cluster.to_string(), addresses, control, children));
+    }
+    for (cluster, _, _, children) in &mut groups {
+        for member in 0..3 {
+            wait_for_file(&ready.join(format!("{cluster}-{member}.ready")), children).await;
+        }
+        wait_for_file(&markers.join(format!("{cluster}.leader")), children).await;
+    }
+    for (cluster, _, control, children) in &mut groups {
+        write_control(control, "seed-rollback");
+        wait_for_file(
+            &markers.join(format!("{cluster}.rollback-seeded")),
+            children,
+        )
+        .await;
+    }
+
+    let mut initial = rollback_coordinator_process_child(
+        "initial",
+        &format!("https://{source_grpc}"),
+        &format!("https://{target_grpc}"),
+        &cert_dir,
+        &initial_marker,
+    );
+    wait_for_file(&source_ack_marker, std::slice::from_mut(&mut initial)).await;
+    assert_sigkill(
+        &mut initial,
+        "SIGKILL coordinator after local BeginRollback commit before ACK",
+    );
+    std::fs::write(&source_ack_gate, b"release").unwrap();
+
+    let read_snapshot = |endpoint: String, peer_id: &'static str| {
+        let ca = cert_dir.join("ca.pem");
+        let cert = cert_dir.join("client.pem");
+        let key = cert_dir.join("client.key.pem");
+        async move {
+            tokio::time::timeout(Duration::from_secs(20), async {
+                loop {
+                    if let Ok(mut client) =
+                        GrpcClient::connect_mtls(&endpoint, &ca, &cert, &key).await
+                        && let Ok(response) = client
+                            .get_remote_trust_rotation(peer_id, "rollback-process-rotation")
+                            .await
+                        && response.accepted
+                        && let Ok(snapshot) = serde_json::from_str::<
+                            dataspool::federation::FederatedTrustRotationSnapshot,
+                        >(&response.state_json)
+                    {
+                        return snapshot;
+                    }
+                    tokio::time::sleep(Duration::from_millis(40)).await;
+                }
+            })
+            .await
+            .expect("rollback crash-boundary state must be readable")
+        }
+    };
+    let source_after_crash = read_snapshot(format!("https://{source_grpc}"), "target").await;
+    let target_after_crash = read_snapshot(format!("https://{target_grpc}"), "source").await;
+    assert_eq!(
+        source_after_crash.rotation.phase,
+        FederatedTrustRotationPhase::RollingBack
+    );
+    assert_eq!(
+        target_after_crash.rotation.phase,
+        FederatedTrustRotationPhase::ActivationBarrier
+    );
+    assert!(
+        source_after_crash
+            .rotation
+            .local_activation_expires_at_ms
+            .is_none()
+    );
+    assert!(
+        source_after_crash
+            .rotation
+            .peer_activation_expires_at_ms
+            .is_none()
+    );
+    assert!(
+        target_after_crash
+            .rotation
+            .local_activation_expires_at_ms
+            .is_none()
+    );
+    assert!(
+        target_after_crash
+            .rotation
+            .peer_activation_expires_at_ms
+            .is_none()
+    );
+
+    let mut recovered = rollback_coordinator_process_child(
+        "recover",
+        &format!("https://{source_grpc}"),
+        &format!("https://{target_grpc}"),
+        &cert_dir,
+        &recovered_marker,
+    );
+    wait_for_file(&recovered_marker, std::slice::from_mut(&mut recovered)).await;
+    let status = recovered
+        .wait()
+        .expect("wait for recovered rollback coordinator");
+    assert!(
+        status.success(),
+        "rollback coordinator recovery failed: {status}"
+    );
+
+    let source_final = read_snapshot(format!("https://{source_grpc}"), "target").await;
+    let target_final = read_snapshot(format!("https://{target_grpc}"), "source").await;
+    for snapshot in [&source_final, &target_final] {
+        assert_eq!(
+            snapshot.rotation.phase,
+            FederatedTrustRotationPhase::RolledBack
+        );
+        assert!(!snapshot.rotation.local_staged && !snapshot.rotation.peer_staged);
+        assert!(snapshot.rotation.local_activation_expires_at_ms.is_none());
+        assert!(snapshot.rotation.peer_activation_expires_at_ms.is_none());
+        assert_eq!(
+            snapshot.peer_active_ca_fingerprint.as_deref(),
+            Some(OLD_FINGERPRINT_CA)
+        );
+        assert!(snapshot.peer_pending_ca_fingerprint.is_none());
+        assert!(snapshot.peer_previous_ca_fingerprint.is_none());
+        assert_eq!(snapshot.peer_active_identity_fingerprint, OLD_FINGERPRINT);
+        assert!(snapshot.peer_pending_identity_fingerprint.is_none());
+    }
+    for (_, _, _, children) in &mut groups {
+        for child in children {
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "rollback must not restart or kill Raft members"
+            );
+            assert_sigkill(child, "cleanup rollback six-member Raft process");
         }
     }
 }
