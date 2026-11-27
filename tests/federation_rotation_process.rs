@@ -601,11 +601,12 @@ fn coordinator_raft_child_process(
     cert_dir: &Path,
     ack_marker: &Path,
     ack_gate: &Path,
+    drop_after: Option<usize>,
 ) -> Child {
     ProcessCommand::new(std::env::current_exe().expect("integration test executable"))
         .args([
             "--exact",
-            "federated_trust_rotation_coordinator_process_recovers_after_remote_activate_ack_loss",
+            "federated_trust_rotation_coordinator_process_recovers_after_local_and_remote_activate_ack_loss",
             "--nocapture",
         ])
         .env("DATASPOOL_TRUST_HA_CHILD", "1")
@@ -621,6 +622,10 @@ fn coordinator_raft_child_process(
         .env("DATASPOOL_TRUST_HA_CERT_DIR", cert_dir)
         .env("DATASPOOL_TRUST_HA_ACK_MARKER", ack_marker)
         .env("DATASPOOL_TRUST_HA_ACK_GATE", ack_gate)
+        .env(
+            "DATASPOOL_TRUST_HA_ACK_DROP_AFTER",
+            drop_after.map(|value| value.to_string()).unwrap_or_default(),
+        )
         .env("DATASPOOL_TRUST_HA_COORDINATOR_MODE", "1")
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
@@ -783,7 +788,7 @@ fn coordinator_process_child(
     ProcessCommand::new(std::env::current_exe().expect("integration test executable"))
         .args([
             "--exact",
-            "federated_trust_rotation_coordinator_process_recovers_after_remote_activate_ack_loss",
+            "federated_trust_rotation_coordinator_process_recovers_after_local_and_remote_activate_ack_loss",
             "--nocapture",
         ])
         .env("DATASPOOL_COORDINATOR_PROCESS_PHASE", phase)
@@ -1765,11 +1770,24 @@ async fn run_coordinator_process() {
     )
     .await
     .unwrap();
-    if phase == "initial" {
-        let expiry = chrono::Utc::now().timestamp_millis() + 60_000;
-        std::fs::write(&expiry_file, expiry.to_string()).unwrap();
+    if matches!(phase.as_str(), "initial" | "recover-first") {
+        let expiry = if phase == "initial" {
+            let expiry = chrono::Utc::now().timestamp_millis() + 60_000;
+            std::fs::write(&expiry_file, expiry.to_string()).unwrap();
+            expiry
+        } else {
+            std::fs::read_to_string(&expiry_file)
+                .unwrap()
+                .parse()
+                .unwrap()
+        };
         let result = coordinator.activate_both_at(expiry).await;
-        panic!("target Activate ACK should remain gated after Raft commit: {result:?}");
+        let boundary = if phase == "initial" {
+            "Source local Activate ACK"
+        } else {
+            "Target remote Activate ACK"
+        };
+        panic!("{boundary} should remain gated after Raft commit: {result:?}");
     }
     let expiry: i64 = std::fs::read_to_string(&expiry_file)
         .unwrap()
@@ -1786,7 +1804,8 @@ async fn run_coordinator_process() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn federated_trust_rotation_coordinator_process_recovers_after_remote_activate_ack_loss() {
+async fn federated_trust_rotation_coordinator_process_recovers_after_local_and_remote_activate_ack_loss()
+ {
     if std::env::var_os("DATASPOOL_TRUST_HA_CHILD").is_some() {
         run_six_member_child().await;
         return;
@@ -1814,8 +1833,10 @@ async fn federated_trust_rotation_coordinator_process_recovers_after_remote_acti
     }
     let source_grpc = reserve_local_addr();
     let target_grpc = reserve_local_addr();
-    let ack_marker = root.path().join("target-activate-committed.marker");
-    let ack_gate = root.path().join("target-activate-ack.release");
+    let source_ack_marker = root.path().join("source-activate-committed.marker");
+    let source_ack_gate = root.path().join("source-activate-ack.release");
+    let target_ack_marker = root.path().join("target-activate-committed.marker");
+    let target_ack_gate = root.path().join("target-activate-ack.release");
     let expiry_file = root.path().join("activation-expiry.txt");
     let initial_marker = root.path().join("coordinator-initial.marker");
     let recovered_marker = root.path().join("coordinator-recovered.marker");
@@ -1846,8 +1867,17 @@ async fn federated_trust_rotation_coordinator_process_recovers_after_remote_acti
                 grpc,
                 peer_grpc,
                 &cert_dir,
-                &ack_marker,
-                &ack_gate,
+                if cluster == "source" {
+                    &source_ack_marker
+                } else {
+                    &target_ack_marker
+                },
+                if cluster == "source" {
+                    &source_ack_gate
+                } else {
+                    &target_ack_gate
+                },
+                Some(if cluster == "source" { 0 } else { 1 }),
             ));
         }
         groups.push((cluster.to_string(), addresses, control, children));
@@ -1875,22 +1905,17 @@ async fn federated_trust_rotation_coordinator_process_recovers_after_remote_acti
         &expiry_file,
         &initial_marker,
     );
-    wait_for_file(&ack_marker, std::slice::from_mut(&mut coordinator)).await;
+    wait_for_file(&source_ack_marker, std::slice::from_mut(&mut coordinator)).await;
     let expiry: i64 = std::fs::read_to_string(&expiry_file)
         .unwrap()
         .parse()
         .unwrap();
     assert_sigkill(
         &mut coordinator,
-        "SIGKILL independent coordinator while remote Activate ACK is gated",
+        "SIGKILL coordinator after Source Activate committed but before ACK",
     );
-    // Release the remote server's blocked response only after the coordinator
-    // has died. The Raft processes and their RocksDB directories remain intact.
-    std::fs::write(&ack_gate, b"release").unwrap();
+    std::fs::write(&source_ack_gate, b"release").unwrap();
 
-    // Inspect both durable Raft snapshots before restarting the coordinator:
-    // Source has committed its local Activate but has not recorded peer ACK;
-    // Target has committed its local Activate and the corresponding peer event.
     let read_snapshot = |endpoint: String, peer_id: &'static str| {
         let ca = cert_dir.join("ca.pem");
         let cert = cert_dir.join("client.pem");
@@ -1917,6 +1942,79 @@ async fn federated_trust_rotation_coordinator_process_recovers_after_remote_acti
             .expect("committed coordinator crash-boundary state must be readable")
         }
     };
+
+    // First boundary: Source Activate is committed, but the remote cluster has
+    // not even recorded the peer activation event. The expiry is already fixed.
+    let source_after_local_activate =
+        read_snapshot(format!("https://{source_grpc}"), "target").await;
+    let target_before_remote_activate =
+        read_snapshot(format!("https://{target_grpc}"), "source").await;
+    assert_eq!(
+        source_after_local_activate.rotation.phase,
+        FederatedTrustRotationPhase::Activating
+    );
+    assert_eq!(
+        source_after_local_activate
+            .rotation
+            .local_activation_expires_at_ms,
+        Some(expiry)
+    );
+    assert!(
+        source_after_local_activate
+            .rotation
+            .peer_activation_expires_at_ms
+            .is_none()
+    );
+    assert_eq!(
+        source_after_local_activate.peer_previous_ca_expires_at_ms,
+        Some(expiry)
+    );
+    assert_eq!(
+        target_before_remote_activate.rotation.phase,
+        FederatedTrustRotationPhase::Activating
+    );
+    assert!(
+        target_before_remote_activate
+            .rotation
+            .local_activation_expires_at_ms
+            .is_none()
+    );
+    assert!(
+        target_before_remote_activate
+            .rotation
+            .peer_activation_expires_at_ms
+            .is_none()
+    );
+    assert!(
+        target_before_remote_activate
+            .peer_previous_ca_expires_at_ms
+            .is_none()
+    );
+
+    // Target has an independent one-shot gate. It will drop its second
+    // Advance response after its local Activate and Overlap state are committed.
+    let first_recovery_marker = root.path().join("coordinator-first-recovery.marker");
+    let mut first_recovery = coordinator_process_child(
+        "recover-first",
+        &format!("https://{source_grpc}"),
+        &format!("https://{target_grpc}"),
+        &cert_dir,
+        &expiry_file,
+        &first_recovery_marker,
+    );
+    wait_for_file(
+        &target_ack_marker,
+        std::slice::from_mut(&mut first_recovery),
+    )
+    .await;
+    assert_sigkill(
+        &mut first_recovery,
+        "SIGKILL coordinator after Target Activate committed but before ACK",
+    );
+    std::fs::write(&target_ack_gate, b"release").unwrap();
+
+    // Second boundary: Target has reached Overlap, while Source is still
+    // Activating. Recovery must finish forward and preserve the original expiry.
     let source_before_restart = read_snapshot(format!("https://{source_grpc}"), "target").await;
     let target_before_restart = read_snapshot(format!("https://{target_grpc}"), "source").await;
     assert_eq!(
@@ -1929,9 +2027,11 @@ async fn federated_trust_rotation_coordinator_process_recovers_after_remote_acti
             .local_activation_expires_at_ms,
         Some(expiry)
     );
-    assert_eq!(
-        source_before_restart.rotation.peer_activation_expires_at_ms,
-        None
+    assert!(
+        source_before_restart
+            .rotation
+            .peer_activation_expires_at_ms
+            .is_none()
     );
     assert_eq!(
         source_before_restart.peer_previous_ca_expires_at_ms,
@@ -2000,8 +2100,17 @@ async fn federated_trust_rotation_coordinator_process_recovers_after_remote_acti
                     &source_grpc
                 },
                 &cert_dir,
-                &ack_marker,
-                &ack_gate,
+                if cluster == "source" {
+                    &source_ack_marker
+                } else {
+                    &target_ack_marker
+                },
+                if cluster == "source" {
+                    &source_ack_gate
+                } else {
+                    &target_ack_gate
+                },
+                None,
             );
         }
     }
@@ -2165,8 +2274,17 @@ async fn federated_trust_rotation_coordinator_process_recovers_after_remote_acti
                     &source_grpc
                 },
                 &cert_dir,
-                &ack_marker,
-                &ack_gate,
+                if cluster == "source" {
+                    &source_ack_marker
+                } else {
+                    &target_ack_marker
+                },
+                if cluster == "source" {
+                    &source_ack_gate
+                } else {
+                    &target_ack_gate
+                },
+                None,
             );
         }
         for member in &follower_members {
@@ -2237,8 +2355,17 @@ async fn federated_trust_rotation_coordinator_process_recovers_after_remote_acti
                 &source_grpc
             },
             &cert_dir,
-            &ack_marker,
-            &ack_gate,
+            if cluster == "source" {
+                &source_ack_marker
+            } else {
+                &target_ack_marker
+            },
+            if cluster == "source" {
+                &source_ack_gate
+            } else {
+                &target_ack_gate
+            },
+            None,
         );
         let pid = children[isolated_leader].id();
         wait_for_file(
