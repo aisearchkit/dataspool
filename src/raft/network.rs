@@ -5,11 +5,11 @@
 
 //! OpenRaft HTTP transport. RPC endpoints are internal cluster traffic only.
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-fault-injection"))]
 use std::collections::HashSet;
 use std::io;
 use std::sync::Arc;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-fault-injection"))]
 use tokio::sync::RwLock;
 
 use axum::{
@@ -37,7 +37,7 @@ use super::storage::{RocksNodeId, TypeConfig};
 pub struct NetworkFactory {
     client: Client,
     token: String,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-fault-injection"))]
     blocked_nodes: Arc<RwLock<HashSet<RocksNodeId>>>,
 }
 
@@ -50,12 +50,12 @@ impl NetworkFactory {
                 .build()
                 .expect("HTTP client"),
             token,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-fault-injection"))]
             blocked_nodes: Arc::new(RwLock::new(HashSet::new())),
         }
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-fault-injection"))]
     pub async fn set_peer_blocked(&self, node_id: RocksNodeId, blocked: bool) {
         let mut nodes = self.blocked_nodes.write().await;
         if blocked {
@@ -70,9 +70,9 @@ pub struct NetworkConnection {
     client: Client,
     base_url: String,
     token: String,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-fault-injection"))]
     target: RocksNodeId,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-fault-injection"))]
     blocked_nodes: Arc<RwLock<HashSet<RocksNodeId>>>,
 }
 
@@ -88,7 +88,7 @@ impl NetworkConnection {
         Req: serde::Serialize + ?Sized,
         Resp: serde::de::DeserializeOwned,
     {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-fault-injection"))]
         if self.blocked_nodes.read().await.contains(&self.target) {
             return Err(io::Error::new(
                 io::ErrorKind::ConnectionRefused,
@@ -114,15 +114,15 @@ impl RaftNetworkFactory<TypeConfig> for NetworkFactory {
     type Network = NetworkConnection;
 
     async fn new_client(&mut self, target: RocksNodeId, node: &BasicNode) -> Self::Network {
-        #[cfg(not(test))]
+        #[cfg(not(any(test, feature = "test-fault-injection")))]
         let _ = target;
         NetworkConnection {
             client: self.client.clone(),
             base_url: format!("http://{}", node.addr),
             token: self.token.clone(),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-fault-injection"))]
             target,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-fault-injection"))]
             blocked_nodes: self.blocked_nodes.clone(),
         }
     }

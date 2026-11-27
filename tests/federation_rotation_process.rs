@@ -892,15 +892,17 @@ async fn run_six_member_child() {
         b"ready",
     )
     .unwrap();
-    for index in 0..3 {
-        let ready = ready_dir.join(format!("{cluster}-{index}.ready"));
-        tokio::time::timeout(Duration::from_secs(20), async {
-            while !ready.exists() {
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .expect("all three members must bind before bootstrap");
+    if !node.is_initialized().await.unwrap() {
+        for index in 0..3 {
+            let ready = ready_dir.join(format!("{cluster}-{index}.ready"));
+            tokio::time::timeout(Duration::from_secs(20), async {
+                while !ready.exists() {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .expect("all three members must bind before initial bootstrap");
+        }
     }
     let members = (0..3)
         .map(|index| {
@@ -967,6 +969,11 @@ async fn run_six_member_child() {
             let leader_index = leader.saturating_sub(base_id) as usize;
             std::fs::write(
                 markers.join(format!("{cluster}.leader")),
+                leader_index.to_string(),
+            )
+            .unwrap();
+            std::fs::write(
+                markers.join(format!("{cluster}.member-{member}.leader")),
                 leader_index.to_string(),
             )
             .unwrap();
@@ -1079,6 +1086,131 @@ async fn run_six_member_child() {
             std::fs::write(
                 markers.join(format!("{cluster}.verified-{member}")),
                 b"verified",
+            )
+            .unwrap();
+            last_command = command.clone();
+        }
+        if command != last_command
+            && let Some(leader_index) = command.strip_prefix("uncommitted-probe:")
+        {
+            let leader_index: usize = leader_index.parse().unwrap();
+            assert!(leader_index < 3, "invalid isolated leader index");
+            let leader_id = base_id + leader_index as u64;
+            if node_id == leader_id {
+                for peer_index in 0..3 {
+                    let peer_id = base_id + peer_index as u64;
+                    if peer_id != node_id {
+                        node.set_peer_blocked(peer_id, true).await;
+                    }
+                }
+                let now = chrono::Utc::now().timestamp_millis();
+                let probe_id = format!("uncommitted-probe-{cluster}");
+                let probe = Command::UpsertFederatedCluster {
+                    cluster: FederatedCluster {
+                        cluster_id: probe_id,
+                        endpoint: "https://127.0.0.1:1".into(),
+                        identity_fingerprint: OLD_FINGERPRINT.into(),
+                        previous_identity_fingerprint: None,
+                        previous_identity_expires_at_ms: None,
+                        pending_identity_fingerprint: None,
+                        rotation_started_at_ms: None,
+                        pending_rotation_grace_period_ms: None,
+                        trust_bundle_pem: None,
+                        trust_bundle_fingerprint: None,
+                        pending_trust_bundle_pem: None,
+                        pending_trust_bundle_fingerprint: None,
+                        trust_bundle_staged_at_ms: None,
+                        previous_trust_bundle_pem: None,
+                        previous_trust_bundle_fingerprint: None,
+                        previous_trust_bundle_expires_at_ms: None,
+                        version: env!("CARGO_PKG_VERSION").into(),
+                        capabilities: BTreeSet::new(),
+                        status: FederatedClusterStatus::Healthy,
+                        last_seen_at_ms: now,
+                        updated_at_ms: now,
+                    },
+                    request_id: format!("uncommitted-probe-request-{cluster}"),
+                    actor: "raft-uncommitted-recovery-e2e".into(),
+                };
+                let before = node.handle().metrics().borrow().last_log_index.unwrap_or(0);
+                let _ =
+                    tokio::time::timeout(Duration::from_secs(3), node.handle().client_write(probe))
+                        .await;
+                tokio::time::timeout(Duration::from_secs(8), async {
+                    loop {
+                        let metrics = node.handle().metrics();
+                        let metrics = metrics.borrow();
+                        let last_log = metrics.last_log_index.unwrap_or(0);
+                        let last_applied = metrics.last_applied.map(|log| log.index).unwrap_or(0);
+                        if last_log > before && last_applied <= before {
+                            break;
+                        }
+                        drop(metrics);
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                })
+                .await
+                .expect(
+                    "isolated leader must persist an uncommitted log entry without applying it",
+                );
+                std::fs::write(
+                    markers.join(format!("{cluster}.uncommitted-appended-{member}")),
+                    b"appended-not-committed",
+                )
+                .unwrap();
+            } else {
+                node.set_peer_blocked(leader_id, true).await;
+                std::fs::write(
+                    markers.join(format!("{cluster}.isolated-follower-{member}")),
+                    b"follower-isolated-from-old-leader",
+                )
+                .unwrap();
+            }
+            last_command = command.clone();
+        }
+        if command != last_command
+            && let Some(expected) = command.strip_prefix("verify-no-uncommitted:")
+        {
+            let (expiry_value, generation) =
+                expected.split_once(':').unwrap_or((expected, "default"));
+            let expected_expiry: i64 = expiry_value.parse().unwrap();
+            tokio::time::timeout(Duration::from_secs(25), async {
+                loop {
+                    let probe = store
+                        .get_federated_cluster(&format!("uncommitted-probe-{cluster}"))
+                        .await
+                        .unwrap();
+                    assert!(probe.is_none(), "uncommitted Raft command must never be applied");
+                    let peer = store.get_federated_cluster(peer_id).await.unwrap();
+                    let rotation = store
+                        .get_federated_trust_rotation("coordinator-process-rotation")
+                        .await
+                        .unwrap();
+                    let metrics = node.handle().metrics();
+                    let metrics = metrics.borrow();
+                    let log_is_fully_applied = metrics.last_log_index
+                        == metrics.last_applied.map(|log| log.index);
+                    drop(metrics);
+                    if let (Some(peer), Some(rotation)) = (peer, rotation)
+                        && peer.trust_bundle_fingerprint.as_deref() == Some(NEW_CA_FINGERPRINT)
+                        && peer.previous_trust_bundle_fingerprint.as_deref() == Some(OLD_FINGERPRINT_CA)
+                        && peer.previous_trust_bundle_expires_at_ms == Some(expected_expiry)
+                        && peer.pending_trust_bundle_pem.is_none()
+                        && rotation.phase == FederatedTrustRotationPhase::Overlap
+                        && rotation.local_activation_expires_at_ms == Some(expected_expiry)
+                        && rotation.peer_activation_expires_at_ms == Some(expected_expiry)
+                        && log_is_fully_applied
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(40)).await;
+                }
+            })
+            .await
+            .expect("restarted members must discard uncommitted probe and preserve committed rotation state");
+            std::fs::write(
+                markers.join(format!("{cluster}.no-uncommitted-{generation}-{member}")),
+                b"uncommitted-entry-not-applied",
             )
             .unwrap();
             last_command = command.clone();
@@ -1728,11 +1860,194 @@ async fn federated_trust_rotation_coordinator_process_recovers_after_remote_acti
             .await;
         }
     }
+    // Exercise a genuinely uncommitted Raft entry on each cluster. Isolate the
+    // current leader from both followers, append a probe that cannot reach a
+    // quorum, then stop that leader before stopping the follower quorum.
+    for (cluster, addresses, control, children) in &mut groups {
+        let leader_file = markers.join(format!("{cluster}.leader"));
+        let isolated_leader: usize = std::fs::read_to_string(&leader_file)
+            .expect("current leader marker")
+            .parse()
+            .unwrap();
+        for member in 0..3 {
+            std::fs::remove_file(markers.join(format!("{cluster}.isolated-follower-{member}")))
+                .ok();
+            std::fs::remove_file(markers.join(format!("{cluster}.uncommitted-appended-{member}")))
+                .ok();
+            std::fs::remove_file(markers.join(format!("{cluster}.member-{member}.leader"))).ok();
+        }
+        write_control(control, &format!("uncommitted-probe:{isolated_leader}"));
+        wait_for_file(
+            &markers.join(format!("{cluster}.uncommitted-appended-{isolated_leader}")),
+            children,
+        )
+        .await;
+        for member in 0..3 {
+            if member != isolated_leader {
+                wait_for_file(
+                    &markers.join(format!("{cluster}.isolated-follower-{member}")),
+                    children,
+                )
+                .await;
+            }
+        }
+        for member in 0..3 {
+            if member != isolated_leader {
+                let member_leader = markers.join(format!("{cluster}.member-{member}.leader"));
+                tokio::time::timeout(Duration::from_secs(15), async {
+                    loop {
+                        if let Ok(value) = std::fs::read_to_string(&member_leader)
+                            && value
+                                .trim()
+                                .parse::<usize>()
+                                .is_ok_and(|leader| leader != isolated_leader)
+                        {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(40)).await;
+                    }
+                })
+                .await
+                .expect("both followers must observe the replacement leader");
+            }
+        }
+        // Prevent restarted processes from replaying the fault-injection command.
+        write_control(control, "hold");
+
+        // Kill the isolated leader first so its uncommitted entry exists only
+        // in its own durable log when the two-member quorum is restarted.
+        assert_sigkill(
+            &mut children[isolated_leader],
+            "SIGKILL isolated leader with an uncommitted probe entry",
+        );
+        for (member, child) in children.iter_mut().enumerate() {
+            if member != isolated_leader {
+                assert_sigkill(child, "SIGKILL follower quorum for restart");
+            }
+        }
+        std::fs::remove_file(&leader_file).ok();
+        for member in 0..3 {
+            std::fs::remove_file(ready.join(format!("{cluster}-{member}.ready"))).ok();
+        }
+
+        // Start only the two followers first. They must elect a leader using
+        // their durable quorum without the isolated leader's uncommitted log.
+        let follower_members = (0..3)
+            .filter(|member| *member != isolated_leader)
+            .collect::<Vec<_>>();
+        for member in &follower_members {
+            let member_root = root
+                .path()
+                .join(cluster.as_str())
+                .join(format!("member-{member}"));
+            let address_list = addresses.join(";");
+            children[*member] = coordinator_raft_child_process(
+                cluster.as_str(),
+                *member,
+                &member_root,
+                &address_list,
+                &ready,
+                control,
+                &markers,
+                if cluster == "source" {
+                    &source_grpc
+                } else {
+                    &target_grpc
+                },
+                if cluster == "source" {
+                    &target_grpc
+                } else {
+                    &source_grpc
+                },
+                &cert_dir,
+                &ack_marker,
+                &ack_gate,
+            );
+        }
+        for member in &follower_members {
+            let pid = children[*member].id();
+            wait_for_file(
+                &ready.join(format!("{cluster}-{member}-{pid}.ready")),
+                children,
+            )
+            .await;
+        }
+        wait_for_file(&leader_file, children).await;
+        let mut quorum_leader = None;
+        for member in 0..3 {
+            if member != isolated_leader {
+                let member_leader = markers.join(format!("{cluster}.member-{member}.leader"));
+                wait_for_file(&member_leader, children).await;
+                let observed: usize = std::fs::read_to_string(member_leader)
+                    .unwrap()
+                    .parse()
+                    .unwrap();
+                assert_ne!(observed, isolated_leader);
+                assert!(quorum_leader.is_none_or(|leader| leader == observed));
+                quorum_leader = Some(observed);
+            }
+        }
+        write_control(control, &format!("verify-no-uncommitted:{expiry}:quorum"));
+        for member in 0..3 {
+            if member != isolated_leader {
+                wait_for_file(
+                    &markers.join(format!("{cluster}.no-uncommitted-quorum-{member}")),
+                    children,
+                )
+                .await;
+            }
+        }
+
+        // Rejoin the old leader last. Its uncommitted suffix must be truncated
+        // by the elected quorum leader, never applied as a committed command.
+        let member_root = root
+            .path()
+            .join(cluster.as_str())
+            .join(format!("member-{isolated_leader}"));
+        let address_list = addresses.join(";");
+        children[isolated_leader] = coordinator_raft_child_process(
+            cluster.as_str(),
+            isolated_leader,
+            &member_root,
+            &address_list,
+            &ready,
+            control,
+            &markers,
+            if cluster == "source" {
+                &source_grpc
+            } else {
+                &target_grpc
+            },
+            if cluster == "source" {
+                &target_grpc
+            } else {
+                &source_grpc
+            },
+            &cert_dir,
+            &ack_marker,
+            &ack_gate,
+        );
+        let pid = children[isolated_leader].id();
+        wait_for_file(
+            &ready.join(format!("{cluster}-{isolated_leader}-{pid}.ready")),
+            children,
+        )
+        .await;
+        write_control(control, &format!("verify-no-uncommitted:{expiry}:all"));
+        for member in 0..3 {
+            wait_for_file(
+                &markers.join(format!("{cluster}.no-uncommitted-all-{member}")),
+                children,
+            )
+            .await;
+        }
+    }
+
     for (_, _, _, children) in &mut groups {
         for child in children {
             assert!(
                 child.try_wait().unwrap().is_none(),
-                "a Raft member process exited; the coordinator crash must not restart or kill cluster members"
+                "a Raft member process exited during uncommitted-entry recovery"
             );
             assert_sigkill(child, "cleanup coordinator recovery Raft member process");
         }

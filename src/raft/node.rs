@@ -74,7 +74,7 @@ pub struct RaftNode {
     node_id: RocksNodeId,
     raft: Arc<Raft>,
     raft_token: String,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-fault-injection"))]
     network: NetworkFactory,
 }
 
@@ -102,7 +102,7 @@ impl RaftNode {
             node_id,
             raft: Arc::new(raft),
             raft_token,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-fault-injection"))]
             network,
         })
     }
@@ -115,7 +115,7 @@ impl RaftNode {
         self.node_id
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-fault-injection"))]
     pub async fn set_peer_blocked(&self, node_id: RocksNodeId, blocked: bool) {
         self.network.set_peer_blocked(node_id, blocked).await;
     }
