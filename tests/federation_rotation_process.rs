@@ -654,11 +654,16 @@ async fn run_rollback_coordinator_process() {
     )
     .await
     .unwrap();
-    if phase == "initial" {
+    if matches!(phase.as_str(), "initial" | "recover-first") {
         let result = coordinator
             .rollback_before_activation("operator requested rollback before activation")
             .await;
-        panic!("source BeginRollback ACK should be dropped after Raft commit: {result:?}");
+        let fault_boundary = if phase == "initial" {
+            "source BeginRollback ACK"
+        } else {
+            "target rollback acknowledgement"
+        };
+        panic!("{fault_boundary} should be dropped after Raft commit: {result:?}");
     }
     let (source, target) = coordinator
         .rollback_before_activation("operator requested rollback before activation")
@@ -691,7 +696,7 @@ fn rollback_coordinator_process_child(
     ProcessCommand::new(std::env::current_exe().expect("integration test executable"))
         .args([
             "--exact",
-            "federated_trust_rotation_rollback_recovers_after_local_begin_ack_loss",
+            "federated_trust_rotation_rollback_recovers_after_local_and_remote_ack_loss",
             "--nocapture",
         ])
         .env("DATASPOOL_ROLLBACK_COORDINATOR_PHASE", phase)
@@ -724,7 +729,7 @@ fn rollback_raft_child_process(
     ProcessCommand::new(std::env::current_exe().expect("integration test executable"))
         .args([
             "--exact",
-            "federated_trust_rotation_rollback_recovers_after_local_begin_ack_loss",
+            "federated_trust_rotation_rollback_recovers_after_local_and_remote_ack_loss",
             "--nocapture",
         ])
         .env("DATASPOOL_TRUST_HA_CHILD", "1")
@@ -2244,7 +2249,7 @@ async fn federated_trust_rotation_coordinator_process_recovers_after_remote_acti
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn federated_trust_rotation_rollback_recovers_after_local_begin_ack_loss() {
+async fn federated_trust_rotation_rollback_recovers_after_local_and_remote_ack_loss() {
     if std::env::var_os("DATASPOOL_TRUST_HA_CHILD").is_some() {
         run_six_member_child().await;
         return;
@@ -2275,8 +2280,8 @@ async fn federated_trust_rotation_rollback_recovers_after_local_begin_ack_loss()
     let target_grpc = reserve_local_addr();
     let source_ack_marker = root.path().join("source-rollback-begin-committed.marker");
     let source_ack_gate = root.path().join("source-rollback-begin-ack.release");
-    let target_ack_marker = root.path().join("target-unused-rollback-ack.marker");
-    let target_ack_gate = root.path().join("target-unused-rollback-ack.release");
+    let target_ack_marker = root.path().join("target-rollback-committed.marker");
+    let target_ack_gate = root.path().join("target-rollback-ack.release");
     let initial_marker = root.path().join("rollback-coordinator-initial.marker");
     let recovered_marker = root.path().join("rollback-coordinator-recovered.marker");
     let mut groups = Vec::new();
@@ -2305,7 +2310,7 @@ async fn federated_trust_rotation_rollback_recovers_after_local_begin_ack_loss()
                         &source_grpc,
                         &target_ack_marker,
                         &target_ack_gate,
-                        100,
+                        1,
                     )
                 };
             children.push(rollback_raft_child_process(
@@ -2416,8 +2421,67 @@ async fn federated_trust_rotation_rollback_recovers_after_local_begin_ack_loss()
             .is_none()
     );
 
+    // Resume once: the peer's BeginRollback commits, then its first local
+    // rollback acknowledgement commits but its response is dropped. Kill this
+    // coordinator too, preserving the second partial-rollback boundary.
+    let first_recovery_marker = root
+        .path()
+        .join("rollback-coordinator-first-recovery.marker");
+    let mut first_recovery = rollback_coordinator_process_child(
+        "recover-first",
+        &format!("https://{source_grpc}"),
+        &format!("https://{target_grpc}"),
+        &cert_dir,
+        &first_recovery_marker,
+    );
+    wait_for_file(
+        &target_ack_marker,
+        std::slice::from_mut(&mut first_recovery),
+    )
+    .await;
+    assert_sigkill(
+        &mut first_recovery,
+        "SIGKILL coordinator after remote rollback commit before ACK",
+    );
+    std::fs::write(&target_ack_gate, b"release").unwrap();
+
+    let source_after_remote_crash = read_snapshot(format!("https://{source_grpc}"), "target").await;
+    let target_after_remote_crash = read_snapshot(format!("https://{target_grpc}"), "source").await;
+    assert_eq!(
+        source_after_remote_crash.rotation.phase,
+        FederatedTrustRotationPhase::RollingBack
+    );
+    assert!(source_after_remote_crash.rotation.local_staged);
+    assert!(source_after_remote_crash.rotation.peer_staged);
+    assert_eq!(
+        target_after_remote_crash.rotation.phase,
+        FederatedTrustRotationPhase::RollingBack
+    );
+    assert!(!target_after_remote_crash.rotation.local_staged);
+    assert!(target_after_remote_crash.rotation.peer_staged);
+    assert!(
+        target_after_remote_crash
+            .peer_pending_ca_fingerprint
+            .is_none()
+    );
+    assert!(
+        target_after_remote_crash
+            .peer_pending_identity_fingerprint
+            .is_none()
+    );
+    assert_eq!(
+        target_after_remote_crash
+            .peer_active_ca_fingerprint
+            .as_deref(),
+        Some(OLD_FINGERPRINT_CA)
+    );
+    assert_eq!(
+        target_after_remote_crash.peer_active_identity_fingerprint,
+        OLD_FINGERPRINT
+    );
+
     let mut recovered = rollback_coordinator_process_child(
-        "recover",
+        "recover-final",
         &format!("https://{source_grpc}"),
         &format!("https://{target_grpc}"),
         &cert_dir,
