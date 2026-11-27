@@ -25,6 +25,8 @@ use tempfile::TempDir;
 
 const OLD_FINGERPRINT: &str = "bb449e4e87f0e0fbf9f14d08981ca9002cca4255d3a497d5a619efc84ad3f5b2";
 const NEW_FINGERPRINT: &str = "2a4be85981a297ad770d988445905efea9af66b726b8e5a42c4de8618e7bd06b";
+const ASYMMETRIC_OLD_FINGERPRINT: &str =
+    "88e8f585081ffc39c65db45d4c7d16c119f7b2e7fcc6053acddba9843a2b32f1";
 const OLD_FINGERPRINT_CA: &str = "3b97b354a97ed41e7b6cbfc79dc0f76bf105128e32e42e72adbbaaa50e67d365";
 const NEW_CA_FINGERPRINT: &str = "cc000414290fd64c9bc3cb369ed3047fd41a52d7ae89a6049bbbed6c38274f4b";
 const ROTATION_CA: &[u8] = include_bytes!("fixtures/federation-rotation/ca.pem");
@@ -241,7 +243,7 @@ async fn run_child_process() {
     ) = if role == "source" {
         (
             NEW_FINGERPRINT,
-            OLD_FINGERPRINT,
+            ASYMMETRIC_OLD_FINGERPRINT,
             ASYMMETRIC_TARGET_CA,
             ASYMMETRIC_SOURCE_CA,
             ASYMMETRIC_SOURCE_CERT,
@@ -251,7 +253,7 @@ async fn run_child_process() {
         )
     } else {
         (
-            OLD_FINGERPRINT,
+            ASYMMETRIC_OLD_FINGERPRINT,
             NEW_FINGERPRINT,
             ASYMMETRIC_SOURCE_CA,
             ASYMMETRIC_TARGET_CA,
@@ -2823,7 +2825,7 @@ async fn federated_certificate_rotation_recovers_after_sigkill_across_both_raft_
             &target_client_key,
             &source_client,
             &source_client_key,
-            OLD_FINGERPRINT,
+            ASYMMETRIC_OLD_FINGERPRINT,
         ),
         (
             format!("https://{target_grpc_addr}"),
