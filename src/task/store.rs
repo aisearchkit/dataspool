@@ -244,6 +244,25 @@ impl<S: KvStore> TaskStore<S> {
         Ok(events)
     }
 
+    /// Read audit events for one exact resource, newest first.
+    pub async fn list_audit_events_for_resource(
+        &self,
+        resource_id: &str,
+        limit: usize,
+    ) -> Result<Vec<AuditEvent>> {
+        let mut events: Vec<AuditEvent> = self
+            .store
+            .prefix_scan_cf(cf::META, b"audit:")
+            .await?
+            .into_iter()
+            .map(|(_, value)| serde_json::from_slice(&value))
+            .collect::<std::result::Result<_, _>>()?;
+        events.retain(|event| event.resource_id == resource_id);
+        events.sort_by_key(|event| std::cmp::Reverse(event.log_index));
+        events.truncate(limit.clamp(1, 1000));
+        Ok(events)
+    }
+
     /// Compute bounded-cardinality operational metrics from the replicated metadata.
     pub async fn operational_metrics(&self) -> Result<OperationalMetrics> {
         let now = chrono::Utc::now();

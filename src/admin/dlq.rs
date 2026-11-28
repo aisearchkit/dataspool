@@ -19,8 +19,8 @@ use crate::{
     FederatedTrustRotationCoordinator,
     drivers::factory::{SinkConfig, create_sink},
     federation::{
-        FederatedCluster, FederatedClusterStatus, FederatedMigration, MigrationState,
-        MigrationTimeoutPolicy,
+        FederatedCluster, FederatedClusterStatus, FederatedMigration, FederatedTrustRotationPhase,
+        MigrationState, MigrationTimeoutPolicy,
     },
     pipeline::{DeadLetterEntry, DeadLetterQueue},
     raft::{Command, RaftNode},
@@ -146,6 +146,18 @@ impl<S: KvStore + Clone + 'static> DlqApi<S> {
                 post(rollback_trust_rotation),
             )
             .route(
+                "/api/v1/federation/trust-rotations/{rotation_id}/diagnostics",
+                get(diagnose_trust_rotation),
+            )
+            .route(
+                "/api/v1/federation/trust-rotations/{rotation_id}/audit",
+                get(list_trust_rotation_audit),
+            )
+            .route(
+                "/api/v1/federation/trust-rotations/{rotation_id}/recover",
+                post(recover_trust_rotation),
+            )
+            .route(
                 "/api/v1/federation/migrations",
                 get(list_federated_migrations).post(create_federated_migration),
             )
@@ -217,6 +229,11 @@ struct TrustRotationActionRequest {
 struct TrustRotationRollbackRequest {
     request_id: String,
     reason: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct TrustRotationRecoveryRequest {
+    request_id: String,
 }
 
 async fn create_federated_trust_rotation<S: KvStore + Clone>(
@@ -357,6 +374,56 @@ async fn rollback_trust_rotation<S: KvStore + Clone>(
         .await
     {
         Ok(rotation) => Json(rotation).into_response(),
+        Err(error) => (StatusCode::CONFLICT, error.to_string()).into_response(),
+    }
+}
+
+async fn diagnose_trust_rotation<S: KvStore + Clone>(
+    State(state): State<ApiState<S>>,
+    Path(rotation_id): Path<String>,
+) -> Response {
+    let Some(coordinator) = state.trust_rotation_coordinator else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match coordinator.inspect_bilateral(&rotation_id).await {
+        Ok(diagnostics) => Json(diagnostics).into_response(),
+        Err(error) => (StatusCode::BAD_GATEWAY, error.to_string()).into_response(),
+    }
+}
+
+async fn list_trust_rotation_audit<S: KvStore + Clone>(
+    State(state): State<ApiState<S>>,
+    Path(rotation_id): Path<String>,
+    Query(query): Query<AuditQuery>,
+) -> Response {
+    let resource_id = format!("federated_trust_rotation:{rotation_id}");
+    match state
+        .tasks
+        .list_audit_events_for_resource(&resource_id, query.limit.unwrap_or(100))
+        .await
+    {
+        Ok(events) => Json(events).into_response(),
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+    }
+}
+
+async fn recover_trust_rotation<S: KvStore + Clone>(
+    State(state): State<ApiState<S>>,
+    Path(rotation_id): Path<String>,
+    headers: axum::http::HeaderMap,
+    Json(request): Json<TrustRotationRecoveryRequest>,
+) -> Response {
+    let Some(coordinator) = state.trust_rotation_coordinator else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match coordinator
+        .recover_rotation(&rotation_id, &request.request_id, &request_actor(&headers))
+        .await
+    {
+        Ok(_) => match coordinator.inspect_bilateral(&rotation_id).await {
+            Ok(diagnostics) => Json(diagnostics).into_response(),
+            Err(error) => (StatusCode::BAD_GATEWAY, error.to_string()).into_response(),
+        },
         Err(error) => (StatusCode::CONFLICT, error.to_string()).into_response(),
     }
 }
@@ -790,6 +857,17 @@ async fn metrics<S: KvStore + Clone>(State(state): State<ApiState<S>>) -> Respon
     };
     let sla_at_risk = sla_alerts.iter().filter(|alert| !alert.breached).count();
     let sla_breached = sla_alerts.iter().filter(|alert| alert.breached).count();
+    let rotations = match state.tasks.list_federated_trust_rotations().await {
+        Ok(rotations) => rotations,
+        Err(error) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response();
+        }
+    };
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let mut rotation_counts = std::collections::BTreeMap::<&'static str, usize>::new();
+    let mut stalled_rotations = 0usize;
+    let mut recovery_required_rotations = 0usize;
+    let mut rotations_with_errors = 0usize;
     let mut body = format!(
         "# HELP dataspool_sla_tasks_at_risk Tasks approaching configured SLA limits\n# TYPE dataspool_sla_tasks_at_risk gauge\ndataspool_sla_tasks_at_risk {}\n# HELP dataspool_sla_tasks_breached Tasks breaching configured SLA limits\n# TYPE dataspool_sla_tasks_breached gauge\ndataspool_sla_tasks_breached {}\n# HELP dataspool_tasks_total Number of known tasks\n# TYPE dataspool_tasks_total gauge\ndataspool_tasks_total {}\n# HELP dataspool_tasks Number of tasks by lifecycle state\n# TYPE dataspool_tasks gauge\ndataspool_tasks{{state=\"pending\"}} {}\ndataspool_tasks{{state=\"running\"}} {}\ndataspool_tasks{{state=\"paused\"}} {}\ndataspool_tasks{{state=\"cancelling\"}} {}\ndataspool_tasks{{state=\"cancelled\"}} {}\ndataspool_tasks{{state=\"completed\"}} {}\ndataspool_tasks{{state=\"failed\"}} {}\n# HELP dataspool_shards Number of shards by state\n# TYPE dataspool_shards gauge\ndataspool_shards{{state=\"pending\"}} {}\ndataspool_shards{{state=\"running\"}} {}\ndataspool_shards{{state=\"completed\"}} {}\ndataspool_shards{{state=\"failed\"}} {}\n# HELP dataspool_nodes Number of nodes by state\n# TYPE dataspool_nodes gauge\ndataspool_nodes{{state=\"healthy\"}} {}\ndataspool_nodes{{state=\"degraded\"}} {}\ndataspool_nodes{{state=\"paused\"}} {}\ndataspool_nodes{{state=\"offline\"}} {}\n# HELP dataspool_retries_total Total failed shard attempts beyond the first attempt\n# TYPE dataspool_retries_total counter\ndataspool_retries_total {}\n# HELP dataspool_oldest_pending_seconds Age of the oldest pending shard\n# TYPE dataspool_oldest_pending_seconds gauge\ndataspool_oldest_pending_seconds {}\n",
         sla_at_risk,
@@ -814,6 +892,79 @@ async fn metrics<S: KvStore + Clone>(State(state): State<ApiState<S>>) -> Respon
         metrics.oldest_pending_seconds,
     );
     body.push_str(&format!("# HELP dataspool_scheduler_delay_seconds Age of the oldest pending shard waiting for scheduling\n# TYPE dataspool_scheduler_delay_seconds gauge\ndataspool_scheduler_delay_seconds {}\n# HELP dataspool_node_active_shards Number of active shard leases per node\n# TYPE dataspool_node_active_shards gauge\n# HELP dataspool_node_capacity_shards Configured concurrent shard capacity per node\n# TYPE dataspool_node_capacity_shards gauge\n# HELP dataspool_node_memory_capacity_mb Configured memory capacity per node in MiB\n# TYPE dataspool_node_memory_capacity_mb gauge\n# HELP dataspool_node_reserved_memory_mb Memory reserved by active shard leases per node in MiB\n# TYPE dataspool_node_reserved_memory_mb gauge\n", metrics.oldest_pending_seconds));
+    body.push_str("# HELP dataspool_federation_trust_rotations Number of federated trust rotations by lifecycle phase\n# TYPE dataspool_federation_trust_rotations gauge\n# HELP dataspool_federation_trust_rotation_stalled Rotations in a transitional phase without an update for at least 30 seconds\n# TYPE dataspool_federation_trust_rotation_stalled gauge\n# HELP dataspool_federation_trust_rotation_recovery_required Rotations requiring forward recovery\n# TYPE dataspool_federation_trust_rotation_recovery_required gauge\n# HELP dataspool_federation_trust_rotation_errors Rotations with a persisted last error\n# TYPE dataspool_federation_trust_rotation_errors gauge\n");
+    for rotation in &rotations {
+        let phase = match rotation.phase {
+            FederatedTrustRotationPhase::Staging => "staging",
+            FederatedTrustRotationPhase::AwaitingDeployment => "awaiting_deployment",
+            FederatedTrustRotationPhase::ActivationBarrier => "activation_barrier",
+            FederatedTrustRotationPhase::Activating => "activating",
+            FederatedTrustRotationPhase::RecoveryRequired => "recovery_required",
+            FederatedTrustRotationPhase::Overlap => "overlap",
+            FederatedTrustRotationPhase::Retiring => "retiring",
+            FederatedTrustRotationPhase::Completed => "completed",
+            FederatedTrustRotationPhase::RollingBack => "rolling_back",
+            FederatedTrustRotationPhase::RolledBack => "rolled_back",
+        };
+        *rotation_counts.entry(phase).or_default() += 1;
+        if rotation.phase == FederatedTrustRotationPhase::RecoveryRequired {
+            recovery_required_rotations += 1;
+        }
+        if rotation.last_error.is_some() {
+            rotations_with_errors += 1;
+        }
+        if now_ms.saturating_sub(rotation.updated_at_ms) >= 30_000
+            && matches!(
+                rotation.phase,
+                FederatedTrustRotationPhase::Staging
+                    | FederatedTrustRotationPhase::Activating
+                    | FederatedTrustRotationPhase::RecoveryRequired
+                    | FederatedTrustRotationPhase::RollingBack
+                    | FederatedTrustRotationPhase::Retiring
+            )
+        {
+            stalled_rotations += 1;
+        }
+    }
+    for phase in [
+        "staging",
+        "awaiting_deployment",
+        "activation_barrier",
+        "activating",
+        "recovery_required",
+        "overlap",
+        "retiring",
+        "completed",
+        "rolling_back",
+        "rolled_back",
+    ] {
+        body.push_str(&format!(
+            "dataspool_federation_trust_rotations{{phase=\"{phase}\"}} {}\n",
+            rotation_counts.get(phase).copied().unwrap_or_default()
+        ));
+    }
+    body.push_str(&format!(
+        "dataspool_federation_trust_rotation_stalled {stalled_rotations}\ndataspool_federation_trust_rotation_recovery_required {recovery_required_rotations}\ndataspool_federation_trust_rotation_errors {rotations_with_errors}\n"
+    ));
+    body.push_str("# HELP dataspool_federation_trust_rotation_overlap_remaining_seconds Remaining CA overlap duration per rotation\n# TYPE dataspool_federation_trust_rotation_overlap_remaining_seconds gauge\n");
+    for rotation in &rotations {
+        if matches!(
+            rotation.phase,
+            FederatedTrustRotationPhase::Overlap | FederatedTrustRotationPhase::Retiring
+        ) && let Some(deadline) = rotation
+            .local_activation_expires_at_ms
+            .zip(rotation.peer_activation_expires_at_ms)
+            .map(|(local, peer)| local.max(peer))
+        {
+            let label = rotation
+                .rotation_id
+                .replace('\\', "\\\\")
+                .replace('"', "\\\"")
+                .replace('\n', "\\n");
+            let remaining = deadline.saturating_sub(now_ms).max(0) as f64 / 1000.0;
+            body.push_str(&format!("dataspool_federation_trust_rotation_overlap_remaining_seconds{{rotation_id=\"{label}\"}} {remaining:.3}\n"));
+        }
+    }
     for node in &metrics.node_load {
         let label = node
             .node_id
@@ -1159,6 +1310,86 @@ mod tests {
             .header("authorization", "Bearer a-secure-test-token-with-at-least-32-bytes").body(Body::empty()).unwrap()).await.unwrap();
         assert_eq!(authorized.status(), StatusCode::NOT_FOUND);
 
+        let diagnostics_path = "/api/v1/federation/trust-rotations/rotation-1/diagnostics";
+        let diagnostics_unauthorized = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(diagnostics_path)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(diagnostics_unauthorized.status(), StatusCode::UNAUTHORIZED);
+        let diagnostics_unavailable = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(diagnostics_path)
+                    .header(
+                        "authorization",
+                        "Bearer a-secure-test-token-with-at-least-32-bytes",
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            diagnostics_unavailable.status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        let rotation_audit = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/federation/trust-rotations/rotation-1/audit?limit=10")
+                    .header(
+                        "authorization",
+                        "Bearer a-secure-test-token-with-at-least-32-bytes",
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rotation_audit.status(), StatusCode::OK);
+
+        let recovery_unauthorized = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/federation/trust-rotations/rotation-1/recover")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"request_id":"manual-recovery-1"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(recovery_unauthorized.status(), StatusCode::UNAUTHORIZED);
+        let recovery_unavailable = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/federation/trust-rotations/rotation-1/recover")
+                    .header(
+                        "authorization",
+                        "Bearer a-secure-test-token-with-at-least-32-bytes",
+                    )
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"request_id":"manual-recovery-1"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            recovery_unavailable.status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+
         let metrics = app
             .clone()
             .oneshot(
@@ -1188,6 +1419,9 @@ mod tests {
             .unwrap();
         assert!(
             String::from_utf8_lossy(&metrics_body).contains("dataspool_scheduler_delay_seconds")
+        );
+        assert!(
+            String::from_utf8_lossy(&metrics_body).contains("dataspool_federation_trust_rotations")
         );
 
         let audit = app

@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Added bilateral federated trust-rotation diagnostics, sanitized state-difference reporting, phase-aware safe recovery, per-rotation audit queries, and Prometheus phase/stall/recovery/overlap metrics.
 - Added a deterministic dynamic shard scheduler that orders tasks by priority/FIFO age, places work on the least-utilized healthy eligible node, enforces per-node concurrency and memory capacity, and honors `requires.*` task tag constraints.
 - Added graceful task pause with a Pausing drain phase, worker-side cancellation propagation, in-flight sink/checkpoint/ack completion, and lease release before the Paused state is committed. Cancellation stops new source batches and lease renewals while allowing an already replicated batch to checkpoint safely.
 - Added TaskService.ListTasks with leader-linearizable pagination, state/tag filtering, and deterministic sorting.

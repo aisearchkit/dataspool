@@ -44,7 +44,9 @@ pub use comms::{GrpcClient, GrpcServer};
 pub use config::DatspoolConfig;
 pub use error::{ConfigError, DatspoolError, DriverError, RaftError, Result, StorageError};
 pub use federation::trust_rotation::{
-    FederatedTrustRotationCoordinator, FederatedTrustRotationProcessCoordinator,
+    FederatedTrustRotationCoordinator, FederatedTrustRotationDiagnostics,
+    FederatedTrustRotationProcessCoordinator, FederatedTrustRotationRecoveryAction,
+    FederatedTrustRotationSideDiagnostics,
 };
 pub use federation::{
     FederatedCluster, FederatedClusterStatus, FederatedMigration, FederatedTrustRotation,

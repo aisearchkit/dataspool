@@ -7097,6 +7097,23 @@ mod tests {
         assert_eq!(events[1].actor, "bob");
         assert_eq!(events[1].request_id, "audit-create-1");
         assert_eq!(events[1].action, "task.create");
+        let resource_events = store
+            .list_audit_events_for_resource(&task_id.to_string(), 10)
+            .await
+            .unwrap();
+        assert_eq!(resource_events.len(), 2);
+        assert!(
+            resource_events
+                .iter()
+                .all(|event| event.resource_id == task_id.to_string())
+        );
+        assert!(
+            store
+                .list_audit_events_for_resource("another-resource", 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]

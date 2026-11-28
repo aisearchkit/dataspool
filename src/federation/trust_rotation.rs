@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::comms::GrpcClient;
@@ -18,6 +19,393 @@ use crate::raft::{Command, RaftNode};
 use crate::storage::RocksDbStore;
 use crate::task::TaskStore;
 use tokio_util::sync::CancellationToken;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FederatedTrustRotationRecoveryAction {
+    ContinueStaging,
+    ResumeRollback,
+    ForwardRecovery,
+    RetireBoth,
+    WaitForOverlap,
+    AwaitOperator,
+    NoAction,
+    ManualInterventionRequired,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FederatedTrustRotationSideDiagnostics {
+    pub cluster_id: String,
+    pub phase: FederatedTrustRotationPhase,
+    pub revision: u64,
+    pub local_staged: bool,
+    pub peer_staged: bool,
+    pub local_deployment_ready: bool,
+    pub peer_deployment_ready: bool,
+    pub activation_barrier_committed: bool,
+    pub local_activation_expires_at_ms: Option<i64>,
+    pub peer_activation_expires_at_ms: Option<i64>,
+    pub local_retired: bool,
+    pub peer_retired: bool,
+    pub rollback_reason: Option<String>,
+    pub rollback_peer_confirmed: bool,
+    pub local_ca_bundle_fingerprint: String,
+    pub peer_ca_bundle_fingerprint: String,
+    pub local_leaf_fingerprint: String,
+    pub peer_leaf_fingerprint: String,
+    pub peer_active_ca_fingerprint: Option<String>,
+    pub peer_pending_ca_fingerprint: Option<String>,
+    pub peer_previous_ca_fingerprint: Option<String>,
+    pub peer_previous_ca_expires_at_ms: Option<i64>,
+    pub peer_active_identity_fingerprint: String,
+    pub peer_pending_identity_fingerprint: Option<String>,
+    pub last_error: Option<String>,
+    pub updated_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FederatedTrustRotationDiagnostics {
+    pub rotation_id: String,
+    pub local: FederatedTrustRotationSideDiagnostics,
+    pub peer: FederatedTrustRotationSideDiagnostics,
+    pub state_aligned: bool,
+    pub differences: Vec<String>,
+    pub safety_violations: Vec<String>,
+    pub recommended_action: FederatedTrustRotationRecoveryAction,
+    pub automated_recovery_safe: bool,
+    pub stalled: bool,
+    pub stalled_for_ms: i64,
+    pub observed_at_ms: i64,
+}
+
+fn side_diagnostics(
+    cluster_id: &str,
+    snapshot: &FederatedTrustRotationSnapshot,
+) -> FederatedTrustRotationSideDiagnostics {
+    let rotation = &snapshot.rotation;
+    FederatedTrustRotationSideDiagnostics {
+        cluster_id: cluster_id.to_string(),
+        phase: rotation.phase,
+        revision: rotation.revision,
+        local_staged: rotation.local_staged,
+        peer_staged: rotation.peer_staged,
+        local_deployment_ready: rotation.local_deployment_ready,
+        peer_deployment_ready: rotation.peer_deployment_ready,
+        activation_barrier_committed: rotation.activation_barrier_committed,
+        local_activation_expires_at_ms: rotation.local_activation_expires_at_ms,
+        peer_activation_expires_at_ms: rotation.peer_activation_expires_at_ms,
+        local_retired: rotation.local_retired,
+        peer_retired: rotation.peer_retired,
+        rollback_reason: rotation.rollback_reason.clone(),
+        rollback_peer_confirmed: rotation.rollback_peer_confirmed,
+        local_ca_bundle_fingerprint: rotation.local_ca_bundle_fingerprint.clone(),
+        peer_ca_bundle_fingerprint: rotation.peer_ca_bundle_fingerprint.clone(),
+        local_leaf_fingerprint: rotation.local_leaf_fingerprint.clone(),
+        peer_leaf_fingerprint: rotation.peer_leaf_fingerprint.clone(),
+        peer_active_ca_fingerprint: snapshot.peer_active_ca_fingerprint.clone(),
+        peer_pending_ca_fingerprint: snapshot.peer_pending_ca_fingerprint.clone(),
+        peer_previous_ca_fingerprint: snapshot.peer_previous_ca_fingerprint.clone(),
+        peer_previous_ca_expires_at_ms: snapshot.peer_previous_ca_expires_at_ms,
+        peer_active_identity_fingerprint: snapshot.peer_active_identity_fingerprint.clone(),
+        peer_pending_identity_fingerprint: snapshot.peer_pending_identity_fingerprint.clone(),
+        last_error: rotation.last_error.clone(),
+        updated_at_ms: rotation.updated_at_ms,
+    }
+}
+
+fn build_rotation_diagnostics(
+    rotation_id: &str,
+    local_cluster_id: &str,
+    peer_cluster_id: &str,
+    local: FederatedTrustRotationSnapshot,
+    peer: FederatedTrustRotationSnapshot,
+    now_ms: i64,
+) -> FederatedTrustRotationDiagnostics {
+    let local_status = side_diagnostics(local_cluster_id, &local);
+    let peer_status = side_diagnostics(peer_cluster_id, &peer);
+    let mut differences = Vec::new();
+    let mut safety_violations = Vec::new();
+    let left = &local.rotation;
+    let right = &peer.rotation;
+
+    macro_rules! difference {
+        ($condition:expr, $message:expr) => {
+            if !$condition {
+                differences.push($message.to_string());
+            }
+        };
+    }
+    difference!(left.phase == right.phase, "phase differs between clusters");
+    difference!(
+        left.revision == right.revision,
+        "Raft rotation revisions differ"
+    );
+    difference!(
+        left.local_staged == right.peer_staged,
+        "local/peer staged acknowledgements differ"
+    );
+    difference!(
+        left.peer_staged == right.local_staged,
+        "peer/local staged acknowledgements differ"
+    );
+    difference!(
+        left.local_deployment_ready == right.peer_deployment_ready,
+        "local/peer deployment readiness differs"
+    );
+    difference!(
+        left.peer_deployment_ready == right.local_deployment_ready,
+        "peer/local deployment readiness differs"
+    );
+    difference!(
+        left.activation_barrier_committed == right.activation_barrier_committed,
+        "activation barrier commits differ"
+    );
+    difference!(
+        left.local_activation_expires_at_ms == right.peer_activation_expires_at_ms,
+        "local activation expiry differs from peer record"
+    );
+    difference!(
+        left.peer_activation_expires_at_ms == right.local_activation_expires_at_ms,
+        "peer activation expiry differs from local record"
+    );
+    difference!(
+        left.local_retired == right.peer_retired,
+        "local/peer retirement acknowledgements differ"
+    );
+    difference!(
+        left.peer_retired == right.local_retired,
+        "peer/local retirement acknowledgements differ"
+    );
+    difference!(
+        left.rollback_peer_confirmed == right.rollback_peer_confirmed,
+        "bilateral rollback confirmations differ"
+    );
+    difference!(
+        left.rollback_reason == right.rollback_reason,
+        "rollback reasons differ between clusters"
+    );
+
+    if left.rotation_id != rotation_id
+        || right.rotation_id != rotation_id
+        || left.peer_cluster_id != peer_cluster_id
+        || right.peer_cluster_id != local_cluster_id
+    {
+        safety_violations.push("rotation identity or peer mapping is inconsistent".into());
+    }
+    if left.overlap_ms != right.overlap_ms {
+        safety_violations.push("overlap durations differ between clusters".into());
+    }
+    if (left.phase == FederatedTrustRotationPhase::Completed
+        && right.phase == FederatedTrustRotationPhase::RolledBack)
+        || (left.phase == FederatedTrustRotationPhase::RolledBack
+            && right.phase == FederatedTrustRotationPhase::Completed)
+    {
+        safety_violations
+            .push("clusters report conflicting terminal outcomes for the same rotation".into());
+    }
+    if !left
+        .local_ca_bundle_fingerprint
+        .eq_ignore_ascii_case(&right.peer_ca_bundle_fingerprint)
+        || !left
+            .peer_ca_bundle_fingerprint
+            .eq_ignore_ascii_case(&right.local_ca_bundle_fingerprint)
+        || !left
+            .local_leaf_fingerprint
+            .eq_ignore_ascii_case(&right.peer_leaf_fingerprint)
+        || !left
+            .peer_leaf_fingerprint
+            .eq_ignore_ascii_case(&right.local_leaf_fingerprint)
+    {
+        safety_violations
+            .push("candidate CA or leaf fingerprints do not map across clusters".into());
+    }
+    if left.rollback_reason.is_some()
+        && right.rollback_reason.is_some()
+        && left.rollback_reason != right.rollback_reason
+    {
+        safety_violations.push("rollback reason was changed on one side".into());
+    }
+    if left.local_activation_expires_at_ms.is_some()
+        && right.peer_activation_expires_at_ms.is_some()
+        && left.local_activation_expires_at_ms != right.peer_activation_expires_at_ms
+        || left.peer_activation_expires_at_ms.is_some()
+            && right.local_activation_expires_at_ms.is_some()
+            && left.peer_activation_expires_at_ms != right.local_activation_expires_at_ms
+    {
+        safety_violations.push("committed activation expiry values differ across clusters".into());
+    }
+    let any_rollback = left.phase == FederatedTrustRotationPhase::RollingBack
+        || right.phase == FederatedTrustRotationPhase::RollingBack;
+    let any_activation_barrier =
+        left.activation_barrier_committed || right.activation_barrier_committed;
+    let any_actual_activation = left.local_activation_expires_at_ms.is_some()
+        || left.peer_activation_expires_at_ms.is_some()
+        || right.local_activation_expires_at_ms.is_some()
+        || right.peer_activation_expires_at_ms.is_some();
+    if any_rollback
+        && any_actual_activation
+        && (left.rollback_peer_confirmed || right.rollback_peer_confirmed)
+    {
+        safety_violations
+            .push("bilaterally confirmed rollback conflicts with a committed CA activation".into());
+    }
+    if any_rollback
+        && any_activation_barrier
+        && (left.rollback_peer_confirmed || right.rollback_peer_confirmed)
+    {
+        safety_violations.push(
+            "bilaterally confirmed rollback conflicts with a committed activation barrier".into(),
+        );
+    }
+    for (snapshot, rotation) in [(&local, left), (&peer, right)] {
+        let candidate_is_active = snapshot
+            .peer_active_ca_fingerprint
+            .as_deref()
+            .is_some_and(|value| value.eq_ignore_ascii_case(&rotation.peer_ca_bundle_fingerprint));
+        let candidate_is_previous = snapshot
+            .peer_previous_ca_fingerprint
+            .as_deref()
+            .is_some_and(|value| value.eq_ignore_ascii_case(&rotation.peer_ca_bundle_fingerprint));
+        if rotation.phase == FederatedTrustRotationPhase::RolledBack
+            && (candidate_is_active
+                || candidate_is_previous
+                || snapshot
+                    .peer_pending_ca_fingerprint
+                    .as_deref()
+                    .is_some_and(|value| {
+                        value.eq_ignore_ascii_case(&rotation.peer_ca_bundle_fingerprint)
+                    })
+                || snapshot
+                    .peer_pending_identity_fingerprint
+                    .as_deref()
+                    .is_some_and(|value| {
+                        value.eq_ignore_ascii_case(&rotation.peer_leaf_fingerprint)
+                    }))
+        {
+            safety_violations.push(format!("{} reports RolledBack while candidate trust or identity material remains installed", rotation.rotation_id));
+        }
+        if rotation.phase == FederatedTrustRotationPhase::Completed
+            && !(rotation.local_retired && rotation.peer_retired)
+        {
+            safety_violations.push(format!(
+                "{} reports Completed without both retirement acknowledgements",
+                rotation.rotation_id
+            ));
+        }
+        if rotation.local_activation_expires_at_ms.is_some()
+            && !snapshot
+                .peer_active_ca_fingerprint
+                .as_deref()
+                .is_some_and(|value| {
+                    value.eq_ignore_ascii_case(&rotation.peer_ca_bundle_fingerprint)
+                })
+        {
+            safety_violations.push(format!(
+                "{} peer active CA does not match the locally committed candidate",
+                rotation.rotation_id
+            ));
+        }
+        if rotation.local_activation_expires_at_ms.is_some()
+            && !rotation.local_retired
+            && (snapshot.peer_previous_ca_expires_at_ms != rotation.local_activation_expires_at_ms
+                || snapshot.peer_previous_ca_fingerprint != rotation.current_peer_ca_fingerprint)
+        {
+            safety_violations.push(format!(
+                "{} peer previous-CA expiry does not match its committed local activation expiry",
+                rotation.rotation_id
+            ));
+        }
+        if rotation.local_retired && snapshot.peer_previous_ca_expires_at_ms.is_some() {
+            safety_violations.push(format!(
+                "{} previous CA remains present after local retirement was acknowledged",
+                rotation.rotation_id
+            ));
+        }
+    }
+
+    let deadline = [
+        left.local_activation_expires_at_ms,
+        left.peer_activation_expires_at_ms,
+        right.local_activation_expires_at_ms,
+        right.peer_activation_expires_at_ms,
+    ]
+    .into_iter()
+    .flatten()
+    .max();
+    let recommended_action = if !safety_violations.is_empty() {
+        FederatedTrustRotationRecoveryAction::ManualInterventionRequired
+    } else if any_activation_barrier
+        || any_actual_activation
+        || matches!(
+            left.phase,
+            FederatedTrustRotationPhase::Activating | FederatedTrustRotationPhase::RecoveryRequired
+        )
+        || matches!(
+            right.phase,
+            FederatedTrustRotationPhase::Activating | FederatedTrustRotationPhase::RecoveryRequired
+        )
+    {
+        FederatedTrustRotationRecoveryAction::ForwardRecovery
+    } else if any_rollback {
+        FederatedTrustRotationRecoveryAction::ResumeRollback
+    } else if matches!(
+        left.phase,
+        FederatedTrustRotationPhase::Overlap | FederatedTrustRotationPhase::Retiring
+    ) || matches!(
+        right.phase,
+        FederatedTrustRotationPhase::Overlap | FederatedTrustRotationPhase::Retiring
+    ) {
+        if deadline.is_some_and(|value| now_ms >= value) {
+            FederatedTrustRotationRecoveryAction::RetireBoth
+        } else {
+            FederatedTrustRotationRecoveryAction::WaitForOverlap
+        }
+    } else if left.phase == FederatedTrustRotationPhase::Staging
+        || right.phase == FederatedTrustRotationPhase::Staging
+    {
+        FederatedTrustRotationRecoveryAction::ContinueStaging
+    } else if matches!(
+        left.phase,
+        FederatedTrustRotationPhase::Completed | FederatedTrustRotationPhase::RolledBack
+    ) && matches!(
+        right.phase,
+        FederatedTrustRotationPhase::Completed | FederatedTrustRotationPhase::RolledBack
+    ) {
+        FederatedTrustRotationRecoveryAction::NoAction
+    } else {
+        FederatedTrustRotationRecoveryAction::AwaitOperator
+    };
+    let updated_at = left.updated_at_ms.min(right.updated_at_ms);
+    let stalled_for_ms = now_ms.saturating_sub(updated_at).max(0);
+    let stalled = stalled_for_ms >= 30_000
+        && matches!(
+            recommended_action,
+            FederatedTrustRotationRecoveryAction::ContinueStaging
+                | FederatedTrustRotationRecoveryAction::ResumeRollback
+                | FederatedTrustRotationRecoveryAction::ForwardRecovery
+                | FederatedTrustRotationRecoveryAction::RetireBoth
+        );
+    let automated_recovery_safe = matches!(
+        recommended_action,
+        FederatedTrustRotationRecoveryAction::ContinueStaging
+            | FederatedTrustRotationRecoveryAction::ResumeRollback
+            | FederatedTrustRotationRecoveryAction::ForwardRecovery
+            | FederatedTrustRotationRecoveryAction::RetireBoth
+    );
+    FederatedTrustRotationDiagnostics {
+        rotation_id: rotation_id.to_string(),
+        local: local_status,
+        peer: peer_status,
+        state_aligned: differences.is_empty() && safety_violations.is_empty(),
+        differences,
+        safety_violations,
+        recommended_action,
+        automated_recovery_safe,
+        stalled,
+        stalled_for_ms,
+        observed_at_ms: now_ms,
+    }
+}
 
 async fn connect_mtls_with_retry(
     endpoint: &str,
@@ -1656,6 +2044,198 @@ impl FederatedTrustRotationCoordinator {
             })
     }
 
+    /// Read both durable Raft views and return a sanitized operational diagnosis.
+    /// CA bundle PEM and private-key material are intentionally never included.
+    pub async fn inspect_bilateral(
+        &self,
+        rotation_id: &str,
+    ) -> crate::Result<FederatedTrustRotationDiagnostics> {
+        let rotation = self.get_rotation(rotation_id).await?;
+        let peer_record = self.peer_record(&rotation.peer_cluster_id).await?;
+        let mut peer_client = self.connect_peer(&peer_record).await?;
+        let response = peer_client
+            .get_remote_trust_rotation(&self.local_cluster_id, rotation_id)
+            .await?;
+        if !response.accepted {
+            return Err(crate::DatspoolError::Internal(
+                "peer rejected the bilateral trust-rotation diagnostic read".into(),
+            ));
+        }
+        let peer_snapshot: FederatedTrustRotationSnapshot =
+            serde_json::from_str(&response.state_json)
+                .map_err(|error| crate::DatspoolError::Serialization(error.to_string()))?;
+        if rotation.peer_cluster_id != peer_record.cluster_id
+            || peer_snapshot.rotation.rotation_id != rotation_id
+            || peer_snapshot.rotation.peer_cluster_id != self.local_cluster_id
+        {
+            return Err(crate::DatspoolError::Configuration(
+                "bilateral diagnostic read returned a mismatched rotation or cluster identity"
+                    .into(),
+            ));
+        }
+        let local_snapshot = FederatedTrustRotationSnapshot {
+            rotation,
+            peer_active_ca_fingerprint: peer_record.trust_bundle_fingerprint,
+            peer_pending_ca_fingerprint: peer_record.pending_trust_bundle_fingerprint,
+            peer_previous_ca_fingerprint: peer_record.previous_trust_bundle_fingerprint,
+            peer_previous_ca_expires_at_ms: peer_record.previous_trust_bundle_expires_at_ms,
+            peer_active_identity_fingerprint: peer_record.identity_fingerprint,
+            peer_pending_identity_fingerprint: peer_record.pending_identity_fingerprint,
+        };
+        Ok(build_rotation_diagnostics(
+            rotation_id,
+            &self.local_cluster_id,
+            &peer_record.cluster_id,
+            local_snapshot,
+            peer_snapshot,
+            chrono::Utc::now().timestamp_millis(),
+        ))
+    }
+
+    /// Safely resume one rotation using only its persisted lifecycle phase. This
+    /// method never bypasses deployment readiness, the activation barrier, the
+    /// overlap deadline, or the bilateral rollback confirmation fence.
+    pub async fn recover_rotation(
+        &self,
+        rotation_id: &str,
+        request_id: &str,
+        actor: &str,
+    ) -> crate::Result<FederatedTrustRotation> {
+        if request_id.trim().is_empty() || request_id.len() > 64 {
+            return Err(crate::DatspoolError::Configuration(
+                "request_id must contain 1-64 bytes".into(),
+            ));
+        }
+        let rotation = self.get_rotation(rotation_id).await?;
+        let diagnostics = self.inspect_bilateral(rotation_id).await?;
+        if !diagnostics.safety_violations.is_empty() {
+            return Err(crate::DatspoolError::Internal(format!(
+                "automatic recovery is blocked by federation safety violations: {}",
+                diagnostics.safety_violations.join("; ")
+            )));
+        }
+        if diagnostics.peer.phase == FederatedTrustRotationPhase::RollingBack
+            && matches!(
+                rotation.phase,
+                FederatedTrustRotationPhase::Staging
+                    | FederatedTrustRotationPhase::AwaitingDeployment
+                    | FederatedTrustRotationPhase::ActivationBarrier
+                    | FederatedTrustRotationPhase::RolledBack
+            )
+            && !diagnostics.local.activation_barrier_committed
+            && !diagnostics.peer.activation_barrier_committed
+        {
+            let reason = diagnostics.peer.rollback_reason.as_deref().ok_or_else(|| {
+                crate::DatspoolError::Internal(
+                    "peer RollingBack state has no persisted rollback reason".into(),
+                )
+            })?;
+            return self
+                .rollback_before_activation(rotation_id, reason, request_id, actor)
+                .await;
+        }
+        match rotation.phase {
+            FederatedTrustRotationPhase::Staging => {
+                self.start_rotation(
+                    &rotation.rotation_id,
+                    &rotation.peer_cluster_id,
+                    rotation.local_ca_bundle_pem.clone(),
+                    rotation.peer_ca_bundle_pem.clone(),
+                    &rotation.local_leaf_fingerprint,
+                    &rotation.peer_leaf_fingerprint,
+                    rotation.overlap_ms,
+                    request_id,
+                    actor,
+                )
+                .await
+            }
+            FederatedTrustRotationPhase::ActivationBarrier => {
+                let peer = self.peer_record(&rotation.peer_cluster_id).await?;
+                let mut client = self.connect_peer(&peer).await?;
+                let response = client
+                    .get_remote_trust_rotation(&self.local_cluster_id, rotation_id)
+                    .await?;
+                if !response.accepted {
+                    return Err(crate::DatspoolError::Internal(
+                        "peer rejected the activation-barrier recovery read".into(),
+                    ));
+                }
+                let remote: FederatedTrustRotationSnapshot =
+                    serde_json::from_str(&response.state_json)
+                        .map_err(|error| crate::DatspoolError::Serialization(error.to_string()))?;
+                if !rotation.activation_barrier_committed
+                    && !remote.rotation.activation_barrier_committed
+                {
+                    return Ok(rotation);
+                }
+                self.authorize_activation(rotation_id, request_id, actor)
+                    .await?;
+                self.activate_both(rotation_id, request_id, actor).await
+            }
+            FederatedTrustRotationPhase::Activating
+            | FederatedTrustRotationPhase::RecoveryRequired => {
+                self.authorize_activation(rotation_id, request_id, actor)
+                    .await?;
+                self.activate_both(rotation_id, request_id, actor).await
+            }
+            FederatedTrustRotationPhase::RollingBack => {
+                let reason = rotation.rollback_reason.as_deref().ok_or_else(|| {
+                    crate::DatspoolError::Internal(
+                        "rolling-back rotation has no persisted rollback reason".into(),
+                    )
+                })?;
+                match self
+                    .rollback_before_activation(rotation_id, reason, request_id, actor)
+                    .await
+                {
+                    Ok(rotation) => Ok(rotation),
+                    Err(error) => {
+                        let current = self.get_rotation(rotation_id).await?;
+                        if current.phase != FederatedTrustRotationPhase::RecoveryRequired {
+                            return Err(error);
+                        }
+                        self.authorize_activation(rotation_id, request_id, actor)
+                            .await?;
+                        self.activate_both(rotation_id, request_id, actor).await
+                    }
+                }
+            }
+            FederatedTrustRotationPhase::Overlap | FederatedTrustRotationPhase::Retiring => {
+                let deadline = rotation
+                    .local_activation_expires_at_ms
+                    .zip(rotation.peer_activation_expires_at_ms)
+                    .map(|(local, peer)| local.max(peer))
+                    .ok_or_else(|| {
+                        crate::DatspoolError::Internal(
+                            "overlap or retiring rotation is missing a committed expiry".into(),
+                        )
+                    })?;
+                if chrono::Utc::now().timestamp_millis() < deadline {
+                    return Ok(rotation);
+                }
+                self.retire_both(rotation_id, request_id, actor).await
+            }
+            FederatedTrustRotationPhase::Completed => {
+                if matches!(
+                    diagnostics.peer.phase,
+                    FederatedTrustRotationPhase::Overlap | FederatedTrustRotationPhase::Retiring
+                ) {
+                    let deadline = rotation
+                        .local_activation_expires_at_ms
+                        .zip(rotation.peer_activation_expires_at_ms)
+                        .map(|(local, peer)| local.max(peer));
+                    if deadline.is_some_and(|value| chrono::Utc::now().timestamp_millis() >= value)
+                    {
+                        return self.retire_both(rotation_id, request_id, actor).await;
+                    }
+                }
+                Ok(rotation)
+            }
+            FederatedTrustRotationPhase::AwaitingDeployment
+            | FederatedTrustRotationPhase::RolledBack => Ok(rotation),
+        }
+    }
+
     async fn advance_local(
         &self,
         rotation_id: &str,
@@ -1759,5 +2339,184 @@ impl FederatedTrustRotationCoordinator {
         } else {
             Err(crate::DatspoolError::Internal(response.message))
         }
+    }
+}
+
+#[cfg(test)]
+mod diagnostics_tests {
+    use super::*;
+
+    fn snapshots(
+        local_phase: FederatedTrustRotationPhase,
+        peer_phase: FederatedTrustRotationPhase,
+    ) -> (
+        FederatedTrustRotationSnapshot,
+        FederatedTrustRotationSnapshot,
+    ) {
+        let local = FederatedTrustRotation {
+            rotation_id: "diagnostic-rotation".into(),
+            peer_cluster_id: "target".into(),
+            current_peer_ca_fingerprint: Some("0".repeat(64)),
+            local_ca_bundle_pem: "local-ca-pem".into(),
+            local_ca_bundle_fingerprint: "a".repeat(64),
+            peer_ca_bundle_pem: "peer-ca-pem".into(),
+            peer_ca_bundle_fingerprint: "b".repeat(64),
+            local_leaf_fingerprint: "c".repeat(64),
+            peer_leaf_fingerprint: "d".repeat(64),
+            overlap_ms: 60_000,
+            phase: local_phase,
+            local_staged: true,
+            peer_staged: true,
+            local_deployment_ready: true,
+            peer_deployment_ready: true,
+            activation_barrier_committed: false,
+            local_activation_expires_at_ms: None,
+            peer_activation_expires_at_ms: None,
+            local_retired: false,
+            peer_retired: false,
+            rollback_reason: Some("operator requested rollback".into()),
+            rollback_peer_confirmed: false,
+            last_error: None,
+            revision: 5,
+            created_at_ms: 1,
+            updated_at_ms: 99_000,
+        };
+        let peer = FederatedTrustRotation {
+            rotation_id: "diagnostic-rotation".into(),
+            peer_cluster_id: "source".into(),
+            current_peer_ca_fingerprint: Some("0".repeat(64)),
+            local_ca_bundle_pem: "peer-ca-pem".into(),
+            local_ca_bundle_fingerprint: "b".repeat(64),
+            peer_ca_bundle_pem: "local-ca-pem".into(),
+            peer_ca_bundle_fingerprint: "a".repeat(64),
+            local_leaf_fingerprint: "d".repeat(64),
+            peer_leaf_fingerprint: "c".repeat(64),
+            overlap_ms: 60_000,
+            phase: peer_phase,
+            local_staged: true,
+            peer_staged: true,
+            local_deployment_ready: true,
+            peer_deployment_ready: true,
+            activation_barrier_committed: false,
+            local_activation_expires_at_ms: None,
+            peer_activation_expires_at_ms: None,
+            local_retired: false,
+            peer_retired: false,
+            rollback_reason: None,
+            rollback_peer_confirmed: false,
+            last_error: None,
+            revision: 4,
+            created_at_ms: 1,
+            updated_at_ms: 99_500,
+        };
+        let snapshot = |rotation: FederatedTrustRotation| FederatedTrustRotationSnapshot {
+            rotation,
+            peer_active_ca_fingerprint: Some("0".repeat(64)),
+            peer_pending_ca_fingerprint: None,
+            peer_previous_ca_fingerprint: None,
+            peer_previous_ca_expires_at_ms: None,
+            peer_active_identity_fingerprint: "e".repeat(64),
+            peer_pending_identity_fingerprint: None,
+        };
+        (snapshot(local), snapshot(peer))
+    }
+
+    #[test]
+    fn diagnostics_recommend_resume_for_pre_activation_rollback_drift() {
+        let (local, peer) = snapshots(
+            FederatedTrustRotationPhase::RollingBack,
+            FederatedTrustRotationPhase::ActivationBarrier,
+        );
+        let diagnostics = build_rotation_diagnostics(
+            "diagnostic-rotation",
+            "source",
+            "target",
+            local,
+            peer,
+            100_000,
+        );
+        assert!(!diagnostics.state_aligned);
+        assert!(diagnostics.safety_violations.is_empty());
+        assert_eq!(
+            diagnostics.recommended_action,
+            FederatedTrustRotationRecoveryAction::ResumeRollback
+        );
+        assert!(diagnostics.automated_recovery_safe);
+        let serialized = serde_json::to_string(&diagnostics).unwrap();
+        assert!(!serialized.contains("local-ca-pem"));
+        assert!(!serialized.contains("peer-ca-pem"));
+    }
+
+    #[test]
+    fn diagnostics_promote_unconfirmed_rollback_when_peer_barrier_committed() {
+        let (local, mut peer) = snapshots(
+            FederatedTrustRotationPhase::RollingBack,
+            FederatedTrustRotationPhase::Activating,
+        );
+        peer.rotation.activation_barrier_committed = true;
+        let diagnostics = build_rotation_diagnostics(
+            "diagnostic-rotation",
+            "source",
+            "target",
+            local,
+            peer,
+            100_000,
+        );
+        assert!(diagnostics.safety_violations.is_empty());
+        assert_eq!(
+            diagnostics.recommended_action,
+            FederatedTrustRotationRecoveryAction::ForwardRecovery
+        );
+        assert!(diagnostics.automated_recovery_safe);
+    }
+
+    #[test]
+    fn diagnostics_choose_forward_recovery_after_peer_activation_commit() {
+        let (local, mut peer) = snapshots(
+            FederatedTrustRotationPhase::RollingBack,
+            FederatedTrustRotationPhase::Activating,
+        );
+        peer.rotation.local_activation_expires_at_ms = Some(160_000);
+        peer.peer_active_ca_fingerprint = Some(peer.rotation.peer_ca_bundle_fingerprint.clone());
+        peer.peer_previous_ca_fingerprint = Some("0".repeat(64));
+        peer.peer_previous_ca_expires_at_ms = Some(160_000);
+        let diagnostics = build_rotation_diagnostics(
+            "diagnostic-rotation",
+            "source",
+            "target",
+            local,
+            peer,
+            100_000,
+        );
+        assert!(diagnostics.safety_violations.is_empty());
+        assert_eq!(
+            diagnostics.recommended_action,
+            FederatedTrustRotationRecoveryAction::ForwardRecovery
+        );
+        assert!(diagnostics.automated_recovery_safe);
+    }
+
+    #[test]
+    fn diagnostics_require_manual_intervention_for_confirmed_rollback_conflict() {
+        let (mut local, mut peer) = snapshots(
+            FederatedTrustRotationPhase::RollingBack,
+            FederatedTrustRotationPhase::Activating,
+        );
+        peer.rotation.activation_barrier_committed = true;
+        local.rotation.rollback_peer_confirmed = true;
+        let diagnostics = build_rotation_diagnostics(
+            "diagnostic-rotation",
+            "source",
+            "target",
+            local,
+            peer,
+            100_000,
+        );
+        assert!(!diagnostics.safety_violations.is_empty());
+        assert_eq!(
+            diagnostics.recommended_action,
+            FederatedTrustRotationRecoveryAction::ManualInterventionRequired
+        );
+        assert!(!diagnostics.automated_recovery_safe);
     }
 }
