@@ -7,11 +7,15 @@ The binary starts the DLQ management HTTP API. It uses the same RocksDB director
 ```bash
 export DATASPOOL_DB_PATH=/var/lib/dataspool
 export DATASPOOL_ADMIN_TOKEN="$(openssl rand -hex 32)"
+# Alternative: use distinct tokens, one per operator (this replaces DATASPOOL_ADMIN_TOKEN):
+# export DATASPOOL_ADMIN_OPERATORS='{"oncall-platform":"<64-hex-character-token>"}'
 export DATASPOOL_HTTP_BIND=127.0.0.1:8080
 cargo run --release
 ```
 
 The bearer token must be at least 32 bytes. Do not expose this service directly to the public network. Keep the default loopback bind or put it behind a TLS-terminating reverse proxy with network allow-listing. The HTML shell at `/admin/dlq` is public but contains no data; all `/api/v1/...` endpoints require `Authorization: Bearer <token>`. Responses are marked `Cache-Control: no-store`.
+
+`GET /api/v1/session` returns the server-resolved operator ID for the authenticated bearer token. With `DATASPOOL_ADMIN_OPERATORS`, each operator has an independent token and audit identity. The caller-supplied `X-Dataspool-Actor` header is overwritten after authentication. Legacy `DATASPOOL_ADMIN_TOKEN` remains supported as the shared `admin` identity.
 
 ## API
 
@@ -48,3 +52,6 @@ tests/run_es_multinode.sh 8x
 ```
 
 The script starts the selected cluster, waits for health, runs the compatibility suite with a three-node assertion, exercises high-concurrency Bulk delivery and requires the real `DocumentSink` to report at least one retried document (HTTP 429 path), runs a sustained soak (default 300 seconds), then removes the cluster and volumes. Set `ES_SOAK_SECONDS=0` to omit the soak; keep `ES_REQUIRE_429=1` for acceptance testing. The disposable cluster uses a one-entry write queue and disables disk allocation thresholds to make pressure testing more reproducible; never use those settings in production.
+
+
+For individually attributable operator sessions, set `DATASPOOL_ADMIN_OPERATORS` to a JSON object mapping operator IDs to unique bearer tokens (minimum 32 bytes each). When configured, this credential set replaces the legacy single `DATASPOOL_ADMIN_TOKEN`; the `/api/v1/session` endpoint returns the authenticated actor ID. Caller-supplied `X-Dataspool-Actor` values are ignored and overwritten after token authentication.

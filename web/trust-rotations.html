@@ -16,7 +16,7 @@
 <div class="shell">
 <header class="topline"><div class="brand"><span class="brand-mark">D</span>DATASPOOL</div><span class="crumb">/ federation / trust rotations</span><div class="top-actions"><span class="connection"><i class="dot" id="connection-dot"></i><span id="connection-label">Not connected</span></span><a href="/admin/dlq" style="font-size:11px;text-decoration:none">Dead letter queue ↗</a></div></header>
 <section class="intro"><div><p class="eyebrow">Federation control plane / operator workspace</p><h1>Trust rotation<br>operations.</h1><p>Inspect both Raft groups, verify certificate overlap and recover stalled rotations without crossing the lifecycle safety boundary.</p></div><div class="intro-side">BILATERAL STATE · RAFT AUDIT<br><span id="observed-at">NO OBSERVATION YET</span></div></section>
-<section class="panel access" aria-label="Admin connection"><label>Admin bearer token<input id="token" type="password" autocomplete="off" placeholder="DATASPOOL_ADMIN_TOKEN"></label><label>Operator identity<input id="actor" maxlength="128" autocomplete="username" placeholder="e.g. oncall-platform"></label><button class="primary" id="connect">Connect &amp; load</button></section>
+<section class="panel access" aria-label="Admin connection"><label>Operator bearer token<input id="token" type="password" autocomplete="off" placeholder="Operator token (legacy DATASPOOL_ADMIN_TOKEN also works)"></label><div class="muted" style="font-size:11px">Operator identity is resolved from the authenticated bearer credential.</div><button class="primary" id="connect">Connect &amp; load</button></section>
 <section class="stats" aria-label="Rotation summary"><div class="panel stat"><div class="stat-label">Active on page</div><div class="stat-value" id="stat-active">—</div><div class="stat-foot">Non-terminal lifecycle records</div></div><div class="panel stat"><div class="stat-label">Stalled</div><div class="stat-value" id="stat-stalled">—</div><div class="stat-foot">Bilateral diagnostics confirmed</div></div><div class="panel stat"><div class="stat-label">Forward recovery</div><div class="stat-value" id="stat-forward">—</div><div class="stat-foot">Activation barrier committed</div></div><div class="panel stat"><div class="stat-label">Manual intervention</div><div class="stat-value" id="stat-manual">—</div><div class="stat-foot">Safety invariant requires review</div></div></section>
 <section class="panel"><div class="toolbar"><strong style="font-size:12px">Rotation registry</strong><span class="spacer"></span><label for="phase-filter">Phase</label><select id="phase-filter"><option value="">All phases</option><option>staging</option><option>awaiting_deployment</option><option>activation_barrier</option><option>activating</option><option>recovery_required</option><option>overlap</option><option>retiring</option><option>completed</option><option>rolling_back</option><option>rolled_back</option></select><label for="peer-filter">Peer</label><input id="peer-filter" placeholder="Cluster ID" style="width:150px;padding:7px 9px;font-size:12px"><button id="refresh">Refresh</button></div><div class="table-wrap"><table><thead><tr><th>Rotation / peer</th><th>Phase</th><th>Progress</th><th>Barrier</th><th>Last updated</th><th></th></tr></thead><tbody id="rotation-rows"><tr><td colspan="6" class="empty">Connect with an administrator token to inspect rotations.</td></tr></tbody></table></div><div class="pager"><span id="page-info">0 rotations</span><button id="prev" disabled>Previous</button><button id="next" disabled>Next</button></div></section>
 <div class="message" id="message" role="status" aria-live="polite"></div>
@@ -37,7 +37,7 @@
   const fingerprint = value => value ? `<span class="fingerprint">${esc(value)}</span>` : '—';
   const phaseClass = value => String(value || '').toLowerCase();
   const say = message => { $('message').textContent = message; };
-  const headers = (json=false) => ({ 'Authorization':`Bearer ${state.token}`, 'X-Dataspool-Actor':state.actor, ...(json ? {'Content-Type':'application/json'} : {}) });
+  const headers = (json=false) => ({ 'Authorization':`Bearer ${state.token}`, ...(json ? {'Content-Type':'application/json'} : {}) });
   async function api(path, options={}) {
     const response = await fetch(path, { ...options, cache:'no-store', headers:{...headers(!!options.body), ...(options.headers||{})} });
     if (!response.ok) {
@@ -47,7 +47,7 @@
     }
     return response.status===204 ? null : response.json();
   }
-  function ready() { state.token=$('token').value.trim(); state.actor=$('actor').value.trim(); return state.token.length>=32 && state.actor.length>0 && state.actor.length<=128; }
+  function ready() { state.token=$('token').value.trim(); return state.token.length>=32; }
   function kv(label, value) { return `<div class="kv"><span class="k">${esc(label)}</span><span class="v">${value}</span></div>`; }
   function sideMarkup(side) {
     return [kv('Cluster',esc(side.cluster_id)),kv('Phase',`<span class="phase ${phaseClass(side.phase)}">${esc(phaseNames[side.phase]||side.phase)}</span>`),kv('Revision',esc(side.revision)),kv('CA bundle fingerprint',fingerprint(side.local_ca_bundle_fingerprint)),kv('Peer CA fingerprint',fingerprint(side.peer_ca_bundle_fingerprint)),kv('Leaf fingerprint',fingerprint(side.local_leaf_fingerprint)),kv('Peer leaf fingerprint',fingerprint(side.peer_leaf_fingerprint)),kv('Activation barrier',side.activation_barrier_committed?'COMMITTED':'Not committed'),kv('Local expiry',esc(fmtExpiry(side.local_activation_expires_at_ms))),kv('Peer expiry',esc(fmtExpiry(side.peer_activation_expires_at_ms))),kv('Deployment ready',`${side.local_deployment_ready?'Local ✓':'Local —'} / ${side.peer_deployment_ready?'Peer ✓':'Peer —'}`),kv('Retired',`${side.local_retired?'Local ✓':'Local —'} / ${side.peer_retired?'Peer ✓':'Peer —'}`),kv('Updated',esc(fmtTime(side.updated_at_ms))),side.last_error?kv('Last error',esc(side.last_error)): ''].join('');
@@ -55,8 +55,9 @@
 
   async function loadPage() {
     if (!ready()) { say('Enter a valid admin token (at least 32 characters) and operator identity.'); return; }
-    state.loading=true; $('connect').disabled=true; $('refresh').disabled=true; say('Reading sanitized rotation records…');
+    state.loading=true; state.actor=''; $('connect').disabled=true; $('refresh').disabled=true; say('Authenticating operator and reading sanitized rotation records…');
     try {
+      const session=await api('/api/v1/session'); state.actor=session.actor;
       const params=new URLSearchParams({limit:String(state.limit),offset:String(state.offset)});
       if ($('phase-filter').value) params.set('phase',$('phase-filter').value);
       if ($('peer-filter').value.trim()) params.set('peer_cluster_id',$('peer-filter').value.trim());
@@ -116,16 +117,18 @@
     $('recover').disabled=true; $('recover-result').textContent='Submitting constrained recovery request…';
     try {
       const result=await api(`/api/v1/federation/trust-rotations/${encodeURIComponent(id)}/recover`,{method:'POST',body:JSON.stringify({request_id:requestId,expected_action:action})});
-      $('recover-result').textContent=`Accepted: ${actionNames[result.expected_action]||result.expected_action}\nBefore: ${result.before.local.phase} / ${result.before.peer.phase}\nAfter: ${result.after.local.phase} / ${result.after.peer.phase}\nAudit request: ${requestId}\nOperator: ${state.actor}`;
-      say('Recovery request completed. Refreshing durable diagnostics and audit history…'); await loadPage(); await openDetail(id);
+      const successText=`Committed: ${actionNames[result.expected_action]||result.expected_action}\nBefore: ${result.before.local.phase} / ${result.before.peer.phase}\nAfter: ${result.after.local.phase} / ${result.after.peer.phase}\nAudit request: ${requestId}\nAuthenticated operator: ${state.actor}`;
+      say('Recovery committed. Refreshing durable diagnostics and audit history…'); await loadPage(); await openDetail(id);
+      $('recover-result').textContent=successText;
+      say('Recovery and its operator outcome are committed. Bilateral diagnostics and audit history have been refreshed.');
     } catch(error) {
       const uncertain=!error.status || error.status>=500;
-      $('recover-result').textContent=uncertain
-        ? `Recovery outcome is not confirmed: ${error.message}\nRequest ID: ${requestId}\nDo not retry yet. Refresh the replicated audit history and bilateral diagnostics to determine whether the Raft operation committed.`
-        : `Recovery was rejected: ${error.message}\nRequest ID: ${requestId}\nRefresh diagnostics before creating a new request.`;
-      say(uncertain?'Recovery outcome is uncertain. Inspect audit history before retrying.':error.message);
-      if(uncertain){ await loadPage(); await openDetail(id); $('recover-result').textContent=`Recovery outcome is not confirmed: ${error.message}\nRequest ID: ${requestId}\nThe refreshed audit history is shown below. Do not retry until the outcome is established.`; }
-      else $('recover').disabled=false;
+      const summary=uncertain
+        ? `Recovery outcome is not confirmed: ${error.message}`
+        : `Recovery request returned HTTP ${error.status}: ${error.message}`;
+      say(uncertain?'Recovery outcome is uncertain. Refreshing bilateral state and audit history; do not retry yet.':'Recovery request did not complete normally. Refreshing bilateral state and audit history.');
+      await loadPage(); await openDetail(id);
+      $('recover-result').textContent=`${summary}\nRequest ID: ${requestId}\nAuthenticated operator: ${state.actor}\nReview the refreshed bilateral diagnostics and replicated audit history before retrying.`;
     }
   }
   $('connect').addEventListener('click',()=>{if(ready())loadPage();}); $('refresh').addEventListener('click',loadPage); $('phase-filter').addEventListener('change',()=>{state.offset=0;loadPage();}); $('peer-filter').addEventListener('keydown',e=>{if(e.key==='Enter'){state.offset=0;loadPage();}}); $('prev').addEventListener('click',()=>{state.offset=Math.max(0,state.offset-state.limit);loadPage();}); $('next').addEventListener('click',()=>{state.offset+=state.limit;loadPage();}); $('close-detail').addEventListener('click',()=>{$('detail').classList.remove('visible');state.selected=null;});

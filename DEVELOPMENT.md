@@ -121,6 +121,12 @@ Dataspool 旨在解决以上痛点，提供一个延迟低、扩展性强、部�
 
 Trust Rotation Operator UI 位于 `web/trust-rotations.html`，由 Axum 内嵌并通过 `/admin/trust-rotations` 提供。修改页面后运行 `scripts/check_trust_rotation_ui.sh` 检查内联 JavaScript 语法；Rust 路由和鉴权行为由 CI 单元测试覆盖。
 
+## 5.4 Rust engineering skills
+
+项目级 Rust Agent Skills 安装在 `.agents/skills/rust-*`，来源为 `full-stack-skills/rust-skills`，固定上游 commit 记录在 `skills-lock.json`。本项目选用了语言基础、标准库、API 设计、Cargo/依赖治理、并发、测试、Axum Web、安全、数据库、可观测性和代码审查等 14 个专项技能；`rust-dataspool` 叠加仓库自身的 Raft、证书轮换、ES 兼容性和测试约束。上游许可证为 Apache-2.0，见 `.agents/skills/rust-skills-LICENSE`。只安装了 Markdown 指引、参考资料和示例，没有复制上游脚本、插件、CI 或自动执行钩子。
+
+新增/更新技能后运行 `python3 scripts/check_agent_skills.py`，检查 frontmatter、500 行限制和本地引用；CI 自动执行该检查。技能中的 Rust 1.97.1 版本信息只是上游资料快照，Dataspool 必须以自身 toolchain/MSRV 和 `Cargo.lock` 为准。
+
 ## 6. 配置文件规范
 
 ### 5.1 集群配置示例 (config/dataspool-cluster.yaml)

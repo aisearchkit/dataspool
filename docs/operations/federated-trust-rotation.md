@@ -1,6 +1,6 @@
 # Federated trust rotation operations
 
-All endpoints below require the Dataspool admin bearer token and should remain on the loopback interface or behind a trusted TLS-terminating proxy.
+All endpoints below require the Dataspool admin bearer token and should remain on the loopback interface or behind a trusted TLS-terminating proxy. Prefer `DATASPOOL_ADMIN_OPERATORS` for individually attributable operators; see the Operator recovery UI section. The legacy single-token mode identifies all requests as `admin`.
 
 ## Lifecycle safety boundary
 
@@ -38,7 +38,7 @@ Stall thresholds are 60 seconds for Staging, 15 seconds for ActivationBarrier af
     curl -sS -X POST \
       -H "Authorization: Bearer $DATASPOOL_ADMIN_TOKEN" \
       -H 'Content-Type: application/json' \
-      -d '{"request_id":"operator-recovery-20261128-01"}' \
+      -d '{"request_id":"operator-recovery-20261128-01","expected_action":"forward_recovery"}' \
       "http://127.0.0.1:8080/api/v1/federation/trust-rotations/$ROTATION_ID/recover"
 
 The endpoint reads the persisted phase and invokes only the corresponding coordinator operation. It does not directly edit Raft state, skip deployment readiness, bypass the activation barrier, shorten the overlap, or force CA retirement. AwaitingDeployment and an uncommitted ActivationBarrier remain waiting states. If diagnostics report manual_intervention_required, this endpoint refuses to proceed.
@@ -51,7 +51,7 @@ Every recovery request must include a unique operator-supplied request ID (1-64 
       -H "Authorization: Bearer $DATASPOOL_ADMIN_TOKEN" \
       "http://127.0.0.1:8080/api/v1/federation/trust-rotations/$ROTATION_ID/audit?limit=100"
 
-The endpoint returns the newest audit records for the exact federated_trust_rotation:$ROTATION_ID resource. Records include actor, request ID, action, previous/next phase, timestamp, and committed Raft log index. Each record also includes an `outcome` (`committed`, `failed`, or `rejected`) and optional bounded `details`. Successful lifecycle transitions are recorded atomically with their state mutation. Failed or rejected operator API operations are recorded by a separate audit-only Raft command: this preserves the current rotation state while assigning the audit record its actual committed Raft index. The original operator request ID and authenticated actor are retained. If the audit-only Raft proposal itself cannot commit, the API logs that audit persistence failure; it does not fabricate a local record or index.
+The endpoint returns the newest audit records for the exact federated_trust_rotation:$ROTATION_ID resource. Records include actor, request ID, action, previous/next phase, timestamp, and committed Raft log index. Each record also includes an `outcome` (`committed`, `failed`, or `rejected`) and optional bounded `details`. Successful lifecycle transitions are recorded atomically with their state mutation. Failed or rejected operator API operations are recorded by a separate audit-only Raft command: this preserves the current rotation state while assigning the audit record its actual committed Raft index. The original operator request ID and authenticated actor are retained. If the audit-only Raft proposal itself cannot commit, the recovery API logs the request ID and returns `503` rather than reporting a normal success; it does not fabricate a local record or index. The operator must inspect bilateral state and the Raft audit stream before retrying.
 
 ## Prometheus metrics
 
@@ -117,13 +117,19 @@ This single-resource endpoint returns the local durable rotation record. Use the
 
 ## Operator recovery UI
 
-Open `http://127.0.0.1:8080/admin/trust-rotations` from the trusted admin network. The page itself is a static shell; all data requests require the same administrator bearer token as the REST API. Enter an operator identity explicitly. The UI sends it as an audit attribution label in `X-Dataspool-Actor`; the bearer token authenticates API access, but this self-entered label is not independently authenticated. In production, a trusted reverse proxy should strip caller-supplied actor headers and inject the verified identity. The API records the resulting actor label and request ID in the replicated audit stream.
+Open `http://127.0.0.1:8080/admin/trust-rotations` from the trusted admin network. The page itself is a static shell; all data requests require a bearer token. Configure individual credentials with `DATASPOOL_ADMIN_OPERATORS` as a JSON object mapping immutable operator IDs to unique high-entropy tokens (each at least 32 bytes), for example `{"oncall-platform":"<token-1>","security-duty":"<token-2>"}`. The UI calls `GET /api/v1/session` after authentication and displays the actor identity resolved by the server. The authenticated actor is derived from the matching bearer credential; any caller-supplied `X-Dataspool-Actor` header is overwritten by the authentication middleware and cannot choose the audit identity. The legacy `DATASPOOL_ADMIN_TOKEN` remains supported as a single `admin` principal for compatibility, but it cannot distinguish individual operators. Prefer per-operator credentials in production and rotate/revoke them through deployment secret management.
 
 The registry uses the dedicated `GET /api/v1/federation/trust-rotations/operator-view` projection. It intentionally omits both CA bundle PEM fields and exposes only public fingerprints, lifecycle flags, revisions and expiry metadata. Each visible row loads bilateral diagnostics with bounded client concurrency. Selecting a rotation loads the authoritative bilateral view and up to 100 audit events, including actor, request ID, outcome and committed Raft index.
 
-The UI enables recovery only when `recommended_action` is automatically recoverable, `automated_recovery_safe` is true, and `safety_violations` is empty. An operator must type the exact rotation ID and confirm the operation. The browser submits only `request_id` and the observed `expected_action` to the existing `POST /recover` endpoint. The server independently re-reads bilateral diagnostics and remains the sole authority; stale or unsafe submissions are rejected and audited.
+The UI enables recovery only when `recommended_action` is automatically recoverable, `automated_recovery_safe` is true, and `safety_violations` is empty. An operator must type the exact rotation ID and confirm the operation. The browser submits only `request_id` and the observed `expected_action` to the existing `POST /recover` endpoint. The server independently re-reads bilateral diagnostics and remains the sole authority; stale or unsafe submissions are rejected and audited. A successful lifecycle transition is not reported as a fully successful operator request unless its explicit `committed` outcome event is also appended to Raft. If that audit append fails, the API returns `503` with an indeterminate-outcome message; inspect bilateral state and the audit stream before retrying.
 
 If either side has committed `ActivationBarrier`, the UI displays an irreversible-boundary warning and never offers rollback. The server-side coordinator remains authoritative even if a browser is stale, modified or bypassed. The UI does not call deployment-ready, authorize-activation, activate, retire or rollback endpoints.
+
+## Live deployment smoke check
+
+After building the deployable binary, run `scripts/smoke_trust_rotation_deployment.sh`. It starts an isolated one-node Raft Dataspool process with a temporary self-signed CA/server certificate, enables the real mTLS gRPC listener and federation coordinator, and verifies the HTTP operator UI, anonymous rejection, per-operator bearer authentication, actor-header spoofing resistance, sanitized registry, and `Cache-Control: no-store`. It then sends a deliberately invalid recovery request and reads back the failure event from the live Raft audit endpoint, checking the authenticated actor, request ID, outcome and nonzero committed log index. The test does not create or mutate a real certificate rotation; bilateral success/failure paths remain covered by the federation process E2E suite.
+
+The legacy `DATASPOOL_ADMIN_TOKEN` mode maps all requests to the `admin` principal and therefore cannot provide individual attribution. Production deployments should use distinct `DATASPOOL_ADMIN_OPERATORS` tokens and protect the UI/API with TLS and network access controls. Tokens are deployment secrets; never commit the JSON value to configuration files.
 
 ## Confirm a manual recovery
 
@@ -135,6 +141,6 @@ The existing POST /recover endpoint now requires the action observed in the late
       -d '{"request_id":"operator-recovery-20261128-02","expected_action":"forward_recovery"}' \
       "http://127.0.0.1:8080/api/v1/federation/trust-rotations/$ROTATION_ID/recover"
 
-The request is rejected with HTTP 409 if the expected action is stale, automated recovery is not safe, or either cluster reports a safety violation. The coordinator independently re-reads bilateral diagnostics and checks the expected action before acting, so a stale operator view cannot authorize a different recovery path. The response contains both the before and after bilateral diagnostics. The operator identity is derived from the authenticated request and the request ID is included in replicated lifecycle audit events.
+The request is rejected with HTTP 409 if the expected action is stale, automated recovery is not safe, or either cluster reports a safety violation. The coordinator independently re-reads bilateral diagnostics and checks the expected action before acting, so a stale operator view cannot authorize a different recovery path. The response contains both the before and after bilateral diagnostics. The operator identity is resolved from the bearer token by the server authentication middleware; `X-Dataspool-Actor` is overwritten and never trusted as an identity source. `GET /api/v1/session` returns the authenticated actor used by the UI. The request ID is included in replicated lifecycle audit events.
 
 Manual recovery cannot select an arbitrary transition. It cannot force rollback after activation, authorize activation while deployment readiness is missing, or retire a CA before the persisted overlap deadline. If diagnostics recommend await_operator or manual_intervention_required, the recovery endpoint refuses the request.

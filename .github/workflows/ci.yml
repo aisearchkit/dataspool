@@ -17,6 +17,7 @@ on:
       - 'deploy/compose/**'
       - 'deploy/prometheus/**'
       - 'docs/operations/federated-trust-rotation.md'
+      - 'docs/operations/dlq-admin-api.md'
       - 'scripts/**'
       - 'web/**'
       - '.agents/skills/**'
@@ -38,6 +39,7 @@ on:
       - 'deploy/compose/**'
       - 'deploy/prometheus/**'
       - 'docs/operations/federated-trust-rotation.md'
+      - 'docs/operations/dlq-admin-api.md'
       - 'scripts/**'
       - 'web/**'
       - '.agents/skills/**'
@@ -74,6 +76,8 @@ jobs:
           node-version: 24
       - name: Check inline operator UI JavaScript
         run: scripts/check_trust_rotation_ui.sh
+      - name: Validate installed Rust Agent Skills
+        run: python3 scripts/check_agent_skills.py
 
   unit-test:
     name: Unit Tests
@@ -108,3 +112,7 @@ jobs:
         run: cargo test --test postgres_cutover -- --nocapture
       - name: Run multi-member Raft failover integration
         run: cargo test --test raft_failover --all-features -- --nocapture
+      - name: Build deployable Dataspool binary
+        run: cargo build --bin dataspool
+      - name: Smoke-test deployed operator recovery API and authenticated audit identity
+        run: scripts/smoke_trust_rotation_deployment.sh

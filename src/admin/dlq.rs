@@ -36,9 +36,15 @@ const MAX_PAGE_SIZE: usize = 200;
 const MAX_REPLAY_IDS: usize = 100;
 
 #[derive(Clone)]
+struct OperatorCredential {
+    token: Arc<[u8]>,
+    actor: Arc<str>,
+}
+
+#[derive(Clone)]
 struct ApiState<S: KvStore + Clone> {
     tasks: Arc<TaskStore<S>>,
-    token: Arc<[u8]>,
+    operator_credentials: Arc<Vec<OperatorCredential>>,
     operation_lock: Arc<tokio::sync::Mutex<()>>,
     raft: Option<Arc<RaftNode>>,
     trust_rotation_coordinator: Option<Arc<FederatedTrustRotationCoordinator>>,
@@ -50,18 +56,54 @@ pub struct DlqApi<S: KvStore + Clone> {
 }
 
 impl<S: KvStore + Clone + 'static> DlqApi<S> {
-    /// Construct the API. A non-empty, high-entropy administrator token is mandatory.
+    /// Construct the API with a single administrator credential.
+    /// The authenticated principal is `admin`; caller-supplied actor headers are ignored.
     pub fn new(tasks: Arc<TaskStore<S>>, admin_token: impl Into<String>) -> crate::Result<Self> {
-        let token = admin_token.into();
-        if token.len() < 32 {
+        Self::new_with_operators(tasks, vec![("admin".into(), admin_token.into())])
+    }
+
+    /// Construct the API with individually attributable operator credentials.
+    /// Each actor is derived from the token that authenticated the request.
+    pub fn new_with_operators(
+        tasks: Arc<TaskStore<S>>,
+        credentials: Vec<(String, String)>,
+    ) -> crate::Result<Self> {
+        if credentials.is_empty() || credentials.len() > 128 {
             return Err(crate::DatspoolError::Configuration(
-                "DLQ admin token must contain at least 32 bytes".into(),
+                "DLQ operator credential count must be between 1 and 128".into(),
             ));
+        }
+        let mut actors = std::collections::HashSet::new();
+        let mut tokens = std::collections::HashSet::new();
+        let mut operator_credentials = Vec::with_capacity(credentials.len());
+        for (actor, token) in credentials {
+            let valid_actor = !actor.is_empty()
+                && actor.len() <= 128
+                && actor
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"._@-".contains(&byte));
+            if !valid_actor || !actors.insert(actor.clone()) {
+                return Err(crate::DatspoolError::Configuration(
+                    "DLQ operator identities must be unique, 1-128 ASCII letters, digits, '.', '_', '@' or '-'".into(),
+                ));
+            }
+            if !(32..=4096).contains(&token.len())
+                || !token.bytes().all(|byte| (0x21..=0x7e).contains(&byte))
+                || !tokens.insert(token.clone())
+            {
+                return Err(crate::DatspoolError::Configuration(
+                    "DLQ operator tokens must be unique, 32-4096 bytes, and contain visible ASCII only".into(),
+                ));
+            }
+            operator_credentials.push(OperatorCredential {
+                token: Arc::from(token.into_bytes()),
+                actor: Arc::from(actor),
+            });
         }
         Ok(Self {
             state: ApiState {
                 tasks,
-                token: Arc::from(token.into_bytes()),
+                operator_credentials: Arc::new(operator_credentials),
                 operation_lock: Arc::new(tokio::sync::Mutex::new(())),
                 raft: None,
                 trust_rotation_coordinator: None,
@@ -98,6 +140,7 @@ impl<S: KvStore + Clone + 'static> DlqApi<S> {
             )
             .route("/metrics", get(metrics))
             .route("/api/v1/audit", get(list_audit_events))
+            .route("/api/v1/session", get(current_session))
             .route("/api/v1/alerts/sla", get(list_sla_alerts))
             .route(
                 "/api/v1/federation/clusters",
@@ -190,6 +233,17 @@ impl<S: KvStore + Clone + 'static> DlqApi<S> {
 #[derive(Debug, Deserialize)]
 struct AuditQuery {
     limit: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+struct AuthenticatedSession {
+    actor: String,
+}
+
+async fn current_session(headers: axum::http::HeaderMap) -> Json<AuthenticatedSession> {
+    Json(AuthenticatedSession {
+        actor: request_actor(&headers),
+    })
 }
 
 async fn list_audit_events<S: KvStore + Clone>(
@@ -666,7 +720,7 @@ async fn recover_trust_rotation<S: KvStore + Clone>(
     let before = match coordinator.inspect_bilateral(&rotation_id).await {
         Ok(diagnostics) => diagnostics,
         Err(error) => {
-            audit_rotation_operation_failure(
+            let audit_persisted = audit_rotation_operation_failure(
                 &coordinator,
                 &rotation_id,
                 &request.request_id,
@@ -676,6 +730,12 @@ async fn recover_trust_rotation<S: KvStore + Clone>(
                 &error.to_string(),
             )
             .await;
+            if !audit_persisted {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(ApiError::new("diagnostics failed and the failure audit could not be committed; inspect the Raft audit stream before retrying")),
+                ).into_response();
+            }
             return (StatusCode::BAD_GATEWAY, error.to_string()).into_response();
         }
     };
@@ -683,7 +743,7 @@ async fn recover_trust_rotation<S: KvStore + Clone>(
         || !before.automated_recovery_safe
         || !before.safety_violations.is_empty()
     {
-        audit_rotation_operation_failure(
+        let audit_persisted = audit_rotation_operation_failure(
             &coordinator,
             &rotation_id,
             &request.request_id,
@@ -693,6 +753,12 @@ async fn recover_trust_rotation<S: KvStore + Clone>(
             "expected action is stale or bilateral diagnostics report unsafe recovery",
         )
         .await;
+        if !audit_persisted {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ApiError::new("recovery was blocked but its rejection audit could not be committed; inspect the Raft audit stream")),
+            ).into_response();
+        }
         return (
             StatusCode::CONFLICT,
             Json(ApiError::new(
@@ -722,7 +788,11 @@ async fn recover_trust_rotation<S: KvStore + Clone>(
                 )
                 .await
             {
-                tracing::error!(rotation_id, %error, "failed to persist successful trust rotation recovery audit");
+                tracing::error!(rotation_id, %error, request_id = %request.request_id, "recovery may have committed but its operator outcome audit did not");
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(ApiError::new("recovery may have committed but its operator outcome audit could not be committed; inspect bilateral state and the Raft audit stream before retrying")),
+                ).into_response();
             }
             match coordinator.inspect_bilateral(&rotation_id).await {
                 Ok(after) => Json(TrustRotationRecoveryResponse {
@@ -735,7 +805,7 @@ async fn recover_trust_rotation<S: KvStore + Clone>(
             }
         }
         Err(error) => {
-            audit_rotation_operation_failure(
+            let audit_persisted = audit_rotation_operation_failure(
                 &coordinator,
                 &rotation_id,
                 &request.request_id,
@@ -745,6 +815,12 @@ async fn recover_trust_rotation<S: KvStore + Clone>(
                 &error.to_string(),
             )
             .await;
+            if !audit_persisted {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(ApiError::new("recovery failed and its outcome audit could not be committed; inspect bilateral state and the Raft audit stream before retrying")),
+                ).into_response();
+            }
             (StatusCode::CONFLICT, error.to_string()).into_response()
         }
     }
@@ -799,12 +875,16 @@ async fn audit_rotation_operation_failure(
     action: &str,
     outcome: &str,
     details: &str,
-) {
-    if let Err(audit_error) = coordinator
+) -> bool {
+    match coordinator
         .record_operation_outcome(rotation_id, request_id, actor, action, outcome, details)
         .await
     {
-        tracing::error!(rotation_id, action, %audit_error, "failed to persist trust rotation operation audit");
+        Ok(()) => true,
+        Err(audit_error) => {
+            tracing::error!(rotation_id, request_id, action, %audit_error, "failed to persist trust rotation operation audit");
+            false
+        }
     }
 }
 
@@ -1597,7 +1677,7 @@ async fn trust_rotation_ui() -> Html<&'static str> {
 
 async fn authorize<S: KvStore + Clone>(
     State(state): State<ApiState<S>>,
-    request: axum::http::Request<Body>,
+    mut request: axum::http::Request<Body>,
     next: Next,
 ) -> Response {
     let supplied = request
@@ -1607,9 +1687,16 @@ async fn authorize<S: KvStore + Clone>(
         .and_then(|v| v.strip_prefix("Bearer "))
         .unwrap_or("")
         .as_bytes();
-    let expected = state.token.as_ref();
-    let valid = supplied.len() == expected.len() && bool::from(supplied.ct_eq(expected));
-    if !valid {
+    let mut authenticated_actor = None;
+    // Compare against every configured credential; never accept the caller's actor header.
+    for credential in state.operator_credentials.iter() {
+        let expected = credential.token.as_ref();
+        let matches = supplied.len() == expected.len() && bool::from(supplied.ct_eq(expected));
+        if matches {
+            authenticated_actor = Some(credential.actor.clone());
+        }
+    }
+    let Some(actor) = authenticated_actor else {
         let mut response = (
             StatusCode::UNAUTHORIZED,
             Json(ApiError::new("unauthorized")),
@@ -1620,7 +1707,14 @@ async fn authorize<S: KvStore + Clone>(
             "no-store".parse().expect("static header"),
         );
         return response;
-    }
+    };
+    let actor_header = match axum::http::HeaderValue::from_str(&actor) {
+        Ok(value) => value,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    request
+        .headers_mut()
+        .insert("x-dataspool-actor", actor_header);
     let mut response = next.run(request).await;
     response.headers_mut().insert(
         header::CACHE_CONTROL,
@@ -2001,7 +2095,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let store = RocksDbStore::open(dir.path()).unwrap();
         let tasks = Arc::new(TaskStore::new(store));
-        let app = DlqApi::new(tasks, "a-secure-test-token-with-at-least-32-bytes")
+        let app = DlqApi::new(tasks.clone(), "a-secure-test-token-with-at-least-32-bytes")
             .unwrap()
             .router();
 
@@ -2034,6 +2128,70 @@ mod tests {
         let trust_ui_html = String::from_utf8(trust_ui_body.to_vec()).unwrap();
         assert!(trust_ui_html.contains("Operator confirmation"));
         assert!(trust_ui_html.contains("ActivationBarrier is committed"));
+
+        let session_unauthorized = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/session")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(session_unauthorized.status(), StatusCode::UNAUTHORIZED);
+        let session = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/session")
+                    .header(
+                        "authorization",
+                        "Bearer a-secure-test-token-with-at-least-32-bytes",
+                    )
+                    .header("x-dataspool-actor", "spoofed-operator")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(session.status(), StatusCode::OK);
+        let session_body = axum::body::to_bytes(session.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let session_json: serde_json::Value = serde_json::from_slice(&session_body).unwrap();
+        assert_eq!(session_json["actor"], "admin");
+
+        let operator_app = DlqApi::new_with_operators(
+            tasks.clone(),
+            vec![(
+                "oncall-platform".into(),
+                "operator-token-with-at-least-32-bytes-123".into(),
+            )],
+        )
+        .unwrap()
+        .router();
+        let operator_session = operator_app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/session")
+                    .header(
+                        "authorization",
+                        "Bearer operator-token-with-at-least-32-bytes-123",
+                    )
+                    .header("x-dataspool-actor", "attacker")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(operator_session.status(), StatusCode::OK);
+        let operator_session_body = axum::body::to_bytes(operator_session.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let operator_session_json: serde_json::Value =
+            serde_json::from_slice(&operator_session_body).unwrap();
+        assert_eq!(operator_session_json["actor"], "oncall-platform");
 
         let operator_view_path =
             "/api/v1/federation/trust-rotations/operator-view?limit=20&offset=0";
@@ -2237,6 +2395,40 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(audit.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn rejects_invalid_operator_credentials() {
+        let dir = tempdir().unwrap();
+        let store = RocksDbStore::open(dir.path()).unwrap();
+        let tasks = Arc::new(TaskStore::new(store));
+        assert!(DlqApi::new_with_operators(tasks.clone(), vec![]).is_err());
+        assert!(
+            DlqApi::new_with_operators(
+                tasks.clone(),
+                vec![(
+                    "bad actor".into(),
+                    "operator-token-with-at-least-32-bytes-123".into()
+                )],
+            )
+            .is_err()
+        );
+        assert!(
+            DlqApi::new_with_operators(
+                tasks,
+                vec![
+                    (
+                        "oncall".into(),
+                        "operator-token-with-at-least-32-bytes-123".into()
+                    ),
+                    (
+                        "backup".into(),
+                        "operator-token-with-at-least-32-bytes-123".into()
+                    ),
+                ],
+            )
+            .is_err()
+        );
     }
 
     #[test]

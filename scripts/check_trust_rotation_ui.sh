@@ -15,3 +15,12 @@ if len(scripts) != 1:
 Path(sys.argv[2]).write_text(scripts[0])
 PY
 node --check "$tmp"
+
+python3 - "$html" <<'PY'
+from pathlib import Path
+import sys
+source=Path(sys.argv[1]).read_text()
+assert "api('/api/v1/session')" in source, 'UI must resolve the authenticated actor from the server'
+assert 'X-Dataspool-Actor' not in source, 'UI must not submit a caller-selected audit identity'
+assert '/api/v1/federation/trust-rotations/' in source and '/recover' in source
+PY

@@ -41,9 +41,6 @@ async fn main() -> Result<()> {
         .as_deref()
         .map(DatspoolConfig::from_file)
         .transpose()?;
-    let admin_token = std::env::var("DATASPOOL_ADMIN_TOKEN").map_err(|_| {
-        DatspoolError::Configuration("DATASPOOL_ADMIN_TOKEN must be set (minimum 32 bytes)".into())
-    })?;
     let db_path = std::env::var("DATASPOOL_DB_PATH")
         .ok()
         .or_else(|| {
@@ -67,7 +64,20 @@ async fn main() -> Result<()> {
 
     let store = dataspool::RocksDbStore::open(&db_path)?;
     let tasks = Arc::new(TaskStore::new(store.clone()));
-    let mut api = dataspool::DlqApi::new(tasks.clone(), admin_token)?;
+    let mut api = if let Ok(operators_json) = std::env::var("DATASPOOL_ADMIN_OPERATORS") {
+        let operators: BTreeMap<String, String> = serde_json::from_str(&operators_json)
+            .map_err(|error| DatspoolError::Configuration(format!(
+                "DATASPOOL_ADMIN_OPERATORS must be a JSON object mapping operator IDs to bearer tokens: {error}"
+            )))?;
+        dataspool::DlqApi::new_with_operators(tasks.clone(), operators.into_iter().collect())?
+    } else {
+        let admin_token = std::env::var("DATASPOOL_ADMIN_TOKEN").map_err(|_| {
+            DatspoolError::Configuration(
+                "Set DATASPOOL_ADMIN_OPERATORS or DATASPOOL_ADMIN_TOKEN (minimum 32 bytes)".into(),
+            )
+        })?;
+        dataspool::DlqApi::new(tasks.clone(), admin_token)?
+    };
     let listener = tokio::net::TcpListener::bind(&bind)
         .await
         .map_err(|e| DatspoolError::Internal(format!("HTTP bind {bind} failed: {e}")))?;
