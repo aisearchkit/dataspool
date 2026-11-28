@@ -16,7 +16,8 @@ use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 
 use crate::{
-    FederatedTrustRotationCoordinator,
+    FederatedTrustRotationCoordinator, FederatedTrustRotationDiagnostics,
+    FederatedTrustRotationRecoveryAction,
     drivers::factory::{SinkConfig, create_sink},
     federation::{
         FederatedCluster, FederatedClusterStatus, FederatedMigration, FederatedTrustRotationPhase,
@@ -234,6 +235,22 @@ struct TrustRotationRollbackRequest {
 #[derive(Debug, Deserialize)]
 struct TrustRotationRecoveryRequest {
     request_id: String,
+    expected_action: FederatedTrustRotationRecoveryAction,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct TrustRotationListQuery {
+    phase: Option<String>,
+    peer_cluster_id: Option<String>,
+    limit: Option<usize>,
+    offset: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+struct TrustRotationRecoveryResponse {
+    expected_action: FederatedTrustRotationRecoveryAction,
+    before: FederatedTrustRotationDiagnostics,
+    after: FederatedTrustRotationDiagnostics,
 }
 
 async fn create_federated_trust_rotation<S: KvStore + Clone>(
@@ -265,9 +282,57 @@ async fn create_federated_trust_rotation<S: KvStore + Clone>(
 
 async fn list_federated_trust_rotations<S: KvStore + Clone>(
     State(state): State<ApiState<S>>,
+    Query(query): Query<TrustRotationListQuery>,
 ) -> Response {
+    const VALID_PHASES: &[&str] = &[
+        "staging",
+        "awaiting_deployment",
+        "activation_barrier",
+        "activating",
+        "recovery_required",
+        "overlap",
+        "retiring",
+        "completed",
+        "rolling_back",
+        "rolled_back",
+    ];
+    if query
+        .phase
+        .as_deref()
+        .is_some_and(|phase| !VALID_PHASES.contains(&phase))
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ApiError::new("invalid trust-rotation phase filter")),
+        )
+            .into_response();
+    }
     match state.tasks.list_federated_trust_rotations().await {
-        Ok(rotations) => Json(rotations).into_response(),
+        Ok(mut rotations) => {
+            if let Some(phase) = query.phase.as_deref() {
+                rotations.retain(|rotation| {
+                    serde_json::to_value(rotation.phase)
+                        .ok()
+                        .and_then(|value| value.as_str().map(str::to_owned))
+                        .as_deref()
+                        == Some(phase)
+                });
+            }
+            if let Some(peer_cluster_id) = query.peer_cluster_id.as_deref() {
+                rotations.retain(|rotation| rotation.peer_cluster_id == peer_cluster_id);
+            }
+            rotations.sort_by_key(|rotation| std::cmp::Reverse(rotation.updated_at_ms));
+            let offset = query.offset.unwrap_or(0);
+            let limit = query.limit.unwrap_or(100).clamp(1, 500);
+            Json(
+                rotations
+                    .into_iter()
+                    .skip(offset)
+                    .take(limit)
+                    .collect::<Vec<_>>(),
+            )
+            .into_response()
+        }
         Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
     }
 }
@@ -416,12 +481,38 @@ async fn recover_trust_rotation<S: KvStore + Clone>(
     let Some(coordinator) = state.trust_rotation_coordinator else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
+    let before = match coordinator.inspect_bilateral(&rotation_id).await {
+        Ok(diagnostics) => diagnostics,
+        Err(error) => return (StatusCode::BAD_GATEWAY, error.to_string()).into_response(),
+    };
+    if before.recommended_action != request.expected_action
+        || !before.automated_recovery_safe
+        || !before.safety_violations.is_empty()
+    {
+        return (
+            StatusCode::CONFLICT,
+            Json(ApiError::new(
+                "recovery action is stale or unsafe; refresh bilateral diagnostics before retrying",
+            )),
+        )
+            .into_response();
+    }
     match coordinator
-        .recover_rotation(&rotation_id, &request.request_id, &request_actor(&headers))
+        .recover_rotation(
+            &rotation_id,
+            &request.expected_action,
+            &request.request_id,
+            &request_actor(&headers),
+        )
         .await
     {
         Ok(_) => match coordinator.inspect_bilateral(&rotation_id).await {
-            Ok(diagnostics) => Json(diagnostics).into_response(),
+            Ok(after) => Json(TrustRotationRecoveryResponse {
+                expected_action: request.expected_action,
+                before,
+                after,
+            })
+            .into_response(),
             Err(error) => (StatusCode::BAD_GATEWAY, error.to_string()).into_response(),
         },
         Err(error) => (StatusCode::CONFLICT, error.to_string()).into_response(),
@@ -1358,6 +1449,22 @@ mod tests {
             diagnostics_unavailable.status(),
             StatusCode::SERVICE_UNAVAILABLE
         );
+        let rotation_status_list = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/federation/trust-rotations?phase=overlap&peer_cluster_id=target&limit=25&offset=0")
+                    .header(
+                        "authorization",
+                        "Bearer a-secure-test-token-with-at-least-32-bytes",
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rotation_status_list.status(), StatusCode::OK);
+
         let rotation_audit = app
             .clone()
             .oneshot(
@@ -1381,7 +1488,7 @@ mod tests {
                     .method("POST")
                     .uri("/api/v1/federation/trust-rotations/rotation-1/recover")
                     .header("content-type", "application/json")
-                    .body(Body::from(r#"{"request_id":"manual-recovery-1"}"#))
+                    .body(Body::from(r#"{"request_id":"manual-recovery-1","expected_action":"forward_recovery"}"#))
                     .unwrap(),
             )
             .await
@@ -1398,7 +1505,7 @@ mod tests {
                         "Bearer a-secure-test-token-with-at-least-32-bytes",
                     )
                     .header("content-type", "application/json")
-                    .body(Body::from(r#"{"request_id":"manual-recovery-1"}"#))
+                    .body(Body::from(r#"{"request_id":"manual-recovery-1","expected_action":"forward_recovery"}"#))
                     .unwrap(),
             )
             .await

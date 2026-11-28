@@ -69,3 +69,31 @@ The ActivationBarrier and AwaitingDeployment phases are intentionally reported s
 ## Alert rules
 
 The Prometheus rule group in deploy/prometheus/federation-trust-rotation-alerts.yml covers stalled transitions, forward-recovery requirements, persisted errors, overlap expiry, overdue retirement, and long waits at the activation barrier. Review the thresholds against the expected deployment and overlap windows before enabling paging.
+
+## Query rotation status
+
+The existing collection and single-rotation endpoints remain the canonical status APIs:
+
+    curl -sS -H "Authorization: Bearer $DATASPOOL_ADMIN_TOKEN" \
+      "http://127.0.0.1:8080/api/v1/federation/trust-rotations?phase=overlap&peer_cluster_id=target&limit=50&offset=0"
+
+The collection response remains a JSON array for compatibility. Results are ordered by most recently updated first. Supported phase filters are staging, awaiting_deployment, activation_barrier, activating, recovery_required, overlap, retiring, completed, rolling_back, and rolled_back. The default page size is 100 and the maximum is 500.
+
+    curl -sS -H "Authorization: Bearer $DATASPOOL_ADMIN_TOKEN" \
+      "http://127.0.0.1:8080/api/v1/federation/trust-rotations/$ROTATION_ID"
+
+This single-resource endpoint returns the local durable rotation record. Use the existing /diagnostics endpoint when bilateral Raft state, peer certificate fingerprints, expiry drift, and safety violations are required. A peer read failure is returned as a gateway error; the API does not silently downgrade a bilateral query to local-only data.
+
+## Confirm a manual recovery
+
+The existing POST /recover endpoint now requires the action observed in the latest diagnostics:
+
+    curl -sS -X POST \
+      -H "Authorization: Bearer $DATASPOOL_ADMIN_TOKEN" \
+      -H 'Content-Type: application/json' \
+      -d '{"request_id":"operator-recovery-20261128-02","expected_action":"forward_recovery"}' \
+      "http://127.0.0.1:8080/api/v1/federation/trust-rotations/$ROTATION_ID/recover"
+
+The request is rejected with HTTP 409 if the expected action is stale, automated recovery is not safe, or either cluster reports a safety violation. The coordinator independently re-reads bilateral diagnostics and checks the expected action before acting, so a stale operator view cannot authorize a different recovery path. The response contains both the before and after bilateral diagnostics. The operator identity is derived from the authenticated request and the request ID is included in replicated lifecycle audit events.
+
+Manual recovery cannot select an arbitrary transition. It cannot force rollback after activation, authorize activation while deployment readiness is missing, or retire a CA before the persisted overlap deadline. If diagnostics recommend await_operator or manual_intervention_required, the recovery endpoint refuses the request.

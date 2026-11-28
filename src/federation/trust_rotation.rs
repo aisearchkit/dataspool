@@ -2098,6 +2098,7 @@ impl FederatedTrustRotationCoordinator {
     pub async fn recover_rotation(
         &self,
         rotation_id: &str,
+        expected_action: &FederatedTrustRotationRecoveryAction,
         request_id: &str,
         actor: &str,
     ) -> crate::Result<FederatedTrustRotation> {
@@ -2108,9 +2109,14 @@ impl FederatedTrustRotationCoordinator {
         }
         let rotation = self.get_rotation(rotation_id).await?;
         let diagnostics = self.inspect_bilateral(rotation_id).await?;
-        if !diagnostics.safety_violations.is_empty() {
-            return Err(crate::DatspoolError::Internal(format!(
-                "automatic recovery is blocked by federation safety violations: {}",
+        if !diagnostics.safety_violations.is_empty()
+            || !diagnostics.automated_recovery_safe
+            || diagnostics.recommended_action != expected_action.clone()
+        {
+            return Err(crate::DatspoolError::Configuration(format!(
+                "recovery precondition changed: expected action {:?}, current action {:?}, safety violations: {}",
+                expected_action,
+                diagnostics.recommended_action,
                 diagnostics.safety_violations.join("; ")
             )));
         }
