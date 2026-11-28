@@ -9,7 +9,7 @@
 </style>
 </head>
 <body><main>
-<h1>Dead Letter Queue</h1><div class="muted">Inspect permanent document failures, select records, and replay them to the configured task sink.</div>
+<h1>Dead Letter Queue</h1><div class="muted">Inspect permanent document failures, select records, and replay them to the configured task sink. <a href="/admin/trust-rotations" style="color:var(--accent);margin-left:10px">Trust rotation operations ↗</a></div>
 <section class="panel"><div class="grid"><input id="token" type="password" autocomplete="off" placeholder="Admin bearer token"><input id="task" placeholder="Task UUID"><input id="shard" placeholder="Shard UUID"><button id="load">Load queue</button></div><div class="toolbar" style="margin-top:12px"><span id="summary" class="muted">Not connected</span><span class="right"></span><button id="replay" disabled>Replay selected</button><button id="prev" disabled>Previous</button><button id="next" disabled>Next</button><button id="refresh" disabled>Refresh</button></div><div id="message" role="status" aria-live="polite"></div></section>
 <section class="panel"><table><thead><tr><th><input id="all" class="select" type="checkbox" aria-label="Select all"></th><th>Entry</th><th>Status</th><th>Failure</th><th>Attempts</th><th>Document</th><th>Action</th></tr></thead><tbody id="rows"><tr><td colspan="7" class="muted">Load a task and shard to view entries.</td></tr></tbody></table></section>
 </main>

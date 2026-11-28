@@ -115,6 +115,16 @@ The collection response remains a JSON array for compatibility. Results are orde
 
 This single-resource endpoint returns the local durable rotation record. Use the existing /diagnostics endpoint when bilateral Raft state, peer certificate fingerprints, expiry drift, and safety violations are required. A peer read failure is returned as a gateway error; the API does not silently downgrade a bilateral query to local-only data.
 
+## Operator recovery UI
+
+Open `http://127.0.0.1:8080/admin/trust-rotations` from the trusted admin network. The page itself is a static shell; all data requests require the same administrator bearer token as the REST API. Enter an operator identity explicitly. The UI sends it as an audit attribution label in `X-Dataspool-Actor`; the bearer token authenticates API access, but this self-entered label is not independently authenticated. In production, a trusted reverse proxy should strip caller-supplied actor headers and inject the verified identity. The API records the resulting actor label and request ID in the replicated audit stream.
+
+The registry uses the dedicated `GET /api/v1/federation/trust-rotations/operator-view` projection. It intentionally omits both CA bundle PEM fields and exposes only public fingerprints, lifecycle flags, revisions and expiry metadata. Each visible row loads bilateral diagnostics with bounded client concurrency. Selecting a rotation loads the authoritative bilateral view and up to 100 audit events, including actor, request ID, outcome and committed Raft index.
+
+The UI enables recovery only when `recommended_action` is automatically recoverable, `automated_recovery_safe` is true, and `safety_violations` is empty. An operator must type the exact rotation ID and confirm the operation. The browser submits only `request_id` and the observed `expected_action` to the existing `POST /recover` endpoint. The server independently re-reads bilateral diagnostics and remains the sole authority; stale or unsafe submissions are rejected and audited.
+
+If either side has committed `ActivationBarrier`, the UI displays an irreversible-boundary warning and never offers rollback. The server-side coordinator remains authoritative even if a browser is stale, modified or bypassed. The UI does not call deployment-ready, authorize-activation, activate, retire or rollback endpoints.
+
 ## Confirm a manual recovery
 
 The existing POST /recover endpoint now requires the action observed in the latest diagnostics:

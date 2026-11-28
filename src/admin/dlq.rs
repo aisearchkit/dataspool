@@ -31,6 +31,7 @@ use crate::{
 };
 
 const UI: &str = include_str!("../../web/dlq.html");
+const TRUST_ROTATION_UI: &str = include_str!("../../web/trust-rotations.html");
 const MAX_PAGE_SIZE: usize = 200;
 const MAX_REPLAY_IDS: usize = 100;
 
@@ -123,6 +124,10 @@ impl<S: KvStore + Clone + 'static> DlqApi<S> {
                 get(list_federated_trust_rotations).post(create_federated_trust_rotation),
             )
             .route(
+                "/api/v1/federation/trust-rotations/operator-view",
+                get(list_trust_rotation_operator_summaries),
+            )
+            .route(
                 "/api/v1/federation/trust-rotations/{rotation_id}",
                 get(get_federated_trust_rotation),
             )
@@ -175,7 +180,10 @@ impl<S: KvStore + Clone + 'static> DlqApi<S> {
                 authorize::<S>,
             ))
             .with_state(self.state);
-        Router::new().route("/admin/dlq", get(ui)).merge(api)
+        Router::new()
+            .route("/admin/dlq", get(ui))
+            .route("/admin/trust-rotations", get(trust_rotation_ui))
+            .merge(api)
     }
 }
 
@@ -251,6 +259,31 @@ struct TrustRotationRecoveryResponse {
     expected_action: FederatedTrustRotationRecoveryAction,
     before: FederatedTrustRotationDiagnostics,
     after: FederatedTrustRotationDiagnostics,
+}
+
+/// Sanitized operator projection. CA bundle PEM is deliberately never serialized to the UI.
+#[derive(Debug, Serialize)]
+struct TrustRotationOperatorSummary {
+    rotation_id: String,
+    peer_cluster_id: String,
+    phase: FederatedTrustRotationPhase,
+    local_ca_bundle_fingerprint: String,
+    peer_ca_bundle_fingerprint: String,
+    local_leaf_fingerprint: String,
+    peer_leaf_fingerprint: String,
+    overlap_ms: i64,
+    activation_barrier_committed: bool,
+    local_activation_expires_at_ms: Option<i64>,
+    peer_activation_expires_at_ms: Option<i64>,
+    local_staged: bool,
+    peer_staged: bool,
+    local_deployment_ready: bool,
+    peer_deployment_ready: bool,
+    local_retired: bool,
+    peer_retired: bool,
+    revision: u64,
+    created_at_ms: i64,
+    updated_at_ms: i64,
 }
 
 async fn create_federated_trust_rotation<S: KvStore + Clone>(
@@ -344,6 +377,83 @@ async fn list_federated_trust_rotations<S: KvStore + Clone>(
                     .collect::<Vec<_>>(),
             )
             .into_response()
+        }
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+    }
+}
+
+async fn list_trust_rotation_operator_summaries<S: KvStore + Clone>(
+    State(state): State<ApiState<S>>,
+    Query(query): Query<TrustRotationListQuery>,
+) -> Response {
+    const VALID_PHASES: &[&str] = &[
+        "staging",
+        "awaiting_deployment",
+        "activation_barrier",
+        "activating",
+        "recovery_required",
+        "overlap",
+        "retiring",
+        "completed",
+        "rolling_back",
+        "rolled_back",
+    ];
+    if query
+        .phase
+        .as_deref()
+        .is_some_and(|phase| !VALID_PHASES.contains(&phase))
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ApiError::new("invalid trust-rotation phase filter")),
+        )
+            .into_response();
+    }
+    match state.tasks.list_federated_trust_rotations().await {
+        Ok(mut rotations) => {
+            if let Some(phase) = query.phase.as_deref() {
+                rotations.retain(|rotation| {
+                    serde_json::to_value(rotation.phase)
+                        .ok()
+                        .and_then(|value| value.as_str().map(str::to_owned))
+                        .as_deref()
+                        == Some(phase)
+                });
+            }
+            if let Some(peer_cluster_id) = query.peer_cluster_id.as_deref() {
+                rotations.retain(|rotation| rotation.peer_cluster_id == peer_cluster_id);
+            }
+            rotations.sort_by_key(|rotation| std::cmp::Reverse(rotation.updated_at_ms));
+            let offset = query.offset.unwrap_or(0);
+            let limit = query.limit.unwrap_or(25).clamp(1, 100);
+            let summaries = rotations
+                .into_iter()
+                .skip(offset)
+                .take(limit)
+                .map(|rotation| TrustRotationOperatorSummary {
+                    rotation_id: rotation.rotation_id,
+                    peer_cluster_id: rotation.peer_cluster_id,
+                    phase: rotation.phase,
+                    local_ca_bundle_fingerprint: rotation.local_ca_bundle_fingerprint,
+                    peer_ca_bundle_fingerprint: rotation.peer_ca_bundle_fingerprint,
+                    local_leaf_fingerprint: rotation.local_leaf_fingerprint,
+                    peer_leaf_fingerprint: rotation.peer_leaf_fingerprint,
+                    overlap_ms: rotation.overlap_ms,
+                    activation_barrier_committed: rotation.activation_barrier_committed,
+                    local_activation_expires_at_ms: rotation.local_activation_expires_at_ms,
+                    peer_activation_expires_at_ms: rotation.peer_activation_expires_at_ms,
+                    local_staged: rotation.local_staged,
+                    peer_staged: rotation.peer_staged,
+                    local_deployment_ready: rotation.local_deployment_ready,
+                    peer_deployment_ready: rotation.peer_deployment_ready,
+                    local_retired: rotation.local_retired,
+                    peer_retired: rotation.peer_retired,
+                    revision: rotation.revision,
+                    created_at_ms: rotation.created_at_ms,
+                    updated_at_ms: rotation.updated_at_ms,
+                })
+                .collect::<Vec<_>>();
+            Json(summaries).into_response()
         }
         Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
     }
@@ -1481,6 +1591,10 @@ async fn ui() -> Html<&'static str> {
     Html(UI)
 }
 
+async fn trust_rotation_ui() -> Html<&'static str> {
+    Html(TRUST_ROTATION_UI)
+}
+
 async fn authorize<S: KvStore + Clone>(
     State(state): State<ApiState<S>>,
     request: axum::http::Request<Body>,
@@ -1774,6 +1888,37 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
+    fn operator_summary_exposes_fingerprints_but_never_certificate_pem() {
+        let summary = TrustRotationOperatorSummary {
+            rotation_id: "rotation-safe-view".into(),
+            peer_cluster_id: "peer-a".into(),
+            phase: FederatedTrustRotationPhase::Overlap,
+            local_ca_bundle_fingerprint: "sha256:local-ca".into(),
+            peer_ca_bundle_fingerprint: "sha256:peer-ca".into(),
+            local_leaf_fingerprint: "sha256:local-leaf".into(),
+            peer_leaf_fingerprint: "sha256:peer-leaf".into(),
+            overlap_ms: 3_600_000,
+            activation_barrier_committed: true,
+            local_activation_expires_at_ms: Some(1_800_000_000_000),
+            peer_activation_expires_at_ms: Some(1_800_000_000_000),
+            local_staged: true,
+            peer_staged: true,
+            local_deployment_ready: true,
+            peer_deployment_ready: true,
+            local_retired: false,
+            peer_retired: false,
+            revision: 7,
+            created_at_ms: 1_799_000_000_000,
+            updated_at_ms: 1_799_500_000_000,
+        };
+        let serialized = serde_json::to_string(&summary).unwrap();
+        assert!(serialized.contains("sha256:local-ca"));
+        assert!(serialized.contains("activation_barrier_committed"));
+        assert!(!serialized.contains("_pem"));
+        assert!(!serialized.contains("BEGIN CERTIFICATE"));
+    }
+
+    #[test]
     fn trust_rotation_audit_metrics_deduplicate_request_replays() {
         let mut summary = TrustRotationAuditMetricSummary::default();
         let event = |request_id: &str, action: &str, outcome: &str| crate::task::AuditEvent {
@@ -1871,6 +2016,62 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(ui.status(), StatusCode::OK);
+
+        let trust_ui = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/trust-rotations")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(trust_ui.status(), StatusCode::OK);
+        let trust_ui_body = axum::body::to_bytes(trust_ui.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let trust_ui_html = String::from_utf8(trust_ui_body.to_vec()).unwrap();
+        assert!(trust_ui_html.contains("Operator confirmation"));
+        assert!(trust_ui_html.contains("ActivationBarrier is committed"));
+
+        let operator_view_path =
+            "/api/v1/federation/trust-rotations/operator-view?limit=20&offset=0";
+        let operator_view_unauthorized = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(operator_view_path)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            operator_view_unauthorized.status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let operator_view = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(operator_view_path)
+                    .header(
+                        "authorization",
+                        "Bearer a-secure-test-token-with-at-least-32-bytes",
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(operator_view.status(), StatusCode::OK);
+        let operator_view_body = axum::body::to_bytes(operator_view.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let operator_view_json = String::from_utf8(operator_view_body.to_vec()).unwrap();
+        assert_eq!(operator_view_json, "[]");
+        assert!(!operator_view_json.contains("_pem"));
 
         let unauthorized = app.clone().oneshot(Request::builder().uri("/api/v1/tasks/00000000-0000-0000-0000-000000000001/shards/00000000-0000-0000-0000-000000000002/dlq").body(Body::empty()).unwrap()).await.unwrap();
         assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);

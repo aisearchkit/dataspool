@@ -18,6 +18,10 @@ on:
       - 'deploy/prometheus/**'
       - 'docs/operations/federated-trust-rotation.md'
       - 'scripts/**'
+      - 'web/**'
+      - '.agents/skills/**'
+      - 'skills-lock.json'
+      - 'DEVELOPMENT.md'
   pull_request:
     branches: [ main, develop ]
     paths:
@@ -35,6 +39,10 @@ on:
       - 'deploy/prometheus/**'
       - 'docs/operations/federated-trust-rotation.md'
       - 'scripts/**'
+      - 'web/**'
+      - '.agents/skills/**'
+      - 'skills-lock.json'
+      - 'DEVELOPMENT.md'
 
 env:
   CARGO_TERM_COLOR: always
@@ -55,6 +63,17 @@ jobs:
           -v "${{ github.workspace }}:/work:ro"
           prom/prometheus:v3.5.0
           check rules /work/deploy/prometheus/federation-trust-rotation-alerts.yml
+
+  frontend-static-check:
+    name: Validate trust-rotation operator UI
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Check inline operator UI JavaScript
+        run: scripts/check_trust_rotation_ui.sh
 
   unit-test:
     name: Unit Tests

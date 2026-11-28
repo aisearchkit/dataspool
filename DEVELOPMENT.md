@@ -115,6 +115,12 @@ Dataspool 旨在解决以上痛点，提供一个延迟低、扩展性强、部�
 - 提交前检查 staged diff；提交后自动推送当前分支到 `origin`，并记录 commit SHA 和推送结果。
 - 推送失败时保留本地 commit，报告失败原因和 ahead 状态；不得宣称已推送。
 
+## 5.3 Frontend design skill
+
+项目级前端设计技能安装在 `.agents/skills/design-taste-frontend/`，版本来源和上游 commit 锁定在 `skills-lock.json`。开发管理页面时先阅读该目录下的 `SKILL.md`，按现有技术栈实现，不为套用设计规范而引入新的前端框架。技能中的浏览器检查脚本按需手动执行；仓库副本移除了上游自动 Stop Hook，避免会话结束时自动执行浏览器或文件检查。技能脚本需要 Node.js 22+ 和 Chrome/Chromium。
+
+Trust Rotation Operator UI 位于 `web/trust-rotations.html`，由 Axum 内嵌并通过 `/admin/trust-rotations` 提供。修改页面后运行 `scripts/check_trust_rotation_ui.sh` 检查内联 JavaScript 语法；Rust 路由和鉴权行为由 CI 单元测试覆盖。
+
 ## 6. 配置文件规范
 
 ### 5.1 集群配置示例 (config/dataspool-cluster.yaml)
