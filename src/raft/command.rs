@@ -319,7 +319,7 @@ pub enum Command {
         request_id: String,
         actor: String,
     },
-    /// Record a failed or rejected operator action without mutating rotation state.
+    /// Record an operator operation outcome without mutating rotation state.
     RecordFederatedTrustRotationAudit {
         rotation_id: String,
         audit_id: String,

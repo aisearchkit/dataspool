@@ -44,3 +44,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The automated release workflow currently publishes a Linux x86_64 artifact as a GitHub pre-release. Other platform binaries and production deployment/upgrade procedures are not included.
 
 - Hardened federated trust-rotation audit completeness: failed and rejected operator actions now use an audit-only Raft command with a real commit index, actor, original request ID, outcome, and bounded failure details.
+
+- Expanded federated trust-rotation operational metrics with restart-safe recovery counts, terminal rotation durations, request-deduplicated phase failure ratios, and bilateral overlap deadline accounting derived from persisted Raft state and audit history.

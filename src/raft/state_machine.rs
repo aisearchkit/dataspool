@@ -1832,10 +1832,14 @@ impl<S: KvStore + Clone> MetaStateMachine<S> {
     ) -> Result<CommandResponse> {
         if audit_id.trim().is_empty()
             || audit_id.len() > 128
+            || request_id.trim().is_empty()
+            || request_id.len() > 128
             || actor.trim().is_empty()
+            || actor.len() > 256
             || action.trim().is_empty()
+            || action.len() > 128
             || details.len() > 2048
-            || !matches!(outcome.as_str(), "failed" | "rejected")
+            || !matches!(outcome.as_str(), "committed" | "failed" | "rejected")
         {
             return Ok(rejected("invalid trust rotation audit record"));
         }
@@ -1878,7 +1882,7 @@ impl<S: KvStore + Clone> MetaStateMachine<S> {
             .save_audit_event(&audit_id, &payload, event)
             .await?;
         Ok(accepted(
-            "Trust rotation failure audit committed",
+            "Trust rotation operation audit committed",
             serde_json::json!({"rotation_id": rotation_id, "request_id": request_id}),
         ))
     }
@@ -7328,6 +7332,34 @@ mod tests {
             .unwrap();
         assert_eq!(attributed.actor, "operator");
         assert_eq!(attributed.request_id, "original-request-9");
+
+        let successful_recovery = sm
+            .apply_command_at(
+                Command::RecordFederatedTrustRotationAudit {
+                    rotation_id: "rotation-audit-failure".into(),
+                    audit_id: "trust-rotation-audit:success-1".into(),
+                    request_id: "operator-request-2".into(),
+                    actor: "alice".into(),
+                    action: "federation.trust_rotation.recover".into(),
+                    outcome: "committed".into(),
+                    details: "forward recovery completed".into(),
+                    at_ms: 1_700_000_000_100,
+                },
+                904,
+            )
+            .await
+            .unwrap();
+        assert!(successful_recovery.success);
+        let events = store
+            .list_audit_events_for_resource("federated_trust_rotation:rotation-audit-failure", 10)
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 2);
+        assert!(events.iter().any(|event| {
+            event.log_index == 904
+                && event.request_id == "operator-request-2"
+                && event.outcome == "committed"
+        }));
     }
 
     #[tokio::test]

@@ -252,11 +252,25 @@ impl<S: KvStore> TaskStore<S> {
         Ok(events)
     }
 
-    /// Read audit events for one exact resource, newest first.
-    pub async fn list_audit_events_for_resource(
+    /// Read the complete persisted audit stream for deterministic metric rebuilds.
+    pub async fn list_all_audit_events(&self) -> Result<Vec<AuditEvent>> {
+        let mut events: Vec<AuditEvent> = self
+            .store
+            .prefix_scan_cf(cf::META, b"audit:")
+            .await?
+            .into_iter()
+            .map(|(_, value)| serde_json::from_slice(&value))
+            .collect::<std::result::Result<_, _>>()?;
+        events.sort_by_key(|event| event.log_index);
+        Ok(events)
+    }
+
+    /// Read every persisted audit event for one exact resource, newest first.
+    /// Operational metrics use this unbounded view so their totals do not silently
+    /// reset or undercount after the public audit API's 1,000-record page limit.
+    pub async fn list_all_audit_events_for_resource(
         &self,
         resource_id: &str,
-        limit: usize,
     ) -> Result<Vec<AuditEvent>> {
         let mut events: Vec<AuditEvent> = self
             .store
@@ -267,6 +281,16 @@ impl<S: KvStore> TaskStore<S> {
             .collect::<std::result::Result<_, _>>()?;
         events.retain(|event| event.resource_id == resource_id);
         events.sort_by_key(|event| std::cmp::Reverse(event.log_index));
+        Ok(events)
+    }
+
+    /// Read a bounded newest-first page of audit events for one exact resource.
+    pub async fn list_audit_events_for_resource(
+        &self,
+        resource_id: &str,
+        limit: usize,
+    ) -> Result<Vec<AuditEvent>> {
+        let mut events = self.list_all_audit_events_for_resource(resource_id).await?;
         events.truncate(limit.clamp(1, 1000));
         Ok(events)
     }
@@ -1001,6 +1025,36 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let db = RocksDbStore::open(temp_dir.path()).unwrap();
         (TaskStore::new(db), temp_dir)
+    }
+
+    #[tokio::test]
+    async fn audit_stream_metrics_source_survives_store_reopen() {
+        let (store, temp_dir) = create_test_store().await;
+        let event = AuditEvent {
+            log_index: 42,
+            actor: "operator".into(),
+            request_id: "rotation-request-42".into(),
+            action: "federation.trust_rotation.recover".into(),
+            resource_id: "federated_trust_rotation:rotation-42".into(),
+            from_state: "recovery_required".into(),
+            to_state: "overlap".into(),
+            occurred_at_ms: 1_700_000_000_000,
+            outcome: "committed".into(),
+            details: Some("recovered".into()),
+        };
+        store
+            .save_audit_event("audit-key-42", "audit-payload-42", event.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            store.list_all_audit_events().await.unwrap(),
+            vec![event.clone()]
+        );
+        drop(store);
+
+        let reopened = TaskStore::new(RocksDbStore::open(temp_dir.path()).unwrap());
+        let restored = reopened.list_all_audit_events().await.unwrap();
+        assert_eq!(restored, vec![event]);
     }
 
     #[tokio::test]

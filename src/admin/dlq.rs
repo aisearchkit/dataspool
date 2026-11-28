@@ -600,15 +600,30 @@ async fn recover_trust_rotation<S: KvStore + Clone>(
         )
         .await
     {
-        Ok(_) => match coordinator.inspect_bilateral(&rotation_id).await {
-            Ok(after) => Json(TrustRotationRecoveryResponse {
-                expected_action: request.expected_action,
-                before,
-                after,
-            })
-            .into_response(),
-            Err(error) => (StatusCode::BAD_GATEWAY, error.to_string()).into_response(),
-        },
+        Ok(_) => {
+            if let Err(error) = coordinator
+                .record_operation_outcome(
+                    &rotation_id,
+                    &request.request_id,
+                    &request_actor(&headers),
+                    "recover",
+                    "committed",
+                    &format!("expected_action={:?}", request.expected_action),
+                )
+                .await
+            {
+                tracing::error!(rotation_id, %error, "failed to persist successful trust rotation recovery audit");
+            }
+            match coordinator.inspect_bilateral(&rotation_id).await {
+                Ok(after) => Json(TrustRotationRecoveryResponse {
+                    expected_action: request.expected_action,
+                    before,
+                    after,
+                })
+                .into_response(),
+                Err(error) => (StatusCode::BAD_GATEWAY, error.to_string()).into_response(),
+            }
+        }
         Err(error) => {
             audit_rotation_operation_failure(
                 &coordinator,
@@ -1056,6 +1071,77 @@ async fn list_sla_alerts<S: KvStore + Clone>(State(state): State<ApiState<S>>) -
     }
 }
 
+fn trust_rotation_metric_phase(action: &str) -> Option<&'static str> {
+    let action = action
+        .strip_prefix("federation.trust_rotation.")
+        .unwrap_or(action);
+    match action {
+        "create" | "local_staged" | "peer_staged" => Some("staging"),
+        // Older releases emitted a generic action without enough detail to
+        // reliably attribute same-phase transitions to a specific operation.
+        "advance" => Some("lifecycle"),
+        "deployment_ready" | "local_deployment_ready" | "peer_deployment_ready" => {
+            Some("deployment")
+        }
+        "authorize_activation"
+        | "activation_authorized"
+        | "activate"
+        | "local_activated"
+        | "peer_activated" => Some("activation"),
+        "retire" | "local_retired" | "peer_retired" => Some("retirement"),
+        "rollback" | "rollback_started" | "rollback_confirmed" | "local_rolled_back"
+        | "peer_rolled_back" => Some("rollback"),
+        "recover" | "recover_diagnostics" | "recover_response_diagnostics" | "reconcile" => {
+            Some("recovery")
+        }
+        _ => None,
+    }
+}
+
+#[derive(Default)]
+struct TrustRotationAuditMetricSummary {
+    recovery_attempts: std::collections::BTreeSet<(String, String)>,
+    recovery_failures: std::collections::BTreeSet<(String, String)>,
+    phase_attempts:
+        std::collections::BTreeMap<(&'static str, String), std::collections::BTreeSet<String>>,
+    phase_failures:
+        std::collections::BTreeMap<(&'static str, String), std::collections::BTreeSet<String>>,
+}
+
+impl TrustRotationAuditMetricSummary {
+    fn observe(&mut self, rotation_id: &str, event: &crate::task::AuditEvent) {
+        let Some(phase) = trust_rotation_metric_phase(&event.action) else {
+            return;
+        };
+        let key = (phase, rotation_id.to_string());
+        self.phase_attempts
+            .entry(key.clone())
+            .or_default()
+            .insert(event.request_id.clone());
+        if phase == "recovery" {
+            self.recovery_attempts
+                .insert((rotation_id.to_string(), event.request_id.clone()));
+        }
+        if matches!(event.outcome.as_str(), "failed" | "rejected") {
+            self.phase_failures
+                .entry(key)
+                .or_default()
+                .insert(event.request_id.clone());
+            if phase == "recovery" {
+                self.recovery_failures
+                    .insert((rotation_id.to_string(), event.request_id.clone()));
+            }
+        }
+    }
+}
+
+fn prometheus_label(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+}
+
 async fn metrics<S: KvStore + Clone>(State(state): State<ApiState<S>>) -> Response {
     let metrics = match state.tasks.operational_metrics().await {
         Ok(metrics) => metrics,
@@ -1082,6 +1168,22 @@ async fn metrics<S: KvStore + Clone>(State(state): State<ApiState<S>>) -> Respon
     let mut stalled_rotations = 0usize;
     let mut recovery_required_rotations = 0usize;
     let mut rotations_with_errors = 0usize;
+    let mut audit_summary = TrustRotationAuditMetricSummary::default();
+    let mut terminal_duration_sum_seconds = 0.0f64;
+    let mut terminal_duration_count = 0u64;
+    let audit_events = match state.tasks.list_all_audit_events().await {
+        Ok(events) => events,
+        Err(error) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response();
+        }
+    };
+    for event in &audit_events {
+        let Some(rotation_id) = event.resource_id.strip_prefix("federated_trust_rotation:") else {
+            continue;
+        };
+        // Include failed create attempts even when no rotation state record was committed.
+        audit_summary.observe(rotation_id, event);
+    }
     let mut body = format!(
         "# HELP dataspool_sla_tasks_at_risk Tasks approaching configured SLA limits\n# TYPE dataspool_sla_tasks_at_risk gauge\ndataspool_sla_tasks_at_risk {}\n# HELP dataspool_sla_tasks_breached Tasks breaching configured SLA limits\n# TYPE dataspool_sla_tasks_breached gauge\ndataspool_sla_tasks_breached {}\n# HELP dataspool_tasks_total Number of known tasks\n# TYPE dataspool_tasks_total gauge\ndataspool_tasks_total {}\n# HELP dataspool_tasks Number of tasks by lifecycle state\n# TYPE dataspool_tasks gauge\ndataspool_tasks{{state=\"pending\"}} {}\ndataspool_tasks{{state=\"running\"}} {}\ndataspool_tasks{{state=\"paused\"}} {}\ndataspool_tasks{{state=\"cancelling\"}} {}\ndataspool_tasks{{state=\"cancelled\"}} {}\ndataspool_tasks{{state=\"completed\"}} {}\ndataspool_tasks{{state=\"failed\"}} {}\n# HELP dataspool_shards Number of shards by state\n# TYPE dataspool_shards gauge\ndataspool_shards{{state=\"pending\"}} {}\ndataspool_shards{{state=\"running\"}} {}\ndataspool_shards{{state=\"completed\"}} {}\ndataspool_shards{{state=\"failed\"}} {}\n# HELP dataspool_nodes Number of nodes by state\n# TYPE dataspool_nodes gauge\ndataspool_nodes{{state=\"healthy\"}} {}\ndataspool_nodes{{state=\"degraded\"}} {}\ndataspool_nodes{{state=\"paused\"}} {}\ndataspool_nodes{{state=\"offline\"}} {}\n# HELP dataspool_retries_total Total failed shard attempts beyond the first attempt\n# TYPE dataspool_retries_total counter\ndataspool_retries_total {}\n# HELP dataspool_oldest_pending_seconds Age of the oldest pending shard\n# TYPE dataspool_oldest_pending_seconds gauge\ndataspool_oldest_pending_seconds {}\n",
         sla_at_risk,
@@ -1108,6 +1210,18 @@ async fn metrics<S: KvStore + Clone>(State(state): State<ApiState<S>>) -> Respon
     body.push_str(&format!("# HELP dataspool_scheduler_delay_seconds Age of the oldest pending shard waiting for scheduling\n# TYPE dataspool_scheduler_delay_seconds gauge\ndataspool_scheduler_delay_seconds {}\n# HELP dataspool_node_active_shards Number of active shard leases per node\n# TYPE dataspool_node_active_shards gauge\n# HELP dataspool_node_capacity_shards Configured concurrent shard capacity per node\n# TYPE dataspool_node_capacity_shards gauge\n# HELP dataspool_node_memory_capacity_mb Configured memory capacity per node in MiB\n# TYPE dataspool_node_memory_capacity_mb gauge\n# HELP dataspool_node_reserved_memory_mb Memory reserved by active shard leases per node in MiB\n# TYPE dataspool_node_reserved_memory_mb gauge\n", metrics.oldest_pending_seconds));
     body.push_str("# HELP dataspool_federation_trust_rotations Number of federated trust rotations by lifecycle phase\n# TYPE dataspool_federation_trust_rotations gauge\n# HELP dataspool_federation_trust_rotation_stalled Rotations in a transitional phase without an update for at least 30 seconds\n# TYPE dataspool_federation_trust_rotation_stalled gauge\n# HELP dataspool_federation_trust_rotation_recovery_required Rotations requiring forward recovery\n# TYPE dataspool_federation_trust_rotation_recovery_required gauge\n# HELP dataspool_federation_trust_rotation_errors Rotations with a persisted last error\n# TYPE dataspool_federation_trust_rotation_errors gauge\n");
     for rotation in &rotations {
+        if matches!(
+            rotation.phase,
+            FederatedTrustRotationPhase::Completed | FederatedTrustRotationPhase::RolledBack
+        ) {
+            let duration = rotation
+                .updated_at_ms
+                .saturating_sub(rotation.created_at_ms)
+                .max(0) as f64
+                / 1000.0;
+            terminal_duration_sum_seconds += duration;
+            terminal_duration_count = terminal_duration_count.saturating_add(1);
+        }
         let phase = match rotation.phase {
             FederatedTrustRotationPhase::Staging => "staging",
             FederatedTrustRotationPhase::AwaitingDeployment => "awaiting_deployment",
@@ -1160,13 +1274,64 @@ async fn metrics<S: KvStore + Clone>(State(state): State<ApiState<S>>) -> Respon
     body.push_str(&format!(
         "dataspool_federation_trust_rotation_stalled {stalled_rotations}\ndataspool_federation_trust_rotation_recovery_required {recovery_required_rotations}\ndataspool_federation_trust_rotation_errors {rotations_with_errors}\n"
     ));
-    body.push_str("# HELP dataspool_federation_trust_rotation_overlap_remaining_seconds Remaining CA overlap duration per rotation\n# TYPE dataspool_federation_trust_rotation_overlap_remaining_seconds gauge\n# HELP dataspool_federation_trust_rotation_age_seconds Age of a trust rotation since creation\n# TYPE dataspool_federation_trust_rotation_age_seconds gauge\n# HELP dataspool_federation_trust_rotation_phase_age_seconds Time spent in the current trust rotation phase\n# TYPE dataspool_federation_trust_rotation_phase_age_seconds gauge\n# HELP dataspool_federation_trust_rotation_last_error Whether the rotation has a persisted last error\n# TYPE dataspool_federation_trust_rotation_last_error gauge\n");
+    body.push_str(&format!(
+        "# HELP dataspool_federation_trust_rotation_recovery_attempts_total Number of distinct persisted recovery requests\n# TYPE dataspool_federation_trust_rotation_recovery_attempts_total counter\ndataspool_federation_trust_rotation_recovery_attempts_total {}\n# HELP dataspool_federation_trust_rotation_recovery_failures_total Number of distinct recovery requests that failed or were rejected\n# TYPE dataspool_federation_trust_rotation_recovery_failures_total counter\ndataspool_federation_trust_rotation_recovery_failures_total {}\n# HELP dataspool_federation_trust_rotation_terminal_duration_seconds_sum Sum of terminal rotation durations (completed or rolled back)\n# TYPE dataspool_federation_trust_rotation_terminal_duration_seconds_sum gauge\ndataspool_federation_trust_rotation_terminal_duration_seconds_sum {:.3}\n# HELP dataspool_federation_trust_rotation_terminal_duration_seconds_count Number of terminal rotations with a persisted duration\n# TYPE dataspool_federation_trust_rotation_terminal_duration_seconds_count gauge\ndataspool_federation_trust_rotation_terminal_duration_seconds_count {}\n",
+        audit_summary.recovery_attempts.len(), audit_summary.recovery_failures.len(), terminal_duration_sum_seconds, terminal_duration_count
+    ));
+    body.push_str("# HELP dataspool_federation_trust_rotation_recovery_attempts Number of distinct recovery requests per rotation\n# TYPE dataspool_federation_trust_rotation_recovery_attempts gauge\n# HELP dataspool_federation_trust_rotation_recovery_failures Number of failed or rejected recovery requests per rotation\n# TYPE dataspool_federation_trust_rotation_recovery_failures gauge\n# HELP dataspool_federation_trust_rotation_phase_operations_total Distinct audited request IDs observed for a phase across rotations\n# TYPE dataspool_federation_trust_rotation_phase_operations_total counter\n# HELP dataspool_federation_trust_rotation_phase_failures_total Distinct phase request IDs that failed or were rejected across rotations\n# TYPE dataspool_federation_trust_rotation_phase_failures_total counter\n# HELP dataspool_federation_trust_rotation_phase_failure_ratio Fraction of distinct phase requests that failed or were rejected across rotations\n# TYPE dataspool_federation_trust_rotation_phase_failure_ratio gauge\n# HELP dataspool_federation_trust_rotation_phase_operations_by_rotation_total Distinct audited request IDs for a phase per rotation\n# TYPE dataspool_federation_trust_rotation_phase_operations_by_rotation_total counter\n# HELP dataspool_federation_trust_rotation_phase_failures_by_rotation_total Distinct failed or rejected request IDs for a phase per rotation\n# TYPE dataspool_federation_trust_rotation_phase_failures_by_rotation_total counter\n# HELP dataspool_federation_trust_rotation_phase_failure_ratio_by_rotation Failure ratio for a phase within one rotation\n# TYPE dataspool_federation_trust_rotation_phase_failure_ratio_by_rotation gauge\n");
+    let mut recovery_counts_by_rotation =
+        std::collections::BTreeMap::<String, (usize, usize)>::new();
+    for (rotation_id, _request_id) in &audit_summary.recovery_attempts {
+        recovery_counts_by_rotation
+            .entry(rotation_id.clone())
+            .or_default()
+            .0 += 1;
+    }
+    for (rotation_id, _request_id) in &audit_summary.recovery_failures {
+        recovery_counts_by_rotation
+            .entry(rotation_id.clone())
+            .or_default()
+            .1 += 1;
+    }
+    for (rotation_id, (attempts, failures)) in recovery_counts_by_rotation {
+        let label = prometheus_label(&rotation_id);
+        body.push_str(&format!("dataspool_federation_trust_rotation_recovery_attempts{{rotation_id=\"{label}\"}} {attempts}\ndataspool_federation_trust_rotation_recovery_failures{{rotation_id=\"{label}\"}} {failures}\n"));
+    }
+    let mut aggregate_phase_counts =
+        std::collections::BTreeMap::<&'static str, (usize, usize)>::new();
+    for ((phase_name, rotation_id), attempts) in &audit_summary.phase_attempts {
+        let failures = audit_summary
+            .phase_failures
+            .get(&(*phase_name, rotation_id.clone()))
+            .map_or(0, |ids| ids.len());
+        let counts = aggregate_phase_counts.entry(phase_name).or_default();
+        counts.0 = counts.0.saturating_add(attempts.len());
+        counts.1 = counts.1.saturating_add(failures);
+    }
+    for (phase_name, (attempts, failures)) in aggregate_phase_counts {
+        let ratio = if attempts == 0 {
+            0.0
+        } else {
+            failures as f64 / attempts as f64
+        };
+        body.push_str(&format!("dataspool_federation_trust_rotation_phase_operations_total{{phase=\"{phase_name}\"}} {attempts}\ndataspool_federation_trust_rotation_phase_failures_total{{phase=\"{phase_name}\"}} {failures}\ndataspool_federation_trust_rotation_phase_failure_ratio{{phase=\"{phase_name}\"}} {ratio:.6}\n"));
+    }
+    for ((phase_name, rotation_id), attempts) in &audit_summary.phase_attempts {
+        let failures = audit_summary
+            .phase_failures
+            .get(&(*phase_name, rotation_id.clone()))
+            .map_or(0, |ids| ids.len());
+        let label = prometheus_label(rotation_id);
+        let ratio = if attempts.is_empty() {
+            0.0
+        } else {
+            failures as f64 / attempts.len() as f64
+        };
+        body.push_str(&format!("dataspool_federation_trust_rotation_phase_operations_by_rotation_total{{rotation_id=\"{label}\",phase=\"{phase_name}\"}} {}\ndataspool_federation_trust_rotation_phase_failures_by_rotation_total{{rotation_id=\"{label}\",phase=\"{phase_name}\"}} {failures}\ndataspool_federation_trust_rotation_phase_failure_ratio_by_rotation{{rotation_id=\"{label}\",phase=\"{phase_name}\"}} {ratio:.6}\n", attempts.len()));
+    }
+    body.push_str("# HELP dataspool_federation_trust_rotation_overlap_remaining_seconds Remaining CA overlap duration per rotation\n# TYPE dataspool_federation_trust_rotation_overlap_remaining_seconds gauge\n# HELP dataspool_federation_trust_rotation_age_seconds Age of a trust rotation since creation\n# TYPE dataspool_federation_trust_rotation_age_seconds gauge\n# HELP dataspool_federation_trust_rotation_phase_age_seconds Time spent in the current trust rotation phase\n# TYPE dataspool_federation_trust_rotation_phase_age_seconds gauge\n# HELP dataspool_federation_trust_rotation_last_error Whether the rotation has a persisted last error\n# TYPE dataspool_federation_trust_rotation_last_error gauge\n# HELP dataspool_federation_trust_rotation_duration_seconds Total duration for terminal rotations\n# TYPE dataspool_federation_trust_rotation_duration_seconds gauge\n");
     for rotation in &rotations {
-        let label = rotation
-            .rotation_id
-            .replace('\\', "\\\\")
-            .replace('"', "\\\"")
-            .replace('\n', "\\n");
+        let label = prometheus_label(&rotation.rotation_id);
         let phase = match rotation.phase {
             FederatedTrustRotationPhase::Staging => "staging",
             FederatedTrustRotationPhase::AwaitingDeployment => "awaiting_deployment",
@@ -1185,6 +1350,17 @@ async fn metrics<S: KvStore + Clone>(State(state): State<ApiState<S>>) -> Respon
         body.push_str(&format!(
             "dataspool_federation_trust_rotation_age_seconds{{rotation_id=\"{label}\",phase=\"{phase}\"}} {age:.3}\ndataspool_federation_trust_rotation_phase_age_seconds{{rotation_id=\"{label}\",phase=\"{phase}\"}} {phase_age:.3}\ndataspool_federation_trust_rotation_last_error{{rotation_id=\"{label}\"}} {last_error}\n"
         ));
+        if matches!(
+            rotation.phase,
+            FederatedTrustRotationPhase::Completed | FederatedTrustRotationPhase::RolledBack
+        ) {
+            let duration = rotation
+                .updated_at_ms
+                .saturating_sub(rotation.created_at_ms)
+                .max(0) as f64
+                / 1000.0;
+            body.push_str(&format!("dataspool_federation_trust_rotation_duration_seconds{{rotation_id=\"{label}\",terminal_state=\"{phase}\"}} {duration:.3}\n"));
+        }
         if matches!(
             rotation.phase,
             FederatedTrustRotationPhase::Overlap | FederatedTrustRotationPhase::Retiring
@@ -1511,6 +1687,81 @@ mod tests {
     use crate::{storage::RocksDbStore, task::TaskStore};
     use tempfile::tempdir;
 
+    #[test]
+    fn trust_rotation_audit_metrics_deduplicate_request_replays() {
+        let mut summary = TrustRotationAuditMetricSummary::default();
+        let event = |request_id: &str, action: &str, outcome: &str| crate::task::AuditEvent {
+            log_index: 1,
+            actor: "operator".into(),
+            request_id: request_id.into(),
+            action: action.into(),
+            resource_id: "federated_trust_rotation:rotation-1".into(),
+            from_state: "staging".into(),
+            to_state: "staging".into(),
+            occurred_at_ms: 1_700_000_000_000,
+            outcome: outcome.into(),
+            details: None,
+        };
+        let failed = event("recover-1", "federation.trust_rotation.recover", "failed");
+        summary.observe("rotation-1", &failed);
+        summary.observe("rotation-1", &failed);
+        let recovered = event(
+            "recover-1",
+            "federation.trust_rotation.recover",
+            "committed",
+        );
+        summary.observe("rotation-1", &recovered);
+        let stage = event(
+            "stage-1",
+            "federation.trust_rotation.local_staged",
+            "committed",
+        );
+        summary.observe("rotation-1", &stage);
+
+        assert_eq!(summary.recovery_attempts.len(), 1);
+        assert_eq!(summary.recovery_failures.len(), 1);
+        assert_eq!(
+            summary
+                .phase_attempts
+                .get(&("recovery", "rotation-1".into()))
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            summary
+                .phase_failures
+                .get(&("recovery", "rotation-1".into()))
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            summary
+                .phase_attempts
+                .get(&("staging", "rotation-1".into()))
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            trust_rotation_metric_phase("federation.trust_rotation.peer_retired"),
+            Some("retirement")
+        );
+        assert_eq!(
+            trust_rotation_metric_phase("federation.trust_rotation.reconcile"),
+            Some("recovery")
+        );
+        assert_eq!(
+            trust_rotation_metric_phase("federation.trust_rotation.unknown"),
+            None
+        );
+        assert_eq!(
+            trust_rotation_metric_phase("federation.trust_rotation.advance"),
+            Some("lifecycle")
+        );
+    }
+
     #[tokio::test]
     async fn ui_is_public_but_dlq_api_requires_bearer_token() {
         use axum::{body::Body, http::Request};
@@ -1671,6 +1922,17 @@ mod tests {
         assert!(
             String::from_utf8_lossy(&metrics_body).contains("dataspool_federation_trust_rotations")
         );
+        let metrics_text = String::from_utf8_lossy(&metrics_body);
+        for metric in [
+            "dataspool_federation_trust_rotation_recovery_attempts_total",
+            "dataspool_federation_trust_rotation_terminal_duration_seconds_sum",
+            "dataspool_federation_trust_rotation_phase_failure_ratio",
+            "dataspool_federation_trust_rotation_phase_operations_by_rotation_total",
+            "dataspool_federation_trust_rotation_recovery_attempts",
+            "dataspool_federation_trust_rotation_overlap_remaining_seconds",
+        ] {
+            assert!(metrics_text.contains(metric), "missing metric {metric}");
+        }
 
         let audit = app
             .oneshot(

@@ -2012,24 +2012,49 @@ impl FederatedTrustRotationCoordinator {
                 }
             }
             .await;
-            if let Err(error) = result {
-                tracing::warn!(rotation_id = %rotation.rotation_id, phase = ?rotation.phase, %error, "Federated trust rotation reconciliation will retry");
-                let failure_request_id = format!(
-                    "{request_id}:failed:{}",
-                    chrono::Utc::now().timestamp_millis()
-                );
-                if let Err(audit_error) = self
-                    .record_operation_outcome(
-                        &rotation.rotation_id,
-                        &failure_request_id,
-                        "trust-rotation-reconciler",
-                        "reconcile",
-                        "failed",
-                        &format!("reconcile_request_id={request_id}: {error}"),
-                    )
-                    .await
-                {
-                    tracing::error!(rotation_id = %rotation.rotation_id, %audit_error, "failed to persist reconciliation failure audit");
+            match result {
+                Ok(()) => {
+                    let current = self.get_rotation(&rotation.rotation_id).await?;
+                    if current.revision > rotation.revision {
+                        let success_request_id =
+                            format!("{request_id}:success:{}", current.revision);
+                        if let Err(audit_error) = self
+                            .record_operation_outcome(
+                                &rotation.rotation_id,
+                                &success_request_id,
+                                "trust-rotation-reconciler",
+                                "reconcile",
+                                "committed",
+                                &format!(
+                                    "reconciliation advanced revision {} to {}",
+                                    rotation.revision, current.revision
+                                ),
+                            )
+                            .await
+                        {
+                            tracing::error!(rotation_id = %rotation.rotation_id, %audit_error, "failed to persist reconciliation success audit");
+                        }
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(rotation_id = %rotation.rotation_id, phase = ?rotation.phase, %error, "Federated trust rotation reconciliation will retry");
+                    let failure_request_id = format!(
+                        "{request_id}:failed:{}",
+                        chrono::Utc::now().timestamp_millis()
+                    );
+                    if let Err(audit_error) = self
+                        .record_operation_outcome(
+                            &rotation.rotation_id,
+                            &failure_request_id,
+                            "trust-rotation-reconciler",
+                            "reconcile",
+                            "failed",
+                            &format!("reconcile_request_id={request_id}: {error}"),
+                        )
+                        .await
+                    {
+                        tracing::error!(rotation_id = %rotation.rotation_id, %audit_error, "failed to persist reconciliation failure audit");
+                    }
                 }
             }
         }
