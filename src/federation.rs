@@ -416,6 +416,7 @@ impl FederatedTrustRotation {
                         self.phase,
                         FederatedTrustRotationPhase::Completed
                             | FederatedTrustRotationPhase::RolledBack
+                            | FederatedTrustRotationPhase::RollingBack
                     )
                 {
                     return Err(
@@ -953,6 +954,18 @@ mod tests {
                 )
                 .is_err(),
             "rollback reason is immutable after the rollback fence is committed"
+        );
+        assert!(
+            rotation
+                .apply_event(
+                    FederatedTrustRotationEvent::MarkRecoveryRequired {
+                        reason: "must not supersede rollback".into(),
+                    },
+                    3,
+                    13,
+                )
+                .is_err(),
+            "recovery-required must not reopen the forward path after rollback starts"
         );
         rotation
             .apply_event(FederatedTrustRotationEvent::ConfirmRollback, 3, 13)
