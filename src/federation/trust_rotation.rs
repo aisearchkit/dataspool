@@ -153,17 +153,7 @@ impl FederatedTrustRotationProcessCoordinator {
             ));
         }
         let (local_before, peer_before) = self.read_snapshots().await?;
-        for snapshot in [&local_before, &peer_before] {
-            if snapshot
-                .rotation
-                .rollback_reason
-                .as_deref()
-                .is_some_and(|existing| existing != reason)
-            {
-                return Err(crate::DatspoolError::Configuration(
-                    "rollback reason cannot change after either side has begun rollback".into(),
-                ));
-            }
+        let activation_uncertain = [&local_before, &peer_before].iter().any(|snapshot| {
             let rotation = &snapshot.rotation;
             let candidate_is_active =
                 snapshot
@@ -178,23 +168,69 @@ impl FederatedTrustRotationProcessCoordinator {
                 .is_some_and(|fingerprint| {
                     fingerprint.eq_ignore_ascii_case(&rotation.peer_ca_bundle_fingerprint)
                 });
-            if rotation.local_activation_expires_at_ms.is_some()
+            rotation.activation_barrier_committed
+                || rotation.local_activation_expires_at_ms.is_some()
                 || rotation.peer_activation_expires_at_ms.is_some()
                 || candidate_is_active
                 || candidate_was_active
-                || rotation.phase == FederatedTrustRotationPhase::RecoveryRequired
                 || matches!(
                     rotation.phase,
                     FederatedTrustRotationPhase::Activating
+                        | FederatedTrustRotationPhase::RecoveryRequired
                         | FederatedTrustRotationPhase::Overlap
                         | FederatedTrustRotationPhase::Retiring
                         | FederatedTrustRotationPhase::Completed
                 )
+        });
+        if activation_uncertain {
+            if local_before.rotation.phase == FederatedTrustRotationPhase::RollingBack
+                && !local_before.rotation.rollback_peer_confirmed
+            {
+                Self::ensure_remote_success(
+                    self.local_client
+                        .advance_remote_trust_rotation(
+                            &self.peer_cluster_id,
+                            &self.rotation_id,
+                            &format!("{}:promote-local-forward-recovery", self.request_prefix),
+                            &FederatedTrustRotationEvent::MarkRecoveryRequired {
+                                reason: "peer activation committed while rollback was not yet bilaterally confirmed".into(),
+                            },
+                        )
+                        .await?,
+                )?;
+            }
+            if peer_before.rotation.phase == FederatedTrustRotationPhase::RollingBack
+                && !peer_before.rotation.rollback_peer_confirmed
+            {
+                Self::ensure_remote_success(
+                    self.peer_client
+                        .advance_remote_trust_rotation(
+                            &self.local_cluster_id,
+                            &self.rotation_id,
+                            &format!("{}:promote-peer-forward-recovery", self.request_prefix),
+                            &FederatedTrustRotationEvent::MarkRecoveryRequired {
+                                reason: "peer activation committed while rollback was not yet bilaterally confirmed".into(),
+                            },
+                        )
+                        .await?,
+                )?;
+            }
+            return Err(crate::DatspoolError::Configuration(
+                "rollback is forbidden after either side activates or activation is uncertain; forward recovery is required".into(),
+            ));
+        }
+        for snapshot in [&local_before, &peer_before] {
+            if snapshot
+                .rotation
+                .rollback_reason
+                .as_deref()
+                .is_some_and(|existing| existing != reason)
             {
                 return Err(crate::DatspoolError::Configuration(
-                    "rollback is forbidden after either side activates or activation is uncertain; forward recovery is required".into(),
+                    "rollback reason cannot change after either side has begun rollback".into(),
                 ));
             }
+            let rotation = &snapshot.rotation;
             if !matches!(
                 rotation.phase,
                 FederatedTrustRotationPhase::Staging
@@ -819,6 +855,9 @@ impl FederatedTrustRotationCoordinator {
 
     /// Commit the activation barrier on both independent Raft clusters. Neither
     /// side is allowed to activate until both deployment-ready assertions exist.
+    /// The first committed barrier is the point of no return for rollback: if a
+    /// concurrent rollback has begun on the other side, it is promoted to forward
+    /// recovery before activation can proceed.
     pub async fn authorize_activation(
         &self,
         rotation_id: &str,
@@ -830,8 +869,109 @@ impl FederatedTrustRotationCoordinator {
                 "request_id must contain 1-64 bytes".into(),
             ));
         }
-        let rotation = self.get_rotation(rotation_id).await?;
+        let mut rotation = self.get_rotation(rotation_id).await?;
         let mut peer = self.connect_peer_by_id(&rotation.peer_cluster_id).await?;
+        let remote_state = peer
+            .get_remote_trust_rotation(&self.local_cluster_id, rotation_id)
+            .await?;
+        if !remote_state.accepted {
+            return Err(crate::DatspoolError::Internal(
+                "peer rejected the durable trust-rotation read before activation authorization"
+                    .into(),
+            ));
+        }
+        let mut remote_snapshot: FederatedTrustRotationSnapshot =
+            serde_json::from_str(&remote_state.state_json)
+                .map_err(|error| crate::DatspoolError::Serialization(error.to_string()))?;
+
+        if rotation.phase == FederatedTrustRotationPhase::RolledBack
+            || remote_snapshot.rotation.phase == FederatedTrustRotationPhase::RolledBack
+        {
+            return Err(crate::DatspoolError::Configuration(
+                "activation is forbidden because at least one side has completed rollback".into(),
+            ));
+        }
+
+        if rotation.phase == FederatedTrustRotationPhase::RollingBack {
+            if rotation.rollback_peer_confirmed {
+                return Err(crate::DatspoolError::Internal(
+                    "activation conflicts with a bilaterally confirmed rollback; manual intervention is required".into(),
+                ));
+            }
+            let peer_has_committed_activation =
+                remote_snapshot.rotation.activation_barrier_committed
+                    || remote_snapshot
+                        .rotation
+                        .local_activation_expires_at_ms
+                        .is_some()
+                    || remote_snapshot
+                        .rotation
+                        .peer_activation_expires_at_ms
+                        .is_some()
+                    || matches!(
+                        remote_snapshot.rotation.phase,
+                        FederatedTrustRotationPhase::Activating
+                            | FederatedTrustRotationPhase::RecoveryRequired
+                            | FederatedTrustRotationPhase::Overlap
+                            | FederatedTrustRotationPhase::Retiring
+                            | FederatedTrustRotationPhase::Completed
+                    );
+            if !peer_has_committed_activation {
+                return Err(crate::DatspoolError::Configuration(
+                    "activation cannot proceed while the peer is still attempting pre-activation rollback".into(),
+                ));
+            }
+            self.mark_recovery_required(
+                rotation_id,
+                "peer activation barrier committed while local rollback was not bilaterally confirmed",
+                &format!("{actor} request:{request_id}"),
+            )
+            .await?;
+            rotation = self.get_rotation(rotation_id).await?;
+        }
+
+        if remote_snapshot.rotation.phase == FederatedTrustRotationPhase::RollingBack {
+            if remote_snapshot.rotation.rollback_peer_confirmed {
+                return Err(crate::DatspoolError::Internal(
+                    "activation conflicts with a bilaterally confirmed peer rollback; manual intervention is required".into(),
+                ));
+            }
+            if !rotation.activation_barrier_committed {
+                return Err(crate::DatspoolError::Configuration(
+                    "activation cannot override peer rollback before this cluster has committed its activation barrier".into(),
+                ));
+            }
+            self.ensure_remote_success(
+                peer.advance_remote_trust_rotation(
+                    &self.local_cluster_id,
+                    rotation_id,
+                    &format!("{request_id}:promote-peer-forward-recovery"),
+                    &FederatedTrustRotationEvent::MarkRecoveryRequired {
+                        reason: "local activation barrier committed while peer rollback was not bilaterally confirmed".into(),
+                    },
+                )
+                .await?,
+            )?;
+            let state = peer
+                .get_remote_trust_rotation(&self.local_cluster_id, rotation_id)
+                .await?;
+            remote_snapshot = serde_json::from_str(&state.state_json)
+                .map_err(|error| crate::DatspoolError::Serialization(error.to_string()))?;
+        }
+
+        if !matches!(
+            remote_snapshot.rotation.phase,
+            FederatedTrustRotationPhase::ActivationBarrier
+                | FederatedTrustRotationPhase::Activating
+                | FederatedTrustRotationPhase::RecoveryRequired
+                | FederatedTrustRotationPhase::Overlap
+                | FederatedTrustRotationPhase::Retiring
+                | FederatedTrustRotationPhase::Completed
+        ) {
+            return Err(crate::DatspoolError::Configuration(
+                "peer is not at a phase that permits activation authorization".into(),
+            ));
+        }
         self.ensure_remote_success(
             peer.advance_remote_trust_rotation(
                 &self.local_cluster_id,
@@ -871,6 +1011,29 @@ impl FederatedTrustRotationCoordinator {
         if !rotation.activation_barrier_committed {
             return Err(crate::DatspoolError::Configuration(
                 "bilateral activation barrier has not been committed".into(),
+            ));
+        }
+        let mut peer = self.connect_peer_by_id(&rotation.peer_cluster_id).await?;
+        let remote_state = peer
+            .get_remote_trust_rotation(&self.local_cluster_id, rotation_id)
+            .await?;
+        if !remote_state.accepted {
+            return Err(crate::DatspoolError::Internal(
+                "peer rejected the durable trust-rotation read before CA activation".into(),
+            ));
+        }
+        let remote_snapshot: FederatedTrustRotationSnapshot =
+            serde_json::from_str(&remote_state.state_json)
+                .map_err(|error| crate::DatspoolError::Serialization(error.to_string()))?;
+        if !remote_snapshot.rotation.activation_barrier_committed
+            || matches!(
+                remote_snapshot.rotation.phase,
+                FederatedTrustRotationPhase::RollingBack | FederatedTrustRotationPhase::RolledBack
+            )
+        {
+            return Err(crate::DatspoolError::Configuration(
+                "CA activation requires both committed activation barriers and no active rollback"
+                    .into(),
             ));
         }
         let local_expiry = if let Some(expiry) = rotation.local_activation_expires_at_ms {
@@ -1115,7 +1278,9 @@ impl FederatedTrustRotationCoordinator {
             .is_some_and(|fingerprint| {
                 fingerprint.eq_ignore_ascii_case(&rotation.local_ca_bundle_fingerprint)
             });
-        if rotation.phase == FederatedTrustRotationPhase::RecoveryRequired
+        let activation_uncertain = rotation.activation_barrier_committed
+            || remote_rotation.activation_barrier_committed
+            || rotation.phase == FederatedTrustRotationPhase::RecoveryRequired
             || remote_rotation.phase == FederatedTrustRotationPhase::RecoveryRequired
             || rotation.local_activation_expires_at_ms.is_some()
             || rotation.peer_activation_expires_at_ms.is_some()
@@ -1124,8 +1289,17 @@ impl FederatedTrustRotationCoordinator {
             || local_ca_already_active
             || local_ca_was_active
             || remote_ca_already_active
-            || remote_ca_was_active
-        {
+            || remote_ca_was_active;
+        if activation_uncertain {
+            if (rotation.phase == FederatedTrustRotationPhase::RollingBack
+                && rotation.rollback_peer_confirmed)
+                || (remote_rotation.phase == FederatedTrustRotationPhase::RollingBack
+                    && remote_rotation.rollback_peer_confirmed)
+            {
+                return Err(crate::DatspoolError::Internal(
+                    "activation evidence conflicts with a bilaterally confirmed rollback; manual intervention is required".into(),
+                ));
+            }
             self.mark_recovery_required(
                 rotation_id,
                 "a CA activation is committed or uncertain; forward recovery is required",

@@ -344,7 +344,8 @@ impl FederatedTrustRotation {
                 self.apply_retirement(false, at_ms)?;
             }
             FederatedTrustRotationEvent::BeginRollback { reason } => {
-                if self.local_activation_expires_at_ms.is_some()
+                if self.activation_barrier_committed
+                    || self.local_activation_expires_at_ms.is_some()
                     || self.peer_activation_expires_at_ms.is_some()
                     || matches!(
                         self.phase,
@@ -353,7 +354,7 @@ impl FederatedTrustRotation {
                             | FederatedTrustRotationPhase::RecoveryRequired
                     )
                 {
-                    return Err("rollback is forbidden after either side activates; forward recovery is required".into());
+                    return Err("rollback is forbidden after the activation barrier commits or either side activates; forward recovery is required".into());
                 }
                 if reason.trim().is_empty() || reason.len() > 1024 {
                     return Err("rollback reason must contain 1-1024 characters".into());
@@ -410,17 +411,20 @@ impl FederatedTrustRotation {
                 }
             }
             FederatedTrustRotationEvent::MarkRecoveryRequired { reason } => {
-                if (!self.activation_barrier_committed
-                    && self.phase != FederatedTrustRotationPhase::ActivationBarrier)
+                let activation_may_have_been_authorized = self.activation_barrier_committed
+                    || self.phase == FederatedTrustRotationPhase::ActivationBarrier
+                    || (self.local_deployment_ready && self.peer_deployment_ready);
+                if !activation_may_have_been_authorized
                     || matches!(
                         self.phase,
                         FederatedTrustRotationPhase::Completed
                             | FederatedTrustRotationPhase::RolledBack
-                            | FederatedTrustRotationPhase::RollingBack
                     )
+                    || (self.phase == FederatedTrustRotationPhase::RollingBack
+                        && self.rollback_peer_confirmed)
                 {
                     return Err(
-                        "recovery-required is valid only after the activation barrier".into(),
+                        "recovery-required is valid only after activation becomes possible on both sides".into(),
                     );
                 }
                 if reason.trim().is_empty() || reason.len() > 1024 {
@@ -902,6 +906,131 @@ mod tests {
     }
 
     #[test]
+    fn trust_rotation_can_promote_unconfirmed_rollback_to_forward_recovery() {
+        let mut rotation = trust_rotation_fixture();
+        for (event, revision, at_ms) in [
+            (
+                FederatedTrustRotationEvent::LocalStaged {
+                    fingerprint: "c".repeat(64),
+                },
+                0,
+                10,
+            ),
+            (
+                FederatedTrustRotationEvent::PeerStaged {
+                    fingerprint: "b".repeat(64),
+                },
+                1,
+                11,
+            ),
+            (
+                FederatedTrustRotationEvent::LocalDeploymentReady {
+                    leaf_fingerprint: "d".repeat(64),
+                },
+                2,
+                12,
+            ),
+            (
+                FederatedTrustRotationEvent::PeerDeploymentReady {
+                    leaf_fingerprint: "e".repeat(64),
+                },
+                3,
+                13,
+            ),
+            (
+                FederatedTrustRotationEvent::BeginRollback {
+                    reason: "rollback raced remote activation".into(),
+                },
+                4,
+                14,
+            ),
+        ] {
+            rotation.apply_event(event, revision, at_ms).unwrap();
+        }
+        assert_eq!(rotation.phase, FederatedTrustRotationPhase::RollingBack);
+        assert!(
+            rotation
+                .apply_event(FederatedTrustRotationEvent::AuthorizeActivation, 5, 15)
+                .is_err(),
+            "activation authorization must not cross an in-progress rollback fence"
+        );
+        rotation
+            .apply_event(
+                FederatedTrustRotationEvent::MarkRecoveryRequired {
+                    reason: "peer activation became visible before bilateral rollback confirmation"
+                        .into(),
+                },
+                5,
+                15,
+            )
+            .unwrap();
+        assert_eq!(
+            rotation.phase,
+            FederatedTrustRotationPhase::RecoveryRequired
+        );
+        assert!(!rotation.rollback_peer_confirmed);
+        assert!(rotation.local_activation_expires_at_ms.is_none());
+        assert!(rotation.peer_activation_expires_at_ms.is_none());
+        assert!(
+            rotation
+                .apply_event(FederatedTrustRotationEvent::ConfirmRollback, 6, 16)
+                .is_err(),
+            "forward recovery promotion must permanently close rollback confirmation"
+        );
+    }
+
+    #[test]
+    fn trust_rotation_rollback_is_fenced_after_activation_barrier_commit() {
+        let mut rotation = trust_rotation_fixture();
+        for (event, revision, at_ms) in [
+            (
+                FederatedTrustRotationEvent::LocalStaged {
+                    fingerprint: "c".repeat(64),
+                },
+                0,
+                10,
+            ),
+            (
+                FederatedTrustRotationEvent::PeerStaged {
+                    fingerprint: "b".repeat(64),
+                },
+                1,
+                11,
+            ),
+            (
+                FederatedTrustRotationEvent::LocalDeploymentReady {
+                    leaf_fingerprint: "d".repeat(64),
+                },
+                2,
+                12,
+            ),
+            (
+                FederatedTrustRotationEvent::PeerDeploymentReady {
+                    leaf_fingerprint: "e".repeat(64),
+                },
+                3,
+                13,
+            ),
+            (FederatedTrustRotationEvent::AuthorizeActivation, 4, 14),
+        ] {
+            rotation.apply_event(event, revision, at_ms).unwrap();
+        }
+        assert!(rotation.activation_barrier_committed);
+        assert!(
+            rotation
+                .apply_event(
+                    FederatedTrustRotationEvent::BeginRollback {
+                        reason: "too late to roll back".into(),
+                    },
+                    5,
+                    15,
+                )
+                .is_err(),
+            "the committed bilateral activation barrier is the irreversible decision point"
+        );
+    }
+
+    #[test]
     fn trust_rotation_rollback_is_allowed_only_before_any_side_activates() {
         let mut rotation = trust_rotation_fixture();
         rotation
@@ -955,21 +1084,21 @@ mod tests {
                 .is_err(),
             "rollback reason is immutable after the rollback fence is committed"
         );
+        rotation
+            .apply_event(FederatedTrustRotationEvent::ConfirmRollback, 3, 13)
+            .unwrap();
         assert!(
             rotation
                 .apply_event(
                     FederatedTrustRotationEvent::MarkRecoveryRequired {
-                        reason: "must not supersede rollback".into(),
+                        reason: "must not supersede confirmed rollback".into(),
                     },
-                    3,
-                    13,
+                    4,
+                    14,
                 )
                 .is_err(),
-            "recovery-required must not reopen the forward path after rollback starts"
+            "a bilaterally confirmed rollback cannot switch back to forward recovery"
         );
-        rotation
-            .apply_event(FederatedTrustRotationEvent::ConfirmRollback, 3, 13)
-            .unwrap();
         assert!(rotation.rollback_peer_confirmed);
         rotation
             .apply_event(FederatedTrustRotationEvent::LocalRolledBack, 4, 14)
