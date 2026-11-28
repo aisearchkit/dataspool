@@ -180,6 +180,9 @@ pub struct FederatedTrustRotation {
     pub local_retired: bool,
     pub peer_retired: bool,
     pub rollback_reason: Option<String>,
+    /// True only after the peer has durably entered the same pre-activation rollback.
+    #[serde(default)]
+    pub rollback_peer_confirmed: bool,
     pub last_error: Option<String>,
     pub revision: u64,
     pub created_at_ms: i64,
@@ -213,6 +216,7 @@ pub enum FederatedTrustRotationEvent {
     LocalRetired,
     PeerRetired,
     BeginRollback { reason: String },
+    ConfirmRollback,
     LocalRolledBack,
     PeerRolledBack,
     MarkRecoveryRequired { reason: String },
@@ -354,12 +358,38 @@ impl FederatedTrustRotation {
                 if reason.trim().is_empty() || reason.len() > 1024 {
                     return Err("rollback reason must contain 1-1024 characters".into());
                 }
-                self.rollback_reason = Some(reason);
-                self.phase = FederatedTrustRotationPhase::RollingBack;
+                if self.phase == FederatedTrustRotationPhase::RollingBack {
+                    if self.rollback_reason.as_deref() != Some(reason.as_str()) {
+                        return Err(
+                            "rollback reason cannot change after rollback has started".into()
+                        );
+                    }
+                } else {
+                    self.rollback_reason = Some(reason);
+                    self.rollback_peer_confirmed = false;
+                    self.phase = FederatedTrustRotationPhase::RollingBack;
+                }
+            }
+            FederatedTrustRotationEvent::ConfirmRollback => {
+                if self.phase != FederatedTrustRotationPhase::RollingBack
+                    || self.rollback_reason.is_none()
+                    || self.local_activation_expires_at_ms.is_some()
+                    || self.peer_activation_expires_at_ms.is_some()
+                {
+                    return Err(
+                        "peer rollback confirmation requires a pre-activation rolling_back state"
+                            .into(),
+                    );
+                }
+                self.rollback_peer_confirmed = true;
             }
             FederatedTrustRotationEvent::LocalRolledBack => {
-                if self.phase != FederatedTrustRotationPhase::RollingBack {
-                    return Err("local rollback acknowledgement requires rolling_back phase".into());
+                if self.phase != FederatedTrustRotationPhase::RollingBack
+                    || !self.rollback_peer_confirmed
+                    || self.local_activation_expires_at_ms.is_some()
+                    || self.peer_activation_expires_at_ms.is_some()
+                {
+                    return Err("local rollback acknowledgement requires bilateral pre-activation rollback confirmation".into());
                 }
                 self.local_staged = false;
                 if !self.peer_staged {
@@ -367,8 +397,12 @@ impl FederatedTrustRotation {
                 }
             }
             FederatedTrustRotationEvent::PeerRolledBack => {
-                if self.phase != FederatedTrustRotationPhase::RollingBack {
-                    return Err("peer rollback acknowledgement requires rolling_back phase".into());
+                if self.phase != FederatedTrustRotationPhase::RollingBack
+                    || !self.rollback_peer_confirmed
+                    || self.local_activation_expires_at_ms.is_some()
+                    || self.peer_activation_expires_at_ms.is_some()
+                {
+                    return Err("peer rollback acknowledgement requires bilateral pre-activation rollback confirmation".into());
                 }
                 self.peer_staged = false;
                 if !self.local_staged {
@@ -708,6 +742,7 @@ mod tests {
             local_retired: false,
             peer_retired: false,
             rollback_reason: None,
+            rollback_peer_confirmed: false,
             last_error: None,
             revision: 0,
             created_at_ms: 1,
@@ -895,12 +930,40 @@ mod tests {
                 12,
             )
             .unwrap();
+        assert!(
+            rotation
+                .apply_event(FederatedTrustRotationEvent::LocalRolledBack, 3, 13)
+                .is_err(),
+            "a local-only BeginRollback must not authorize material removal"
+        );
+        assert!(
+            rotation
+                .apply_event(FederatedTrustRotationEvent::PeerRolledBack, 3, 13)
+                .is_err(),
+            "peer material removal must also wait for bilateral confirmation"
+        );
+        assert!(
+            rotation
+                .apply_event(
+                    FederatedTrustRotationEvent::BeginRollback {
+                        reason: "different reason".into(),
+                    },
+                    3,
+                    13,
+                )
+                .is_err(),
+            "rollback reason is immutable after the rollback fence is committed"
+        );
         rotation
-            .apply_event(FederatedTrustRotationEvent::LocalRolledBack, 3, 13)
+            .apply_event(FederatedTrustRotationEvent::ConfirmRollback, 3, 13)
+            .unwrap();
+        assert!(rotation.rollback_peer_confirmed);
+        rotation
+            .apply_event(FederatedTrustRotationEvent::LocalRolledBack, 4, 14)
             .unwrap();
         assert_eq!(rotation.phase, FederatedTrustRotationPhase::RollingBack);
         rotation
-            .apply_event(FederatedTrustRotationEvent::PeerRolledBack, 4, 14)
+            .apply_event(FederatedTrustRotationEvent::PeerRolledBack, 5, 15)
             .unwrap();
         assert_eq!(rotation.phase, FederatedTrustRotationPhase::RolledBack);
 

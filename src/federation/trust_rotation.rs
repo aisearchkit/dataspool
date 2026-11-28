@@ -239,8 +239,38 @@ impl FederatedTrustRotationProcessCoordinator {
             )?;
         }
 
-        // Re-read after both BeginRollback commits. A crash can occur after any
-        // one of the following four side-specific acknowledgements.
+        // Both BeginRollback events must be durable before either side is
+        // authorized to remove staged material. Persist the peer confirmation
+        // independently on both Raft groups so recovery can resume this barrier.
+        let (local_rolling, peer_rolling) = self.read_snapshots().await?;
+        if local_rolling.rotation.phase != FederatedTrustRotationPhase::RolledBack
+            && !local_rolling.rotation.rollback_peer_confirmed
+        {
+            Self::ensure_remote_success(
+                self.local_client
+                    .advance_remote_trust_rotation(
+                        &self.peer_cluster_id,
+                        &self.rotation_id,
+                        &format!("{}:confirm-local-rollback", self.request_prefix),
+                        &FederatedTrustRotationEvent::ConfirmRollback,
+                    )
+                    .await?,
+            )?;
+        }
+        if peer_rolling.rotation.phase != FederatedTrustRotationPhase::RolledBack
+            && !peer_rolling.rotation.rollback_peer_confirmed
+        {
+            Self::ensure_remote_success(
+                self.peer_client
+                    .advance_remote_trust_rotation(
+                        &self.local_cluster_id,
+                        &self.rotation_id,
+                        &format!("{}:confirm-peer-rollback", self.request_prefix),
+                        &FederatedTrustRotationEvent::ConfirmRollback,
+                    )
+                    .await?,
+            )?;
+        }
         let (local_rolling, peer_rolling) = self.read_snapshots().await?;
         if peer_rolling.rotation.phase == FederatedTrustRotationPhase::RollingBack {
             if peer_rolling.rotation.local_staged {
@@ -626,6 +656,7 @@ impl FederatedTrustRotationCoordinator {
             local_retired: false,
             peer_retired: false,
             rollback_reason: None,
+            rollback_peer_confirmed: false,
             last_error: None,
             revision: 0,
             created_at_ms: now,
@@ -1109,6 +1140,44 @@ impl FederatedTrustRotationCoordinator {
                     rotation_id,
                     &format!("{request_id}:peer-begin"),
                     &begin,
+                )
+                .await?,
+            )?;
+        }
+
+        // The local coordinator has observed both durable BeginRollback commits.
+        // Record that bilateral barrier on each side before allowing material
+        // cleanup; each confirmation has its own replay-stable request identity.
+        let current_rotation = self.get_rotation(rotation_id).await?;
+        if current_rotation.phase == FederatedTrustRotationPhase::RollingBack
+            && !current_rotation.rollback_peer_confirmed
+        {
+            self.advance_local(
+                rotation_id,
+                FederatedTrustRotationEvent::ConfirmRollback,
+                &format!("{request_id}:confirm-local"),
+                chrono::Utc::now().timestamp_millis(),
+                &audit_actor,
+            )
+            .await?;
+        }
+        let mut peer = self.connect_peer_by_id(&rotation.peer_cluster_id).await?;
+        let remote_state = peer
+            .get_remote_trust_rotation(&self.local_cluster_id, rotation_id)
+            .await?;
+        remote_rotation =
+            serde_json::from_str::<FederatedTrustRotationSnapshot>(&remote_state.state_json)
+                .map_err(|error| crate::DatspoolError::Serialization(error.to_string()))?
+                .rotation;
+        if remote_rotation.phase == FederatedTrustRotationPhase::RollingBack
+            && !remote_rotation.rollback_peer_confirmed
+        {
+            self.ensure_remote_success(
+                peer.advance_remote_trust_rotation(
+                    &self.local_cluster_id,
+                    rotation_id,
+                    &format!("{request_id}:confirm-peer"),
+                    &FederatedTrustRotationEvent::ConfirmRollback,
                 )
                 .await?,
             )?;

@@ -948,6 +948,7 @@ async fn seed_coordinator_rotation(
         local_retired: false,
         peer_retired: false,
         rollback_reason: None,
+        rollback_peer_confirmed: false,
         last_error: None,
         revision: 0,
         created_at_ms: now,
@@ -2494,7 +2495,7 @@ async fn federated_trust_rotation_rollback_recovers_after_local_and_remote_ack_l
                         &source_grpc,
                         &target_ack_marker,
                         &target_ack_gate,
-                        1,
+                        2,
                     )
                 };
             children.push(rollback_raft_child_process(
@@ -2641,6 +2642,8 @@ async fn federated_trust_rotation_rollback_recovers_after_local_and_remote_ack_l
         target_after_remote_crash.rotation.phase,
         FederatedTrustRotationPhase::RollingBack
     );
+    assert!(source_after_remote_crash.rotation.rollback_peer_confirmed);
+    assert!(target_after_remote_crash.rotation.rollback_peer_confirmed);
     assert!(!target_after_remote_crash.rotation.local_staged);
     assert!(target_after_remote_crash.rotation.peer_staged);
     assert!(

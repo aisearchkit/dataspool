@@ -1387,6 +1387,7 @@ impl<S: KvStore + Clone> MetaStateMachine<S> {
                     .peer_leaf_fingerprint
                     .eq_ignore_ascii_case(&new_fingerprint)
                 && (rotation.phase != crate::federation::FederatedTrustRotationPhase::RollingBack
+                    || !rotation.rollback_peer_confirmed
                     || rotation.local_activation_expires_at_ms.is_some()
                     || rotation.peer_activation_expires_at_ms.is_some())
             {
@@ -1475,6 +1476,7 @@ impl<S: KvStore + Clone> MetaStateMachine<S> {
                     .peer_leaf_fingerprint
                     .eq_ignore_ascii_case(&new_fingerprint)
                 && (rotation.phase != crate::federation::FederatedTrustRotationPhase::RollingBack
+                    || !rotation.rollback_peer_confirmed
                     || rotation.local_activation_expires_at_ms.is_some()
                     || rotation.peer_activation_expires_at_ms.is_some())
             {
@@ -1567,6 +1569,7 @@ impl<S: KvStore + Clone> MetaStateMachine<S> {
                     .peer_ca_bundle_fingerprint
                     .eq_ignore_ascii_case(&bundle_fingerprint)
                 && (rotation.phase != crate::federation::FederatedTrustRotationPhase::RollingBack
+                    || !rotation.rollback_peer_confirmed
                     || rotation.local_activation_expires_at_ms.is_some()
                     || rotation.peer_activation_expires_at_ms.is_some())
             {
@@ -4639,6 +4642,7 @@ mod tests {
             local_retired: false,
             peer_retired: false,
             rollback_reason: None,
+            rollback_peer_confirmed: false,
             last_error: None,
             revision: 0,
             created_at_ms: 1_000,

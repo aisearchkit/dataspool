@@ -524,6 +524,7 @@ fn invert_trust_rotation_event(
         Event::LocalRetired => Event::PeerRetired,
         Event::PeerRetired => Event::LocalRetired,
         Event::BeginRollback { reason } => Event::BeginRollback { reason },
+        Event::ConfirmRollback => Event::ConfirmRollback,
         Event::LocalRolledBack => Event::PeerRolledBack,
         Event::PeerRolledBack => Event::LocalRolledBack,
         Event::MarkRecoveryRequired { reason } => Event::MarkRecoveryRequired { reason },
@@ -1196,6 +1197,7 @@ impl task::task_service_server::TaskService for Arc<RwLock<TaskServiceImpl>> {
             local_retired: false,
             peer_retired: false,
             rollback_reason: None,
+            rollback_peer_confirmed: false,
             last_error: None,
             revision: 0,
             created_at_ms: now,
@@ -1512,6 +1514,7 @@ impl task::task_service_server::TaskService for Arc<RwLock<TaskServiceImpl>> {
             crate::federation::FederatedTrustRotationEvent::LocalRolledBack
                 if rotation.local_activation_expires_at_ms.is_some()
                     || rotation.peer_activation_expires_at_ms.is_some()
+                    || !rotation.rollback_peer_confirmed
                     || rotation.phase
                         != crate::federation::FederatedTrustRotationPhase::RollingBack =>
             {
