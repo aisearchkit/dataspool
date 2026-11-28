@@ -946,8 +946,31 @@ async fn metrics<S: KvStore + Clone>(State(state): State<ApiState<S>>) -> Respon
     body.push_str(&format!(
         "dataspool_federation_trust_rotation_stalled {stalled_rotations}\ndataspool_federation_trust_rotation_recovery_required {recovery_required_rotations}\ndataspool_federation_trust_rotation_errors {rotations_with_errors}\n"
     ));
-    body.push_str("# HELP dataspool_federation_trust_rotation_overlap_remaining_seconds Remaining CA overlap duration per rotation\n# TYPE dataspool_federation_trust_rotation_overlap_remaining_seconds gauge\n");
+    body.push_str("# HELP dataspool_federation_trust_rotation_overlap_remaining_seconds Remaining CA overlap duration per rotation\n# TYPE dataspool_federation_trust_rotation_overlap_remaining_seconds gauge\n# HELP dataspool_federation_trust_rotation_age_seconds Age of a trust rotation since creation\n# TYPE dataspool_federation_trust_rotation_age_seconds gauge\n# HELP dataspool_federation_trust_rotation_phase_age_seconds Time spent in the current trust rotation phase\n# TYPE dataspool_federation_trust_rotation_phase_age_seconds gauge\n# HELP dataspool_federation_trust_rotation_last_error Whether the rotation has a persisted last error\n# TYPE dataspool_federation_trust_rotation_last_error gauge\n");
     for rotation in &rotations {
+        let label = rotation
+            .rotation_id
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('\n', "\\n");
+        let phase = match rotation.phase {
+            FederatedTrustRotationPhase::Staging => "staging",
+            FederatedTrustRotationPhase::AwaitingDeployment => "awaiting_deployment",
+            FederatedTrustRotationPhase::ActivationBarrier => "activation_barrier",
+            FederatedTrustRotationPhase::Activating => "activating",
+            FederatedTrustRotationPhase::RecoveryRequired => "recovery_required",
+            FederatedTrustRotationPhase::Overlap => "overlap",
+            FederatedTrustRotationPhase::Retiring => "retiring",
+            FederatedTrustRotationPhase::Completed => "completed",
+            FederatedTrustRotationPhase::RollingBack => "rolling_back",
+            FederatedTrustRotationPhase::RolledBack => "rolled_back",
+        };
+        let age = now_ms.saturating_sub(rotation.created_at_ms).max(0) as f64 / 1000.0;
+        let phase_age = now_ms.saturating_sub(rotation.updated_at_ms).max(0) as f64 / 1000.0;
+        let last_error = i32::from(rotation.last_error.is_some());
+        body.push_str(&format!(
+            "dataspool_federation_trust_rotation_age_seconds{{rotation_id=\"{label}\",phase=\"{phase}\"}} {age:.3}\ndataspool_federation_trust_rotation_phase_age_seconds{{rotation_id=\"{label}\",phase=\"{phase}\"}} {phase_age:.3}\ndataspool_federation_trust_rotation_last_error{{rotation_id=\"{label}\"}} {last_error}\n"
+        ));
         if matches!(
             rotation.phase,
             FederatedTrustRotationPhase::Overlap | FederatedTrustRotationPhase::Retiring
@@ -956,13 +979,8 @@ async fn metrics<S: KvStore + Clone>(State(state): State<ApiState<S>>) -> Respon
             .zip(rotation.peer_activation_expires_at_ms)
             .map(|(local, peer)| local.max(peer))
         {
-            let label = rotation
-                .rotation_id
-                .replace('\\', "\\\\")
-                .replace('"', "\\\"")
-                .replace('\n', "\\n");
             let remaining = deadline.saturating_sub(now_ms).max(0) as f64 / 1000.0;
-            body.push_str(&format!("dataspool_federation_trust_rotation_overlap_remaining_seconds{{rotation_id=\"{label}\"}} {remaining:.3}\n"));
+            body.push_str(&format!("dataspool_federation_trust_rotation_overlap_remaining_seconds{{rotation_id=\"{label}\",phase=\"{phase}\"}} {remaining:.3}\n"));
         }
     }
     for node in &metrics.node_load {

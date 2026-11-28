@@ -1,0 +1,59 @@
+groups:
+  - name: dataspool-federation-trust-rotation
+    rules:
+      - alert: DataspoolFederationTrustRotationStalled
+        expr: dataspool_federation_trust_rotation_stalled > 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: Federated trust rotation is stalled
+          description: At least one recoverable trust-rotation transition has not progressed for more than 30 seconds.
+
+      - alert: DataspoolFederationTrustRotationNeedsForwardRecovery
+        expr: dataspool_federation_trust_rotation_recovery_required > 0
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: Federated trust rotation requires forward recovery
+          description: An activation decision is committed and the coordinator must converge both clusters.
+
+      - alert: DataspoolFederationTrustRotationHasError
+        expr: dataspool_federation_trust_rotation_last_error > 0
+        for: 30s
+        labels:
+          severity: warning
+        annotations:
+          summary: Federated trust rotation has a persisted error
+          description: Inspect the bilateral diagnostics and per-rotation audit history before recovery.
+
+      - alert: DataspoolFederationTrustRotationOverlapExpiring
+        expr: dataspool_federation_trust_rotation_overlap_remaining_seconds{phase="overlap"} < 3600
+          and dataspool_federation_trust_rotation_overlap_remaining_seconds{phase="overlap"} > 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: Federated CA overlap expires within one hour
+          description: Confirm both clusters are healthy and retirement can proceed at the persisted deadline.
+
+      - alert: DataspoolFederationTrustRotationRetirementOverdue
+        expr: dataspool_federation_trust_rotation_overlap_remaining_seconds{phase="overlap"} == 0
+          or (dataspool_federation_trust_rotation_overlap_remaining_seconds{phase="retiring"} == 0
+          and dataspool_federation_trust_rotation_phase_age_seconds{phase="retiring"} > 300)
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: Federated CA retirement is overdue
+          description: The overlap deadline has passed but retirement has not converged on both clusters.
+
+      - alert: DataspoolFederationTrustRotationAwaitingOperator
+        expr: dataspool_federation_trust_rotation_phase_age_seconds{phase="activation_barrier"} > 900
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: Federated trust rotation is waiting for operator authorization
+          description: Both deployment readiness proofs are staged; review diagnostics and authorize or roll back before the activation barrier is committed.

@@ -59,6 +59,13 @@ The authenticated /metrics endpoint exports:
 - dataspool_federation_trust_rotation_stalled — stale recoverable transitions (30-second threshold).
 - dataspool_federation_trust_rotation_recovery_required — rotations requiring forward recovery.
 - dataspool_federation_trust_rotation_errors — rotations with a persisted last error.
-- dataspool_federation_trust_rotation_overlap_remaining_seconds{rotation_id} — remaining overlap for each rotation in Overlap or Retiring.
+- dataspool_federation_trust_rotation_last_error{rotation_id} — per-rotation persisted-error indicator.
+- dataspool_federation_trust_rotation_age_seconds{rotation_id,phase} — total time since rotation creation.
+- dataspool_federation_trust_rotation_phase_age_seconds{rotation_id,phase} — time spent in the current phase.
+- dataspool_federation_trust_rotation_overlap_remaining_seconds{rotation_id,phase} — remaining overlap for each rotation in Overlap or Retiring.
 
 The ActivationBarrier and AwaitingDeployment phases are intentionally reported separately from stalled transitions because they may be waiting for explicit operator action or external certificate deployment.
+
+## Alert rules
+
+The Prometheus rule group in deploy/prometheus/federation-trust-rotation-alerts.yml covers stalled transitions, forward-recovery requirements, persisted errors, overlap expiry, overdue retirement, and long waits at the activation barrier. Review the thresholds against the expected deployment and overlap windows before enabling paging.
