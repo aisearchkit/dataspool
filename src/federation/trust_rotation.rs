@@ -154,6 +154,16 @@ impl FederatedTrustRotationProcessCoordinator {
         }
         let (local_before, peer_before) = self.read_snapshots().await?;
         for snapshot in [&local_before, &peer_before] {
+            if snapshot
+                .rotation
+                .rollback_reason
+                .as_deref()
+                .is_some_and(|existing| existing != reason)
+            {
+                return Err(crate::DatspoolError::Configuration(
+                    "rollback reason cannot change after either side has begun rollback".into(),
+                ));
+            }
             let rotation = &snapshot.rotation;
             let candidate_is_active =
                 snapshot
@@ -1067,6 +1077,19 @@ impl FederatedTrustRotationCoordinator {
             serde_json::from_str(&remote_state.state_json)
                 .map_err(|error| crate::DatspoolError::Serialization(error.to_string()))?;
         let mut remote_rotation = remote_snapshot.rotation;
+        for existing_reason in [
+            rotation.rollback_reason.as_deref(),
+            remote_rotation.rollback_reason.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if existing_reason != reason {
+                return Err(crate::DatspoolError::Configuration(
+                    "rollback reason cannot change after either side has begun rollback".into(),
+                ));
+            }
+        }
         let local_peer_record = self.peer_record(&rotation.peer_cluster_id).await?;
         let local_ca_already_active = local_peer_record
             .trust_bundle_fingerprint

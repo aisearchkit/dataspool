@@ -697,6 +697,17 @@ async fn run_rollback_coordinator_process() {
     )
     .await
     .unwrap();
+    if phase == "wrong-reason" {
+        let result = coordinator
+            .rollback_before_activation("different operator rollback reason")
+            .await;
+        assert!(
+            result.is_err(),
+            "recovery must reject a changed rollback reason before touching the peer"
+        );
+        std::fs::write(&marker, b"changed-rollback-reason-rejected").unwrap();
+        return;
+    }
     if matches!(phase.as_str(), "initial" | "recover-first") {
         let result = coordinator
             .rollback_before_activation("operator requested rollback before activation")
@@ -2468,6 +2479,7 @@ async fn federated_trust_rotation_rollback_recovers_after_local_and_remote_ack_l
     let target_ack_marker = root.path().join("target-rollback-committed.marker");
     let target_ack_gate = root.path().join("target-rollback-ack.release");
     let initial_marker = root.path().join("rollback-coordinator-initial.marker");
+    let wrong_reason_marker = root.path().join("rollback-coordinator-wrong-reason.marker");
     let recovered_marker = root.path().join("rollback-coordinator-recovered.marker");
     let mut groups = Vec::new();
     for cluster in ["source", "target"] {
@@ -2604,6 +2616,27 @@ async fn federated_trust_rotation_rollback_recovers_after_local_and_remote_ack_l
             .rotation
             .peer_activation_expires_at_ms
             .is_none()
+    );
+
+    // A new operator reason must not fork the two durable rollback records.
+    let mut wrong_reason = rollback_coordinator_process_child(
+        "wrong-reason",
+        &format!("https://{source_grpc}"),
+        &format!("https://{target_grpc}"),
+        &cert_dir,
+        &wrong_reason_marker,
+    );
+    wait_for_file(
+        &wrong_reason_marker,
+        std::slice::from_mut(&mut wrong_reason),
+    )
+    .await;
+    assert!(wrong_reason.wait().unwrap().success());
+    let target_after_wrong_reason = read_snapshot(format!("https://{target_grpc}"), "source").await;
+    assert_eq!(
+        target_after_wrong_reason.rotation.phase,
+        FederatedTrustRotationPhase::ActivationBarrier,
+        "a changed reason must not start rollback on the peer"
     );
 
     // Resume once: the peer's BeginRollback commits, then its first local
