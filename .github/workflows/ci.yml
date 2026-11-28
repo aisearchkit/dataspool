@@ -112,6 +112,9 @@ jobs:
         run: cargo test --test postgres_cutover -- --nocapture
       - name: Run multi-member Raft failover integration
         run: cargo test --test raft_failover --all-features -- --nocapture
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
       - name: Build deployable Dataspool binary
         run: cargo build --bin dataspool
       - name: Smoke-test deployed operator recovery API and authenticated audit identity

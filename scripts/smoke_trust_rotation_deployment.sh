@@ -3,14 +3,19 @@ set -euo pipefail
 
 binary="${DATASPOOL_BINARY:-target/debug/dataspool}"
 if [[ ! -x "$binary" ]]; then echo "Dataspool binary not executable: $binary" >&2; exit 1; fi
-for tool in openssl curl python3; do command -v "$tool" >/dev/null || { echo "missing required tool: $tool" >&2; exit 1; }; done
+for tool in openssl curl python3 node google-chrome; do command -v "$tool" >/dev/null || { echo "missing required tool: $tool" >&2; exit 1; }; done
 
 http_port="${DATASPOOL_SMOKE_HTTP_PORT:-58080}"
 raft_port="${DATASPOOL_SMOKE_RAFT_PORT:-58081}"
 task_port="${DATASPOOL_SMOKE_TASK_PORT:-58082}"
 tmp="$(mktemp -d)"
 pid=""
+chrome_pid=""
 cleanup() {
+  if [[ -n "$chrome_pid" ]] && kill -0 "$chrome_pid" 2>/dev/null; then
+    kill -TERM "$chrome_pid" 2>/dev/null || true
+    wait "$chrome_pid" 2>/dev/null || true
+  fi
   if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
     kill -TERM "$pid" 2>/dev/null || true
     for _ in $(seq 1 50); do kill -0 "$pid" 2>/dev/null || break; sleep 0.1; done
@@ -45,6 +50,7 @@ s=s.replace('/var/lib/dataspool', str(root/'data'))
 PY
 
 operator_token="$(openssl rand -hex 32)"
+auditor_token="$(openssl rand -hex 32)"
 printf '%s' "$operator_token" >"$tmp/operator-token"
 chmod 600 "$tmp/operator-token"
 export DATASPOOL_CONFIG="$tmp/config.yaml"
@@ -54,7 +60,7 @@ export DATASPOOL_RAFT_BIND="127.0.0.1:$raft_port"
 export DATASPOOL_RAFT_ADVERTISE_ADDR="127.0.0.1:$raft_port"
 export DATASPOOL_RAFT_TOKEN="$(openssl rand -hex 32)"
 export DATASPOOL_FEDERATION_CLUSTER_ID="operator-ui-smoke"
-export DATASPOOL_ADMIN_OPERATORS="$(python3 -c 'import json,sys; print(json.dumps({"smoke-operator":sys.argv[1]}))' "$operator_token")"
+export DATASPOOL_ADMIN_OPERATORS="$(python3 -c 'import json,sys; print(json.dumps({"smoke-operator":sys.argv[1],"smoke-auditor":sys.argv[2]}))' "$operator_token" "$auditor_token")"
 unset DATASPOOL_ADMIN_TOKEN || true
 
 "$binary" >"$tmp/dataspool.log" 2>&1 & pid=$!
@@ -74,6 +80,11 @@ python3 - "$session" <<'PY'
 import json,sys
 value=json.loads(sys.argv[1]); assert value == {'actor':'smoke-operator'}, value
 PY
+auditor_session="$(curl --silent --fail -H "Authorization: Bearer $auditor_token" -H 'X-Dataspool-Actor: forged-admin' "$base/api/v1/session")"
+python3 - "$auditor_session" <<'PY'
+import json,sys
+value=json.loads(sys.argv[1]); assert value == {'actor':'smoke-auditor'}, value
+PY
 rotations="$(curl --silent --fail -H "Authorization: Bearer $operator_token" -H 'X-Dataspool-Actor: forged-admin' "$base/api/v1/federation/trust-rotations/operator-view?limit=20&offset=0")"
 python3 - "$rotations" <<'PY'
 import json,sys
@@ -87,6 +98,12 @@ recovery_status="$(curl --silent --output "$tmp/recovery-response.json" --write-
   -d '{"request_id":"smoke-request-0001","expected_action":"forward_recovery"}' \
   "$base/api/v1/federation/trust-rotations/nonexistent-smoke-rotation/recover")"
 [[ "$recovery_status" == "502" ]] || { cat "$tmp/recovery-response.json" >&2; echo "missing rotation recovery returned HTTP $recovery_status, expected 502" >&2; exit 1; }
+replay_status="$(curl --silent --output /dev/null --write-out '%{http_code}' \
+  -X POST -H "Authorization: Bearer $operator_token" -H 'X-Dataspool-Actor: forged-admin' \
+  -H 'Content-Type: application/json' \
+  -d '{"request_id":"smoke-request-0001","expected_action":"forward_recovery"}' \
+  "$base/api/v1/federation/trust-rotations/nonexistent-smoke-rotation/recover")"
+[[ "$replay_status" == "502" ]] || { echo "replayed recovery returned HTTP $replay_status, expected 502" >&2; exit 1; }
 audit="$(curl --silent --fail -H "Authorization: Bearer $operator_token" -H 'X-Dataspool-Actor: forged-admin' \
   "$base/api/v1/federation/trust-rotations/nonexistent-smoke-rotation/audit?limit=10")"
 python3 - "$audit" <<'PY'
@@ -105,18 +122,21 @@ grep -qi '^cache-control: no-store' <<<"$headers" || { echo "authenticated API r
 html="$(curl --silent --fail "$base/admin/trust-rotations")"
 grep -q 'Operator confirmation' <<<"$html"
 grep -q 'ActivationBarrier is committed' <<<"$html"
-if command -v google-chrome >/dev/null 2>&1; then
-  google-chrome --headless --no-sandbox --disable-gpu --disable-dev-shm-usage \
-    --disable-background-networking --virtual-time-budget=1000 --dump-dom \
-    "$base/admin/trust-rotations" >"$tmp/browser-dom.html" 2>"$tmp/browser.log"
-  grep -q 'Trust rotation' "$tmp/browser-dom.html"
-  grep -q 'Operator confirmation' "$tmp/browser-dom.html"
-  printf 'PASS: Chrome headless rendered the live operator UI\n'
-fi
+google-chrome --headless --no-sandbox --disable-gpu --disable-dev-shm-usage \
+  --disable-background-networking --no-first-run --no-default-browser-check \
+  --remote-debugging-port=0 --user-data-dir="$tmp/chrome" about:blank \
+  >"$tmp/browser.log" 2>&1 & chrome_pid=$!
+for _ in $(seq 1 100); do
+  [[ -s "$tmp/chrome/DevToolsActivePort" ]] && break
+  kill -0 "$chrome_pid" 2>/dev/null || { cat "$tmp/browser.log" >&2; echo "Chrome exited before DevTools became ready" >&2; exit 1; }
+  sleep 0.1
+done
+[[ -s "$tmp/chrome/DevToolsActivePort" ]] || { cat "$tmp/browser.log" >&2; echo "Timed out waiting for Chrome DevTools" >&2; exit 1; }
+node scripts/smoke_trust_rotation_browser.mjs "$base" "$operator_token" smoke-operator "$tmp/chrome/DevToolsActivePort"
 
 printf 'PASS: real Dataspool process started with single-node Raft and mTLS gRPC\n'
-printf 'PASS: anonymous API access rejected; per-operator bearer resolved to smoke-operator\n'
-printf 'PASS: forged actor header ignored; audit actor/request ID/outcome/real Raft index verified\n'
+printf 'PASS: anonymous API rejected; two distinct bearer credentials resolve to their configured operator identities\n'
+printf 'PASS: forged actor header ignored; replayed failure produces one audit event with authenticated actor, request ID, outcome and real Raft index\n'
 printf 'PASS: sanitized operator registry, no-store API response and served operator UI\n'
 if [[ "${DATASPOOL_SMOKE_HOLD:-0}" == "1" ]]; then
   printf 'BROWSER_URL=%s/admin/trust-rotations\n' "$base"
