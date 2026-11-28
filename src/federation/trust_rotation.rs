@@ -63,6 +63,17 @@ pub struct FederatedTrustRotationSideDiagnostics {
     pub updated_at_ms: i64,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FederatedTrustRotationProgressStatus {
+    Waiting,
+    Progressing,
+    AutomaticRecovery,
+    Stalled,
+    ManualInterventionRequired,
+    Terminal,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FederatedTrustRotationDiagnostics {
     pub rotation_id: String,
@@ -75,6 +86,14 @@ pub struct FederatedTrustRotationDiagnostics {
     pub automated_recovery_safe: bool,
     pub stalled: bool,
     pub stalled_for_ms: i64,
+    pub progress_status: FederatedTrustRotationProgressStatus,
+    pub last_progress_at_ms: i64,
+    pub stall_threshold_ms: Option<i64>,
+    pub last_audit_action: Option<String>,
+    pub last_audit_outcome: Option<String>,
+    pub last_audit_at_ms: Option<i64>,
+    pub diagnosis_reason: String,
+    pub recovery_guidance: String,
     pub observed_at_ms: i64,
 }
 
@@ -375,16 +394,23 @@ fn build_rotation_diagnostics(
     } else {
         FederatedTrustRotationRecoveryAction::AwaitOperator
     };
-    let updated_at = left.updated_at_ms.min(right.updated_at_ms);
-    let stalled_for_ms = now_ms.saturating_sub(updated_at).max(0);
-    let stalled = stalled_for_ms >= 30_000
-        && matches!(
-            recommended_action,
-            FederatedTrustRotationRecoveryAction::ContinueStaging
-                | FederatedTrustRotationRecoveryAction::ResumeRollback
-                | FederatedTrustRotationRecoveryAction::ForwardRecovery
-                | FederatedTrustRotationRecoveryAction::RetireBoth
-        );
+    // The older of the two durable timestamps is the conservative bilateral
+    // progress watermark: one side advancing cannot hide a peer that is stuck.
+    let last_progress_at_ms = left.updated_at_ms.min(right.updated_at_ms);
+    let stalled_for_ms = now_ms.saturating_sub(last_progress_at_ms).max(0);
+    let phase_threshold_ms = |phase| match phase {
+        FederatedTrustRotationPhase::Staging => Some(60_000),
+        FederatedTrustRotationPhase::ActivationBarrier
+        | FederatedTrustRotationPhase::Activating
+        | FederatedTrustRotationPhase::RecoveryRequired => Some(15_000),
+        FederatedTrustRotationPhase::RollingBack => Some(30_000),
+        FederatedTrustRotationPhase::Retiring => Some(60_000),
+        _ => None,
+    };
+    let stall_threshold_ms = phase_threshold_ms(left.phase)
+        .into_iter()
+        .chain(phase_threshold_ms(right.phase))
+        .max();
     let automated_recovery_safe = matches!(
         recommended_action,
         FederatedTrustRotationRecoveryAction::ContinueStaging
@@ -392,6 +418,82 @@ fn build_rotation_diagnostics(
             | FederatedTrustRotationRecoveryAction::ForwardRecovery
             | FederatedTrustRotationRecoveryAction::RetireBoth
     );
+    let stalled = automated_recovery_safe
+        && stall_threshold_ms.is_some_and(|threshold| stalled_for_ms >= threshold);
+    let progress_status = if !safety_violations.is_empty() {
+        FederatedTrustRotationProgressStatus::ManualInterventionRequired
+    } else if matches!(
+        left.phase,
+        FederatedTrustRotationPhase::Completed | FederatedTrustRotationPhase::RolledBack
+    ) && matches!(
+        right.phase,
+        FederatedTrustRotationPhase::Completed | FederatedTrustRotationPhase::RolledBack
+    ) {
+        FederatedTrustRotationProgressStatus::Terminal
+    } else if matches!(
+        recommended_action,
+        FederatedTrustRotationRecoveryAction::WaitForOverlap
+            | FederatedTrustRotationRecoveryAction::AwaitOperator
+            | FederatedTrustRotationRecoveryAction::NoAction
+    ) {
+        FederatedTrustRotationProgressStatus::Waiting
+    } else if stalled {
+        FederatedTrustRotationProgressStatus::Stalled
+    } else {
+        FederatedTrustRotationProgressStatus::Progressing
+    };
+    let diagnosis_reason = match progress_status {
+        FederatedTrustRotationProgressStatus::ManualInterventionRequired => {
+            "bilateral safety invariants are violated; automatic recovery is blocked".to_string()
+        }
+        FederatedTrustRotationProgressStatus::Terminal => {
+            "both clusters report a terminal lifecycle state".to_string()
+        }
+        FederatedTrustRotationProgressStatus::Waiting
+            if recommended_action == FederatedTrustRotationRecoveryAction::WaitForOverlap =>
+        {
+            "the persisted bilateral overlap deadline has not elapsed".to_string()
+        }
+        FederatedTrustRotationProgressStatus::Waiting
+            if left.phase == FederatedTrustRotationPhase::AwaitingDeployment
+                || right.phase == FederatedTrustRotationPhase::AwaitingDeployment =>
+        {
+            "waiting for external certificate deployment and explicit readiness confirmation"
+                .to_string()
+        }
+        FederatedTrustRotationProgressStatus::Waiting => {
+            "waiting for explicit operator authorization or an external prerequisite".to_string()
+        }
+        FederatedTrustRotationProgressStatus::Stalled => format!(
+            "no bilateral durable progress for {stalled_for_ms}ms; phase threshold is {}ms",
+            stall_threshold_ms.unwrap_or_default()
+        ),
+        FederatedTrustRotationProgressStatus::AutomaticRecovery => {
+            "the background reconciler has recently attempted to advance the persisted workflow"
+                .to_string()
+        }
+        FederatedTrustRotationProgressStatus::Progressing => {
+            "the rotation remains within its phase-specific progress window".to_string()
+        }
+    };
+    let recovery_guidance = match recommended_action {
+        FederatedTrustRotationRecoveryAction::ContinueStaging =>
+            "allow the reconciler to replay the idempotent staging operation; if stalled, inspect peer gRPC/Raft reachability, then POST /recover with expected_action=continue_staging".to_string(),
+        FederatedTrustRotationRecoveryAction::ResumeRollback =>
+            "allow bilateral pre-activation rollback reconciliation; verify neither side committed the activation barrier, then POST /recover with expected_action=resume_rollback".to_string(),
+        FederatedTrustRotationRecoveryAction::ForwardRecovery =>
+            "do not roll back; restore peer connectivity and let the reconciler complete the committed activation path, or POST /recover with expected_action=forward_recovery".to_string(),
+        FederatedTrustRotationRecoveryAction::RetireBoth =>
+            "the persisted overlap deadline has elapsed; verify both expiry records and let the reconciler retire both previous CAs, or POST /recover with expected_action=retire_both".to_string(),
+        FederatedTrustRotationRecoveryAction::WaitForOverlap =>
+            "do not retire either CA; retain both trust roots until the later persisted bilateral expiry".to_string(),
+        FederatedTrustRotationRecoveryAction::AwaitOperator =>
+            "complete external certificate deployment and readiness checks; then explicitly authorize activation, or resolve the outstanding operator decision".to_string(),
+        FederatedTrustRotationRecoveryAction::NoAction =>
+            "no action is required; both sides are terminal".to_string(),
+        FederatedTrustRotationRecoveryAction::ManualInterventionRequired =>
+            "stop automated recovery; compare bilateral Raft records, CA/leaf fingerprints and expiry values, resolve the invariant violation under change control, then re-run diagnostics".to_string(),
+    };
     FederatedTrustRotationDiagnostics {
         rotation_id: rotation_id.to_string(),
         local: local_status,
@@ -403,6 +505,14 @@ fn build_rotation_diagnostics(
         automated_recovery_safe,
         stalled,
         stalled_for_ms,
+        progress_status,
+        last_progress_at_ms,
+        stall_threshold_ms,
+        last_audit_action: None,
+        last_audit_outcome: None,
+        last_audit_at_ms: None,
+        diagnosis_reason,
+        recovery_guidance,
         observed_at_ms: now_ms,
     }
 }
@@ -2125,14 +2235,43 @@ impl FederatedTrustRotationCoordinator {
             peer_active_identity_fingerprint: peer_record.identity_fingerprint,
             peer_pending_identity_fingerprint: peer_record.pending_identity_fingerprint,
         };
-        Ok(build_rotation_diagnostics(
+        let mut diagnostics = build_rotation_diagnostics(
             rotation_id,
             &self.local_cluster_id,
             &peer_record.cluster_id,
             local_snapshot,
             peer_snapshot,
             chrono::Utc::now().timestamp_millis(),
-        ))
+        );
+        // Audit is a durable explanation of progress, not the clock source: the
+        // bilateral Raft timestamps remain authoritative and avoid treating a
+        // failed/rejected request as progress.
+        let resource_id = format!("federated_trust_rotation:{rotation_id}");
+        if let Some(event) = self
+            .store
+            .list_all_audit_events_for_resource(&resource_id)
+            .await?
+            .into_iter()
+            .max_by_key(|event| (event.occurred_at_ms, event.log_index))
+        {
+            let recent_reconcile = event.action == "federation.trust_rotation.reconcile"
+                && diagnostics
+                    .observed_at_ms
+                    .saturating_sub(event.occurred_at_ms)
+                    <= 15_000;
+            diagnostics.last_audit_action = Some(event.action);
+            diagnostics.last_audit_outcome = Some(event.outcome);
+            diagnostics.last_audit_at_ms = Some(event.occurred_at_ms);
+            if recent_reconcile
+                && diagnostics.progress_status == FederatedTrustRotationProgressStatus::Progressing
+            {
+                diagnostics.progress_status =
+                    FederatedTrustRotationProgressStatus::AutomaticRecovery;
+                diagnostics.diagnosis_reason =
+                    "the background reconciler has attempted this rotation within the last 15 seconds".into();
+            }
+        }
+        Ok(diagnostics)
     }
 
     /// Safely resume one rotation using only its persisted lifecycle phase. This
@@ -2510,7 +2649,96 @@ mod diagnostics_tests {
     }
 
     #[test]
+    fn diagnostics_use_phase_specific_stall_windows() {
+        let (mut local, mut peer) = snapshots(
+            FederatedTrustRotationPhase::Staging,
+            FederatedTrustRotationPhase::Staging,
+        );
+        local.rotation.updated_at_ms = 10_000;
+        peer.rotation.updated_at_ms = 10_000;
+        let within_window = build_rotation_diagnostics(
+            "diagnostic-rotation",
+            "source",
+            "target",
+            local.clone(),
+            peer.clone(),
+            69_999,
+        );
+        assert!(!within_window.stalled);
+        assert_eq!(within_window.stall_threshold_ms, Some(60_000));
+        let beyond_window = build_rotation_diagnostics(
+            "diagnostic-rotation",
+            "source",
+            "target",
+            local,
+            peer,
+            70_000,
+        );
+        assert!(beyond_window.stalled);
+        assert_eq!(
+            beyond_window.progress_status,
+            FederatedTrustRotationProgressStatus::Stalled
+        );
+    }
+
+    #[test]
+    fn diagnostics_classify_overlap_as_normal_wait() {
+        let (local, peer) = snapshots(
+            FederatedTrustRotationPhase::Overlap,
+            FederatedTrustRotationPhase::Overlap,
+        );
+        let diagnostics = build_rotation_diagnostics(
+            "diagnostic-rotation",
+            "source",
+            "target",
+            local,
+            peer,
+            200_000,
+        );
+        assert_eq!(
+            diagnostics.recommended_action,
+            FederatedTrustRotationRecoveryAction::WaitForOverlap
+        );
+        assert_eq!(
+            diagnostics.progress_status,
+            FederatedTrustRotationProgressStatus::Waiting
+        );
+        assert!(!diagnostics.stalled);
+        assert!(
+            diagnostics
+                .recovery_guidance
+                .contains("do not retire either CA")
+        );
+    }
+
+    #[test]
     fn diagnostics_recommend_resume_for_pre_activation_rollback_drift() {
+        let (local, peer) = snapshots(
+            FederatedTrustRotationPhase::RollingBack,
+            FederatedTrustRotationPhase::ActivationBarrier,
+        );
+        let diagnostics = build_rotation_diagnostics(
+            "diagnostic-rotation",
+            "source",
+            "target",
+            local,
+            peer,
+            100_000,
+        );
+        assert!(!diagnostics.state_aligned);
+        assert!(diagnostics.safety_violations.is_empty());
+        assert_eq!(
+            diagnostics.recommended_action,
+            FederatedTrustRotationRecoveryAction::ResumeRollback
+        );
+        assert!(diagnostics.automated_recovery_safe);
+        let serialized = serde_json::to_string(&diagnostics).unwrap();
+        assert!(!serialized.contains("local-ca-pem"));
+        assert!(!serialized.contains("peer-ca-pem"));
+    }
+
+    #[test]
+    fn diagnostics_classify_safety_conflict_as_manual_intervention() {
         let (local, peer) = snapshots(
             FederatedTrustRotationPhase::RollingBack,
             FederatedTrustRotationPhase::ActivationBarrier,
@@ -2606,5 +2834,10 @@ mod diagnostics_tests {
             FederatedTrustRotationRecoveryAction::ManualInterventionRequired
         );
         assert!(!diagnostics.automated_recovery_safe);
+        assert_eq!(
+            diagnostics.progress_status,
+            FederatedTrustRotationProgressStatus::ManualInterventionRequired
+        );
+        assert!(!diagnostics.recovery_guidance.is_empty());
     }
 }

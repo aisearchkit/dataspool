@@ -1208,7 +1208,7 @@ async fn metrics<S: KvStore + Clone>(State(state): State<ApiState<S>>) -> Respon
         metrics.oldest_pending_seconds,
     );
     body.push_str(&format!("# HELP dataspool_scheduler_delay_seconds Age of the oldest pending shard waiting for scheduling\n# TYPE dataspool_scheduler_delay_seconds gauge\ndataspool_scheduler_delay_seconds {}\n# HELP dataspool_node_active_shards Number of active shard leases per node\n# TYPE dataspool_node_active_shards gauge\n# HELP dataspool_node_capacity_shards Configured concurrent shard capacity per node\n# TYPE dataspool_node_capacity_shards gauge\n# HELP dataspool_node_memory_capacity_mb Configured memory capacity per node in MiB\n# TYPE dataspool_node_memory_capacity_mb gauge\n# HELP dataspool_node_reserved_memory_mb Memory reserved by active shard leases per node in MiB\n# TYPE dataspool_node_reserved_memory_mb gauge\n", metrics.oldest_pending_seconds));
-    body.push_str("# HELP dataspool_federation_trust_rotations Number of federated trust rotations by lifecycle phase\n# TYPE dataspool_federation_trust_rotations gauge\n# HELP dataspool_federation_trust_rotation_stalled Rotations in a transitional phase without an update for at least 30 seconds\n# TYPE dataspool_federation_trust_rotation_stalled gauge\n# HELP dataspool_federation_trust_rotation_recovery_required Rotations requiring forward recovery\n# TYPE dataspool_federation_trust_rotation_recovery_required gauge\n# HELP dataspool_federation_trust_rotation_errors Rotations with a persisted last error\n# TYPE dataspool_federation_trust_rotation_errors gauge\n");
+    body.push_str("# HELP dataspool_federation_trust_rotations Number of federated trust rotations by lifecycle phase\n# TYPE dataspool_federation_trust_rotations gauge\n# HELP dataspool_federation_trust_rotation_stalled Locally persisted recoverable rotations beyond their phase-specific stall threshold\n# TYPE dataspool_federation_trust_rotation_stalled gauge\n# HELP dataspool_federation_trust_rotation_recovery_required Rotations requiring forward recovery\n# TYPE dataspool_federation_trust_rotation_recovery_required gauge\n# HELP dataspool_federation_trust_rotation_errors Rotations with a persisted last error\n# TYPE dataspool_federation_trust_rotation_errors gauge\n");
     for rotation in &rotations {
         if matches!(
             rotation.phase,
@@ -1241,15 +1241,24 @@ async fn metrics<S: KvStore + Clone>(State(state): State<ApiState<S>>) -> Respon
         if rotation.last_error.is_some() {
             rotations_with_errors += 1;
         }
-        if now_ms.saturating_sub(rotation.updated_at_ms) >= 30_000
-            && matches!(
-                rotation.phase,
-                FederatedTrustRotationPhase::Staging
-                    | FederatedTrustRotationPhase::Activating
-                    | FederatedTrustRotationPhase::RecoveryRequired
-                    | FederatedTrustRotationPhase::RollingBack
-                    | FederatedTrustRotationPhase::Retiring
-            )
+        let stall_threshold_ms = match rotation.phase {
+            FederatedTrustRotationPhase::Staging => Some(60_000),
+            FederatedTrustRotationPhase::ActivationBarrier
+            | FederatedTrustRotationPhase::Activating
+            | FederatedTrustRotationPhase::RecoveryRequired => Some(15_000),
+            FederatedTrustRotationPhase::RollingBack => Some(30_000),
+            FederatedTrustRotationPhase::Retiring
+                if rotation
+                    .local_activation_expires_at_ms
+                    .zip(rotation.peer_activation_expires_at_ms)
+                    .is_some_and(|(local, peer)| now_ms >= local.max(peer)) =>
+            {
+                Some(60_000)
+            }
+            _ => None,
+        };
+        if stall_threshold_ms
+            .is_some_and(|threshold| now_ms.saturating_sub(rotation.updated_at_ms) >= threshold)
         {
             stalled_rotations += 1;
         }

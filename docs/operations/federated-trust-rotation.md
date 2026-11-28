@@ -29,7 +29,9 @@ The recommended_action field is one of:
 - no_action: both sides are terminal.
 - manual_intervention_required: a safety invariant is violated; automated recovery is deliberately blocked.
 
-The stalled field becomes true when a recoverable transitional phase has not been updated for at least 30 seconds. state_aligned is false when the two durable views differ, including expected partial-commit windows.
+The diagnostics response classifies progress with `progress_status`: `waiting` means a legitimate external/operator prerequisite or an unexpired overlap window; `progressing` means an automated transition is within its phase window; `automatic_recovery` means the durable audit stream shows a reconciler attempt within the last 15 seconds; `stalled` means a recoverable transition exceeded its phase-specific threshold; `manual_intervention_required` means a safety invariant is violated; and `terminal` means both sides are complete or rolled back. The response includes the conservative bilateral `last_progress_at_ms` (the older of the two Raft `updated_at_ms` values), `stalled_for_ms`, `stall_threshold_ms`, the latest audit action/outcome/time, `diagnosis_reason`, and `recovery_guidance`. Failed/rejected audit events explain failures but do not advance the durable progress watermark.
+
+Stall thresholds are 60 seconds for Staging, 15 seconds for ActivationBarrier after the bilateral barrier is committed and for Activating/RecoveryRequired, 30 seconds for RollingBack, and 60 seconds for Retiring after both persisted overlap expiries have elapsed. AwaitingDeployment, an uncommitted ActivationBarrier, and an unexpired Overlap/Retiring window are waits, not stalls. The `stalled` boolean is true only when the current recommended action is automatically recoverable and the applicable threshold has elapsed. `state_aligned` is false when the two durable views differ, including expected partial-commit windows.
 
 ## Trigger safe recovery
 
@@ -56,7 +58,7 @@ The endpoint returns the newest audit records for the exact federated_trust_rota
 The authenticated /metrics endpoint exports:
 
 - dataspool_federation_trust_rotations{phase} — rotation count by lifecycle phase.
-- dataspool_federation_trust_rotation_stalled — stale recoverable transitions (30-second threshold).
+- dataspool_federation_trust_rotation_stalled — locally persisted recoverable transitions beyond the phase-specific threshold (60s staging, 15s activation/recovery, 30s rollback, 60s post-deadline retirement). This aggregate metric uses the local durable record; the bilateral `/diagnostics` response is authoritative for operator decisions.
 - dataspool_federation_trust_rotation_recovery_required — rotations requiring forward recovery.
 - dataspool_federation_trust_rotation_errors — rotations with a persisted last error.
 - dataspool_federation_trust_rotation_last_error{rotation_id} — per-rotation persisted-error indicator.
