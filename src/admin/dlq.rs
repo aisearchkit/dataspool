@@ -1208,7 +1208,58 @@ async fn metrics<S: KvStore + Clone>(State(state): State<ApiState<S>>) -> Respon
         metrics.oldest_pending_seconds,
     );
     body.push_str(&format!("# HELP dataspool_scheduler_delay_seconds Age of the oldest pending shard waiting for scheduling\n# TYPE dataspool_scheduler_delay_seconds gauge\ndataspool_scheduler_delay_seconds {}\n# HELP dataspool_node_active_shards Number of active shard leases per node\n# TYPE dataspool_node_active_shards gauge\n# HELP dataspool_node_capacity_shards Configured concurrent shard capacity per node\n# TYPE dataspool_node_capacity_shards gauge\n# HELP dataspool_node_memory_capacity_mb Configured memory capacity per node in MiB\n# TYPE dataspool_node_memory_capacity_mb gauge\n# HELP dataspool_node_reserved_memory_mb Memory reserved by active shard leases per node in MiB\n# TYPE dataspool_node_reserved_memory_mb gauge\n", metrics.oldest_pending_seconds));
-    body.push_str("# HELP dataspool_federation_trust_rotations Number of federated trust rotations by lifecycle phase\n# TYPE dataspool_federation_trust_rotations gauge\n# HELP dataspool_federation_trust_rotation_stalled Locally persisted recoverable rotations beyond their phase-specific stall threshold\n# TYPE dataspool_federation_trust_rotation_stalled gauge\n# HELP dataspool_federation_trust_rotation_recovery_required Rotations requiring forward recovery\n# TYPE dataspool_federation_trust_rotation_recovery_required gauge\n# HELP dataspool_federation_trust_rotation_errors Rotations with a persisted last error\n# TYPE dataspool_federation_trust_rotation_errors gauge\n");
+    body.push_str("# HELP dataspool_federation_trust_rotations Number of federated trust rotations by lifecycle phase\n# TYPE dataspool_federation_trust_rotations gauge\n# HELP dataspool_federation_trust_rotation_stalled Locally persisted recoverable rotations beyond their phase-specific stall threshold\n# TYPE dataspool_federation_trust_rotation_stalled gauge\n# HELP dataspool_federation_trust_rotation_recovery_required Rotations requiring forward recovery\n# TYPE dataspool_federation_trust_rotation_recovery_required gauge\n# HELP dataspool_federation_trust_rotation_errors Rotations with a persisted last error\n# TYPE dataspool_federation_trust_rotation_errors gauge\n# HELP dataspool_federation_trust_rotation_bilateral_diagnostics_available Whether the bilateral Raft diagnostic probe succeeded for a rotation\n# TYPE dataspool_federation_trust_rotation_bilateral_diagnostics_available gauge\n# HELP dataspool_federation_trust_rotation_bilateral_state_aligned Whether the durable bilateral rotation records and trust state are aligned\n# TYPE dataspool_federation_trust_rotation_bilateral_state_aligned gauge\n");
+    let mut bilateral_status = std::collections::BTreeMap::<String, Option<bool>>::new();
+    if let Some(coordinator) = state.trust_rotation_coordinator.as_ref() {
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(8));
+        let mut checks = tokio::task::JoinSet::new();
+        for rotation in &rotations {
+            if matches!(
+                rotation.phase,
+                FederatedTrustRotationPhase::Completed | FederatedTrustRotationPhase::RolledBack
+            ) {
+                continue;
+            }
+            let coordinator = Arc::clone(coordinator);
+            let semaphore = Arc::clone(&semaphore);
+            let rotation_id = rotation.rotation_id.clone();
+            checks.spawn(async move {
+                let permit = semaphore.acquire_owned().await.ok()?;
+                let result = tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    coordinator.inspect_bilateral_state(&rotation_id),
+                )
+                .await;
+                drop(permit);
+                let aligned = match result {
+                    Ok(Ok(diagnostics)) => Some(diagnostics.state_aligned),
+                    Ok(Err(error)) => {
+                        tracing::debug!(rotation_id = %rotation_id, %error, "bilateral trust-rotation metrics probe failed");
+                        None
+                    }
+                    Err(_) => {
+                        tracing::debug!(rotation_id = %rotation_id, "bilateral trust-rotation metrics probe timed out");
+                        None
+                    }
+                };
+                Some((rotation_id, aligned))
+            });
+        }
+        while let Some(result) = checks.join_next().await {
+            if let Ok(Some((rotation_id, aligned))) = result {
+                bilateral_status.insert(rotation_id, aligned);
+            }
+        }
+    } else {
+        for rotation in &rotations {
+            if !matches!(
+                rotation.phase,
+                FederatedTrustRotationPhase::Completed | FederatedTrustRotationPhase::RolledBack
+            ) {
+                bilateral_status.insert(rotation.rotation_id.clone(), None);
+            }
+        }
+    }
     for rotation in &rotations {
         if matches!(
             rotation.phase,
@@ -1244,7 +1295,11 @@ async fn metrics<S: KvStore + Clone>(State(state): State<ApiState<S>>) -> Respon
         let stall_threshold_ms = match rotation.phase {
             FederatedTrustRotationPhase::Staging => Some(60_000),
             FederatedTrustRotationPhase::ActivationBarrier
-            | FederatedTrustRotationPhase::Activating
+                if rotation.activation_barrier_committed =>
+            {
+                Some(15_000)
+            }
+            FederatedTrustRotationPhase::Activating
             | FederatedTrustRotationPhase::RecoveryRequired => Some(15_000),
             FederatedTrustRotationPhase::RollingBack => Some(30_000),
             FederatedTrustRotationPhase::Retiring
@@ -1359,6 +1414,28 @@ async fn metrics<S: KvStore + Clone>(State(state): State<ApiState<S>>) -> Respon
         body.push_str(&format!(
             "dataspool_federation_trust_rotation_age_seconds{{rotation_id=\"{label}\",phase=\"{phase}\"}} {age:.3}\ndataspool_federation_trust_rotation_phase_age_seconds{{rotation_id=\"{label}\",phase=\"{phase}\"}} {phase_age:.3}\ndataspool_federation_trust_rotation_last_error{{rotation_id=\"{label}\"}} {last_error}\n"
         ));
+        if !matches!(
+            rotation.phase,
+            FederatedTrustRotationPhase::Completed | FederatedTrustRotationPhase::RolledBack
+        ) {
+            let bilateral_available = i32::from(
+                bilateral_status
+                    .get(&rotation.rotation_id)
+                    .is_some_and(Option::is_some),
+            );
+            let bilateral_aligned = bilateral_status
+                .get(&rotation.rotation_id)
+                .and_then(|aligned| *aligned)
+                .map(i32::from);
+            body.push_str(&format!(
+                "dataspool_federation_trust_rotation_bilateral_diagnostics_available{{rotation_id=\"{label}\"}} {bilateral_available}\n"
+            ));
+            if let Some(aligned) = bilateral_aligned {
+                body.push_str(&format!(
+                    "dataspool_federation_trust_rotation_bilateral_state_aligned{{rotation_id=\"{label}\"}} {aligned}\n"
+                ));
+            }
+        }
         if matches!(
             rotation.phase,
             FederatedTrustRotationPhase::Completed | FederatedTrustRotationPhase::RolledBack
@@ -1939,6 +2016,8 @@ mod tests {
             "dataspool_federation_trust_rotation_phase_operations_by_rotation_total",
             "dataspool_federation_trust_rotation_recovery_attempts",
             "dataspool_federation_trust_rotation_overlap_remaining_seconds",
+            "dataspool_federation_trust_rotation_bilateral_diagnostics_available",
+            "dataspool_federation_trust_rotation_bilateral_state_aligned",
         ] {
             assert!(metrics_text.contains(metric), "missing metric {metric}");
         }

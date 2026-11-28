@@ -6,54 +6,156 @@ groups:
         for: 1m
         labels:
           severity: warning
+          service: dataspool
+          component: federation-trust-rotation
         annotations:
           summary: Federated trust rotation is stalled
-          description: At least one recoverable trust-rotation transition has not progressed for more than 30 seconds.
+          description: >-
+            At least one recoverable rotation exceeded its phase-specific durable-progress threshold.
+            The metric is local and aggregate; identify the rotation and confirm bilateral diagnostics
+            before taking action.
+          runbook_url: https://github.com/aisearchkit/dataspool/blob/main/docs/operations/federated-trust-rotation.md#inspect-both-clusters
 
       - alert: DataspoolFederationTrustRotationNeedsForwardRecovery
         expr: dataspool_federation_trust_rotation_recovery_required > 0
         for: 30s
         labels:
           severity: critical
+          service: dataspool
+          component: federation-trust-rotation
         annotations:
           summary: Federated trust rotation requires forward recovery
-          description: An activation decision is committed and the coordinator must converge both clusters.
+          description: >-
+            The irreversible activation barrier is committed. Do not roll back; restore peer
+            connectivity and inspect bilateral diagnostics before using the constrained
+            forward_recovery action.
+          runbook_url: https://github.com/aisearchkit/dataspool/blob/main/docs/operations/federated-trust-rotation.md#trigger-safe-recovery
 
-      - alert: DataspoolFederationTrustRotationHasError
-        expr: dataspool_federation_trust_rotation_last_error > 0
-        for: 30s
-        labels:
-          severity: warning
-        annotations:
-          summary: Federated trust rotation has a persisted error
-          description: Inspect the bilateral diagnostics and per-rotation audit history before recovery.
-
-      - alert: DataspoolFederationTrustRotationOverlapExpiring
-        expr: dataspool_federation_trust_rotation_overlap_remaining_seconds{phase="overlap"} < 3600
-          and dataspool_federation_trust_rotation_overlap_remaining_seconds{phase="overlap"} > 0
+      - alert: DataspoolFederationTrustRotationRecoveryFailed
+        expr: increase(dataspool_federation_trust_rotation_recovery_failures_total[15m]) > 0
         for: 1m
         labels:
           severity: warning
+          service: dataspool
+          component: federation-trust-rotation
         annotations:
-          summary: Federated CA overlap expires within one hour
-          description: Confirm both clusters are healthy and retirement can proceed at the persisted deadline.
+          summary: Federated trust rotation recovery failed
+          description: >-
+            A new recovery request or background reconciliation attempt failed in the last 15 minutes.
+            Inspect the rotation audit and bilateral diagnostics; do not repeatedly replay recovery
+            without resolving the recorded cause.
+          runbook_url: https://github.com/aisearchkit/dataspool/blob/main/docs/operations/federated-trust-rotation.md#rotation-audit-history
 
-      - alert: DataspoolFederationTrustRotationRetirementOverdue
-        expr: dataspool_federation_trust_rotation_overlap_remaining_seconds{phase="overlap"} == 0
-          or (dataspool_federation_trust_rotation_overlap_remaining_seconds{phase="retiring"} == 0
-          and dataspool_federation_trust_rotation_phase_age_seconds{phase="retiring"} > 300)
+      - alert: DataspoolFederationTrustRotationOverlapExpiring
+        expr: dataspool_federation_trust_rotation_overlap_remaining_seconds > 3600
+          and dataspool_federation_trust_rotation_overlap_remaining_seconds <= 21600
+        for: 5m
+        labels:
+          severity: warning
+          service: dataspool
+          component: federation-trust-rotation
+        annotations:
+          summary: Federated CA overlap expires within six hours
+          description: >-
+            The later of the two persisted old-CA expiry timestamps is within six hours. Verify
+            both new certificates are deployed and healthy, and ensure both clusters can complete
+            retirement. Do not shorten the persisted overlap deadline.
+          runbook_url: https://github.com/aisearchkit/dataspool/blob/main/docs/operations/federated-trust-rotation.md#inspect-both-clusters
+
+      - alert: DataspoolFederationTrustRotationOverlapCritical
+        expr: dataspool_federation_trust_rotation_overlap_remaining_seconds > 0
+          and dataspool_federation_trust_rotation_overlap_remaining_seconds <= 3600
         for: 1m
         labels:
           severity: critical
+          service: dataspool
+          component: federation-trust-rotation
+        annotations:
+          summary: Federated CA overlap expires within one hour
+          description: >-
+            The old-CA trust window is close to expiry. Confirm both peers are reachable and
+            certificate activation is complete; prepare the safe bilateral retirement path.
+            Never manually remove the old CA before the persisted deadline and both-side checks.
+          runbook_url: https://github.com/aisearchkit/dataspool/blob/main/docs/operations/federated-trust-rotation.md#trigger-safe-recovery
+
+      - alert: DataspoolFederationTrustRotationRetirementOverdue
+        expr: dataspool_federation_trust_rotation_overlap_remaining_seconds == 0
+          and on (rotation_id)
+          dataspool_federation_trust_rotation_phase_age_seconds > 300
+        for: 2m
+        labels:
+          severity: critical
+          service: dataspool
+          component: federation-trust-rotation
         annotations:
           summary: Federated CA retirement is overdue
-          description: The overlap deadline has passed but retirement has not converged on both clusters.
+          description: >-
+            Both persisted overlap deadlines have elapsed, but the rotation has remained in
+            Overlap or Retiring for more than five minutes. Restore peer/Raft connectivity and
+            inspect bilateral state; use retire_both only when diagnostics recommend it.
+          runbook_url: https://github.com/aisearchkit/dataspool/blob/main/docs/operations/federated-trust-rotation.md#trigger-safe-recovery
+
+      - alert: DataspoolFederationTrustRotationExpiryMissing
+        expr: dataspool_federation_trust_rotation_age_seconds{phase=~"overlap|retiring"}
+          unless on (rotation_id)
+          dataspool_federation_trust_rotation_overlap_remaining_seconds
+        for: 2m
+        labels:
+          severity: critical
+          service: dataspool
+          component: federation-trust-rotation
+        annotations:
+          summary: Federated CA expiry data is missing
+          description: >-
+            An Overlap or Retiring rotation has no metric for the bilateral expiry deadline.
+            At least one committed expiry may be missing; do not retire either CA. Inspect both
+            persisted Raft records and resolve the safety condition under change control.
+          runbook_url: https://github.com/aisearchkit/dataspool/blob/main/docs/operations/federated-trust-rotation.md#inspect-both-clusters
+
+      - alert: DataspoolFederationTrustRotationBilateralMismatch
+        expr: dataspool_federation_trust_rotation_bilateral_state_aligned == 0
+          and on (rotation_id)
+          dataspool_federation_trust_rotation_bilateral_diagnostics_available == 1
+        for: 3m
+        labels:
+          severity: critical
+          service: dataspool
+          component: federation-trust-rotation
+        annotations:
+          summary: Federated trust rotation state differs between clusters
+          description: >-
+            Bilateral Raft records, certificate fingerprints, expiry values, or acknowledgements
+            have remained inconsistent for at least three minutes. Some short-lived differences
+            can occur during a committed transition; inspect diagnostics and audit history before
+            recovery. Never force a phase change or CA retirement.
+          runbook_url: https://github.com/aisearchkit/dataspool/blob/main/docs/operations/federated-trust-rotation.md#inspect-both-clusters
+
+      - alert: DataspoolFederationTrustRotationBilateralDiagnosticsUnavailable
+        expr: dataspool_federation_trust_rotation_bilateral_diagnostics_available == 0
+        for: 2m
+        labels:
+          severity: warning
+          service: dataspool
+          component: federation-trust-rotation
+        annotations:
+          summary: Bilateral trust-rotation diagnostics are unavailable
+          description: >-
+            The coordinator could not read the peer Raft view within the metrics probe timeout.
+            This is not evidence that the clusters are aligned. Check peer gRPC/mTLS connectivity,
+            peer registration, and Raft availability before attempting recovery.
+          runbook_url: https://github.com/aisearchkit/dataspool/blob/main/docs/operations/federated-trust-rotation.md#inspect-both-clusters
 
       - alert: DataspoolFederationTrustRotationAwaitingOperator
         expr: dataspool_federation_trust_rotation_phase_age_seconds{phase="activation_barrier"} > 900
         for: 5m
         labels:
           severity: warning
+          service: dataspool
+          component: federation-trust-rotation
         annotations:
-          summary: Federated trust rotation is waiting for operator authorization
-          description: Both deployment readiness proofs are staged; review diagnostics and authorize or roll back before the activation barrier is committed.
+          summary: Federated trust rotation is awaiting operator authorization
+          description: >-
+            Both deployment readiness proofs should be staged, but activation authorization has
+            not been committed. Review diagnostics and deployment evidence; explicitly authorize
+            or perform the safe pre-activation rollback. Do not treat this wait as an automatic stall.
+          runbook_url: https://github.com/aisearchkit/dataspool/blob/main/docs/operations/federated-trust-rotation.md#confirm-a-manual-recovery

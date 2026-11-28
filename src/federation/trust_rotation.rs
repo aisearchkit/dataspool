@@ -2203,6 +2203,24 @@ impl FederatedTrustRotationCoordinator {
         &self,
         rotation_id: &str,
     ) -> crate::Result<FederatedTrustRotationDiagnostics> {
+        self.inspect_bilateral_inner(rotation_id, true).await
+    }
+
+    /// Read only the two durable Raft views for low-overhead health metrics.
+    /// Audit history is intentionally skipped because it is not needed to
+    /// determine bilateral alignment and may be large on long-lived clusters.
+    pub async fn inspect_bilateral_state(
+        &self,
+        rotation_id: &str,
+    ) -> crate::Result<FederatedTrustRotationDiagnostics> {
+        self.inspect_bilateral_inner(rotation_id, false).await
+    }
+
+    async fn inspect_bilateral_inner(
+        &self,
+        rotation_id: &str,
+        include_audit: bool,
+    ) -> crate::Result<FederatedTrustRotationDiagnostics> {
         let rotation = self.get_rotation(rotation_id).await?;
         let peer_record = self.peer_record(&rotation.peer_cluster_id).await?;
         let mut peer_client = self.connect_peer(&peer_record).await?;
@@ -2247,12 +2265,13 @@ impl FederatedTrustRotationCoordinator {
         // bilateral Raft timestamps remain authoritative and avoid treating a
         // failed/rejected request as progress.
         let resource_id = format!("federated_trust_rotation:{rotation_id}");
-        if let Some(event) = self
-            .store
-            .list_all_audit_events_for_resource(&resource_id)
-            .await?
-            .into_iter()
-            .max_by_key(|event| (event.occurred_at_ms, event.log_index))
+        if include_audit
+            && let Some(event) = self
+                .store
+                .list_all_audit_events_for_resource(&resource_id)
+                .await?
+                .into_iter()
+                .max_by_key(|event| (event.occurred_at_ms, event.log_index))
         {
             let recent_reconcile = event.action == "federation.trust_rotation.reconcile"
                 && diagnostics

@@ -76,7 +76,30 @@ The ActivationBarrier and AwaitingDeployment phases are intentionally reported s
 
 ## Alert rules
 
-The Prometheus rule group in deploy/prometheus/federation-trust-rotation-alerts.yml covers stalled transitions, forward-recovery requirements, persisted errors, overlap expiry, overdue retirement, and long waits at the activation barrier. Review the thresholds against the expected deployment and overlap windows before enabling paging.
+Load `deploy/prometheus/federation-trust-rotation-alerts.yml` into the Prometheus rule files and validate it with `promtool check rules` before enabling paging. The rules assume the authenticated Dataspool `/metrics` endpoint is scraped successfully and the scrape interval is no longer than 30 seconds. Alert labels include `service=dataspool` and `component=federation-trust-rotation`; every alert includes a runbook link.
+
+| Alert | Trigger / debounce | Severity | Operator action |
+| --- | --- | --- | --- |
+| `DataspoolFederationTrustRotationStalled` | Aggregate phase-aware stalled count is nonzero for 1 minute | warning | Identify the rotation, inspect bilateral diagnostics and audit, then use only the recommended constrained recovery action |
+| `DataspoolFederationTrustRotationNeedsForwardRecovery` | Persisted `RecoveryRequired` count is nonzero for 30 seconds | critical | Activation is irreversible; restore peer connectivity and complete forward recovery, never roll back |
+| `DataspoolFederationTrustRotationRecoveryFailed` | A new durable recovery failure appears in the last 15 minutes, held for 1 minute | warning | Inspect the failed audit event and peer/Raft error before retrying |
+| `DataspoolFederationTrustRotationOverlapExpiring` | Later bilateral expiry is between 1 and 6 hours, held for 5 minutes | warning | Verify new certificates and both peers; prepare retirement without shortening overlap |
+| `DataspoolFederationTrustRotationOverlapCritical` | Later bilateral expiry is within 1 hour, held for 1 minute | critical | Restore peer reachability and prepare safe retirement; never remove the old CA early |
+| `DataspoolFederationTrustRotationRetirementOverdue` | Expiry is zero and phase age exceeds 5 minutes, held for 2 minutes | critical | Inspect both persisted records; use `retire_both` only when bilateral diagnostics recommend it |
+| `DataspoolFederationTrustRotationExpiryMissing` | Overlap/Retiring has no bilateral expiry metric for 2 minutes | critical | Treat as unsafe; do not retire either CA and compare both Raft records |
+| `DataspoolFederationTrustRotationBilateralMismatch` | Bilateral state alignment is false for 3 minutes while the peer probe succeeds | critical | Inspect phase/revision, fingerprints, expiry and acknowledgements; transient commit windows are debounced |
+| `DataspoolFederationTrustRotationBilateralDiagnosticsUnavailable` | Peer diagnostics probe fails for 2 minutes | warning | Check peer gRPC/mTLS, registration and Raft availability; unavailable is not aligned |
+| `DataspoolFederationTrustRotationAwaitingOperator` | ActivationBarrier phase age exceeds 15 minutes, held for 5 minutes | warning | Review deployment evidence and explicitly authorize activation or perform safe pre-activation rollback |
+
+Recovery failures use `increase(...recovery_failures_total[15m])`, not a raw `> 0` check: the metric is reconstructed from the append-only Raft audit stream and therefore retains historical failures across restarts. The old `last_error` gauge is intentionally not paged on because a persisted historical error can remain after the underlying condition has recovered.
+
+The bilateral metrics `...bilateral_diagnostics_available` and `...bilateral_state_aligned` are emitted per active rotation. The metrics probe reads both Raft views without scanning audit history, runs with at most eight concurrent peer requests, and applies a two-second timeout per request. Terminal rotations are excluded from peer probes to avoid repeatedly querying immutable historical records. A failed or timed-out probe emits availability `0` and omits the alignment sample; it never reports unavailable state as aligned. If the coordinator is not configured, availability is `0` for each known rotation. The `/diagnostics` endpoint remains the authoritative operator view and includes the audit-derived recovery guidance.
+
+`RetirementOverdue` deliberately waits until the later persisted expiry is zero and the rotation has remained in Overlap/Retiring for at least five minutes, avoiding an alert merely because the overlap window has just elapsed. `ExpiryMissing` is separate because the absence of either persisted expiry must block retirement, not be interpreted as an elapsed deadline. `BilateralMismatch` waits three minutes to absorb ordinary short-lived cross-cluster commit windows; the alert must never trigger an automatic recovery action.
+
+Example validation:
+
+    promtool check rules deploy/prometheus/federation-trust-rotation-alerts.yml
 
 ## Query rotation status
 
