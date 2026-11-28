@@ -319,6 +319,17 @@ pub enum Command {
         request_id: String,
         actor: String,
     },
+    /// Record a failed or rejected operator action without mutating rotation state.
+    RecordFederatedTrustRotationAudit {
+        rotation_id: String,
+        audit_id: String,
+        request_id: String,
+        actor: String,
+        action: String,
+        outcome: String,
+        details: String,
+        at_ms: i64,
+    },
     TransitionFederatedMigration {
         migration_id: String,
         next_state: crate::federation::MigrationState,
@@ -534,6 +545,14 @@ impl Command {
                 rotation_id, event, ..
             } => {
                 format!("AdvanceFederatedTrustRotation({rotation_id}, {event:?})")
+            }
+            Command::RecordFederatedTrustRotationAudit {
+                rotation_id,
+                action,
+                outcome,
+                ..
+            } => {
+                format!("RecordFederatedTrustRotationAudit({rotation_id}, {action}, {outcome})")
             }
             Command::TransitionFederatedMigration {
                 migration_id,

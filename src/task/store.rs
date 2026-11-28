@@ -19,6 +19,14 @@ pub struct AuditEvent {
     pub from_state: String,
     pub to_state: String,
     pub occurred_at_ms: i64,
+    #[serde(default = "default_audit_outcome")]
+    pub outcome: String,
+    #[serde(default)]
+    pub details: Option<String>,
+}
+
+fn default_audit_outcome() -> String {
+    "committed".to_string()
 }
 
 /// Current task-level SLA status. Alerts are derived, never independently persisted.
@@ -461,6 +469,28 @@ impl<S: KvStore> TaskStore<S> {
         if let (Some(event), Some(key)) = (audit, event_key) {
             batch.put_cf(cf::META, key, serde_json::to_vec(&event)?);
         }
+        self.store.write_batch(batch).await?;
+        Ok(())
+    }
+
+    /// Atomically persist an audit-only Raft command and its idempotency key.
+    pub async fn save_audit_event(
+        &self,
+        request_id: &str,
+        payload: &str,
+        event: AuditEvent,
+    ) -> Result<()> {
+        let mut batch = crate::storage::WriteBatch::new();
+        batch.put_cf(
+            cf::META,
+            format!("control_request:{request_id}"),
+            payload.as_bytes().to_vec(),
+        );
+        batch.put_cf(
+            cf::META,
+            format!("audit:{:020}", event.log_index),
+            serde_json::to_vec(&event)?,
+        );
         self.store.write_batch(batch).await?;
         Ok(())
     }

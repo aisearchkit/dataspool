@@ -600,6 +600,28 @@ impl<S: KvStore + Clone> MetaStateMachine<S> {
                 )
                 .await
             }
+            Command::RecordFederatedTrustRotationAudit {
+                rotation_id,
+                audit_id,
+                request_id,
+                actor,
+                action,
+                outcome,
+                details,
+                at_ms,
+            } => {
+                self.apply_record_trust_rotation_audit(
+                    rotation_id,
+                    audit_id,
+                    request_id,
+                    actor,
+                    action,
+                    outcome,
+                    details,
+                    at_ms,
+                )
+                .await
+            }
             Command::TransitionFederatedMigration {
                 migration_id,
                 next_state,
@@ -1796,6 +1818,71 @@ impl<S: KvStore + Clone> MetaStateMachine<S> {
         ))
     }
 
+    #[allow(clippy::too_many_arguments)]
+    async fn apply_record_trust_rotation_audit(
+        &self,
+        rotation_id: String,
+        audit_id: String,
+        request_id: String,
+        actor: String,
+        action: String,
+        outcome: String,
+        details: String,
+        at_ms: i64,
+    ) -> Result<CommandResponse> {
+        if audit_id.trim().is_empty()
+            || audit_id.len() > 128
+            || actor.trim().is_empty()
+            || action.trim().is_empty()
+            || details.len() > 2048
+            || !matches!(outcome.as_str(), "failed" | "rejected")
+        {
+            return Ok(rejected("invalid trust rotation audit record"));
+        }
+        let resource_id = format!("federated_trust_rotation:{rotation_id}");
+        let Some(log_index) = self.applied_log_index else {
+            return Ok(rejected("audit records require a committed Raft log index"));
+        };
+        let phase = self
+            .task_store
+            .get_federated_trust_rotation(&rotation_id)
+            .await?
+            .map(|rotation| format!("{:?}", rotation.phase))
+            .unwrap_or_else(|| "unknown".into());
+        let payload = format!("trust-rotation-audit:{rotation_id}:{action}:{outcome}:{details}");
+        if let Some(existing) = self.task_store.get_control_request(&audit_id).await? {
+            return if existing == payload {
+                Ok(accepted(
+                    "Trust rotation audit record already committed",
+                    serde_json::json!({"rotation_id": rotation_id}),
+                ))
+            } else {
+                Ok(rejected(
+                    "audit id was already used with a different payload",
+                ))
+            };
+        }
+        let event = crate::task::AuditEvent {
+            log_index,
+            actor,
+            request_id: request_id.clone(),
+            action,
+            resource_id,
+            from_state: phase.clone(),
+            to_state: phase,
+            occurred_at_ms: at_ms,
+            outcome,
+            details: Some(details),
+        };
+        self.task_store
+            .save_audit_event(&audit_id, &payload, event)
+            .await?;
+        Ok(accepted(
+            "Trust rotation failure audit committed",
+            serde_json::json!({"rotation_id": rotation_id, "request_id": request_id}),
+        ))
+    }
+
     async fn apply_advance_federated_trust_rotation(
         &self,
         rotation_id: String,
@@ -1871,10 +1958,40 @@ impl<S: KvStore + Clone> MetaStateMachine<S> {
             return Ok(rejected(&error));
         }
         let next = format!("{:?}", rotation.phase);
+        let event_action = match &event {
+            crate::federation::FederatedTrustRotationEvent::LocalStaged { .. } => "local_staged",
+            crate::federation::FederatedTrustRotationEvent::PeerStaged { .. } => "peer_staged",
+            crate::federation::FederatedTrustRotationEvent::LocalDeploymentReady { .. } => {
+                "local_deployment_ready"
+            }
+            crate::federation::FederatedTrustRotationEvent::PeerDeploymentReady { .. } => {
+                "peer_deployment_ready"
+            }
+            crate::federation::FederatedTrustRotationEvent::AuthorizeActivation => {
+                "activation_authorized"
+            }
+            crate::federation::FederatedTrustRotationEvent::LocalActivated { .. } => {
+                "local_activated"
+            }
+            crate::federation::FederatedTrustRotationEvent::PeerActivated { .. } => {
+                "peer_activated"
+            }
+            crate::federation::FederatedTrustRotationEvent::LocalRetired => "local_retired",
+            crate::federation::FederatedTrustRotationEvent::PeerRetired => "peer_retired",
+            crate::federation::FederatedTrustRotationEvent::BeginRollback { .. } => {
+                "rollback_started"
+            }
+            crate::federation::FederatedTrustRotationEvent::ConfirmRollback => "rollback_confirmed",
+            crate::federation::FederatedTrustRotationEvent::LocalRolledBack => "local_rolled_back",
+            crate::federation::FederatedTrustRotationEvent::PeerRolledBack => "peer_rolled_back",
+            crate::federation::FederatedTrustRotationEvent::MarkRecoveryRequired { .. } => {
+                "recovery_required"
+            }
+        };
         let audit = self.audit_event(
             &actor,
             &request_id,
-            "federation.trust_rotation.advance",
+            &format!("federation.trust_rotation.{event_action}"),
             &rotation_id,
             &previous,
             &next,
@@ -2399,17 +2516,26 @@ impl<S: KvStore + Clone> MetaStateMachine<S> {
         from_state: &str,
         to_state: &str,
     ) -> Option<crate::task::AuditEvent> {
-        self.applied_log_index
-            .map(|log_index| crate::task::AuditEvent {
+        self.applied_log_index.map(|log_index| {
+            let (audit_actor, audit_request_id) = actor
+                .rsplit_once(" request:")
+                .filter(|(identity, request)| {
+                    !identity.trim().is_empty() && !request.trim().is_empty()
+                })
+                .unwrap_or((actor, request_id));
+            crate::task::AuditEvent {
                 log_index,
-                actor: actor.to_string(),
-                request_id: request_id.to_string(),
+                actor: audit_actor.to_string(),
+                request_id: audit_request_id.to_string(),
                 action: action.to_string(),
                 resource_id: resource_id.to_string(),
                 from_state: from_state.to_string(),
                 to_state: to_state.to_string(),
                 occurred_at_ms: chrono::Utc::now().timestamp_millis(),
-            })
+                outcome: "committed".into(),
+                details: None,
+            }
+        })
     }
 
     async fn apply_control_task(
@@ -2872,6 +2998,8 @@ impl<S: KvStore + Clone> MetaStateMachine<S> {
                     from_state: previous_state,
                     to_state: next_state,
                     occurred_at_ms: chrono::Utc::now().timestamp_millis(),
+                    outcome: "committed".into(),
+                    details: None,
                 })
         } else {
             None
@@ -7114,6 +7242,92 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn trust_rotation_failure_audit_is_committed_with_real_raft_index() {
+        let dir = tempdir().unwrap();
+        let db = RocksDbStore::open(dir.path()).unwrap();
+        let store = TaskStore::new(db);
+        let mut sm = MetaStateMachine::new(store.kv_store().clone());
+        let response = sm
+            .apply_command_at(
+                Command::RecordFederatedTrustRotationAudit {
+                    rotation_id: "rotation-audit-failure".into(),
+                    audit_id: "trust-rotation-audit:failure-1".into(),
+                    request_id: "operator-request-1".into(),
+                    actor: "alice".into(),
+                    action: "federation.trust_rotation.activate".into(),
+                    outcome: "failed".into(),
+                    details: "peer activation RPC timed out".into(),
+                    at_ms: 1_700_000_000_000,
+                },
+                901,
+            )
+            .await
+            .unwrap();
+        assert!(
+            response.success,
+            "audit-only command should commit: {}",
+            response.message
+        );
+        let events = store
+            .list_audit_events_for_resource("federated_trust_rotation:rotation-audit-failure", 10)
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].log_index, 901);
+        assert_eq!(events[0].actor, "alice");
+        assert_eq!(events[0].request_id, "operator-request-1");
+        assert_eq!(events[0].action, "federation.trust_rotation.activate");
+        assert_eq!(events[0].outcome, "failed");
+        assert_eq!(events[0].from_state, "unknown");
+        assert_eq!(events[0].to_state, "unknown");
+        assert_eq!(
+            events[0].details.as_deref(),
+            Some("peer activation RPC timed out")
+        );
+        let replay = sm
+            .apply_command_at(
+                Command::RecordFederatedTrustRotationAudit {
+                    rotation_id: "rotation-audit-failure".into(),
+                    audit_id: "trust-rotation-audit:failure-1".into(),
+                    request_id: "operator-request-1".into(),
+                    actor: "alice".into(),
+                    action: "federation.trust_rotation.activate".into(),
+                    outcome: "failed".into(),
+                    details: "peer activation RPC timed out".into(),
+                    at_ms: 1_700_000_000_000,
+                },
+                902,
+            )
+            .await
+            .unwrap();
+        assert!(replay.success);
+        assert_eq!(
+            store
+                .list_audit_events_for_resource(
+                    "federated_trust_rotation:rotation-audit-failure",
+                    10
+                )
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        sm.applied_log_index = Some(903);
+        let attributed = sm
+            .audit_event(
+                "operator request:original-request-9",
+                "internal-replay-id",
+                "federation.trust_rotation.local_staged",
+                "rotation-audit-failure",
+                "staging",
+                "staging",
+            )
+            .unwrap();
+        assert_eq!(attributed.actor, "operator");
+        assert_eq!(attributed.request_id, "original-request-9");
     }
 
     #[tokio::test]

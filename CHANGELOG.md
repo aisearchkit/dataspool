@@ -42,3 +42,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Limitations
 - This is an early preview focused on Elasticsearch HTTP migration. MySQL/PostgreSQL sink completeness, production Raft consensus, full gRPC cluster/task APIs, local Lucene reading, and a complete Control/Agent production orchestration lifecycle are not claimed as supported in this release.
 - The automated release workflow currently publishes a Linux x86_64 artifact as a GitHub pre-release. Other platform binaries and production deployment/upgrade procedures are not included.
+
+- Hardened federated trust-rotation audit completeness: failed and rejected operator actions now use an audit-only Raft command with a real commit index, actor, original request ID, outcome, and bounded failure details.

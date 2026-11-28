@@ -49,7 +49,7 @@ Every recovery request must include a unique operator-supplied request ID (1-64 
       -H "Authorization: Bearer $DATASPOOL_ADMIN_TOKEN" \
       "http://127.0.0.1:8080/api/v1/federation/trust-rotations/$ROTATION_ID/audit?limit=100"
 
-The endpoint returns the newest audit records for the exact federated_trust_rotation:$ROTATION_ID resource. Records include actor, request ID, action, previous/next phase, timestamp, and committed Raft log index.
+The endpoint returns the newest audit records for the exact federated_trust_rotation:$ROTATION_ID resource. Records include actor, request ID, action, previous/next phase, timestamp, and committed Raft log index. Each record also includes an `outcome` (`committed`, `failed`, or `rejected`) and optional bounded `details`. Successful lifecycle transitions are recorded atomically with their state mutation. Failed or rejected operator API operations are recorded by a separate audit-only Raft command: this preserves the current rotation state while assigning the audit record its actual committed Raft index. The original operator request ID and authenticated actor are retained. If the audit-only Raft proposal itself cannot commit, the API logs that audit persistence failure; it does not fabricate a local record or index.
 
 ## Prometheus metrics
 

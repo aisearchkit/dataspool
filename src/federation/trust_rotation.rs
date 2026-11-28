@@ -1048,6 +1048,7 @@ impl FederatedTrustRotationCoordinator {
                 ));
             }
         }
+        let audit_actor = format!("{actor} request:{request_id}");
         let local_ca_fingerprint = validate_trust_bundle(&local_ca_bundle_pem)
             .map_err(crate::DatspoolError::Configuration)?;
         let peer_ca_fingerprint = validate_trust_bundle(&peer_ca_bundle_pem)
@@ -1102,7 +1103,7 @@ impl FederatedTrustRotationCoordinator {
                     rotation: Box::new(rotation),
                     at_ms: now,
                     request_id: format!("federation-trust:{rotation_id}:create-local"),
-                    actor: format!("{actor} request:{request_id}"),
+                    actor: audit_actor.clone(),
                 })
                 .await?,
         )?;
@@ -1145,7 +1146,7 @@ impl FederatedTrustRotationCoordinator {
                         at_ms: chrono::Utc::now().timestamp_millis(),
                         grace_period_ms: overlap_ms,
                         request_id: format!("federation-trust:{rotation_id}:stage-peer-leaf-local"),
-                        actor: actor.to_string(),
+                        actor: audit_actor.clone(),
                     })
                     .await?,
             )?;
@@ -1158,7 +1159,7 @@ impl FederatedTrustRotationCoordinator {
             },
             &format!("federation-trust:{rotation_id}:peer-staged"),
             chrono::Utc::now().timestamp_millis(),
-            actor,
+            &audit_actor,
         )
         .await?;
 
@@ -1172,7 +1173,7 @@ impl FederatedTrustRotationCoordinator {
                     bundle_fingerprint: peer_ca_fingerprint.clone(),
                     at_ms: chrono::Utc::now().timestamp_millis(),
                     request_id: format!("federation-trust:{rotation_id}:stage-local"),
-                    actor: actor.to_string(),
+                    actor: audit_actor.clone(),
                 })
                 .await?,
         )?;
@@ -1183,7 +1184,7 @@ impl FederatedTrustRotationCoordinator {
             },
             &format!("federation-trust:{rotation_id}:local-staged"),
             chrono::Utc::now().timestamp_millis(),
-            actor,
+            &audit_actor,
         )
         .await?;
 
@@ -2013,6 +2014,23 @@ impl FederatedTrustRotationCoordinator {
             .await;
             if let Err(error) = result {
                 tracing::warn!(rotation_id = %rotation.rotation_id, phase = ?rotation.phase, %error, "Federated trust rotation reconciliation will retry");
+                let failure_request_id = format!(
+                    "{request_id}:failed:{}",
+                    chrono::Utc::now().timestamp_millis()
+                );
+                if let Err(audit_error) = self
+                    .record_operation_outcome(
+                        &rotation.rotation_id,
+                        &failure_request_id,
+                        "trust-rotation-reconciler",
+                        "reconcile",
+                        "failed",
+                        &format!("reconcile_request_id={request_id}: {error}"),
+                    )
+                    .await
+                {
+                    tracing::error!(rotation_id = %rotation.rotation_id, %audit_error, "failed to persist reconciliation failure audit");
+                }
             }
         }
         Ok(())
@@ -2326,6 +2344,45 @@ impl FederatedTrustRotationCoordinator {
             )
             .await
         }
+    }
+
+    /// Persist a failed or rejected operator action through Raft without changing rotation state.
+    pub async fn record_operation_outcome(
+        &self,
+        rotation_id: &str,
+        request_id: &str,
+        actor: &str,
+        action: &str,
+        outcome: &str,
+        details: &str,
+    ) -> crate::Result<()> {
+        let digest =
+            Sha256::digest(format!("{rotation_id}:{request_id}:{action}:{outcome}").as_bytes());
+        let audit_id = format!(
+            "trust-rotation-audit:{}",
+            digest
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        );
+        let response = self
+            .raft
+            .propose(Command::RecordFederatedTrustRotationAudit {
+                rotation_id: rotation_id.to_string(),
+                audit_id,
+                request_id: if request_id.trim().is_empty() {
+                    "(missing)".into()
+                } else {
+                    request_id.to_string()
+                },
+                actor: actor.to_string(),
+                action: format!("federation.trust_rotation.{action}"),
+                outcome: outcome.to_string(),
+                details: details.chars().take(512).collect(),
+                at_ms: chrono::Utc::now().timestamp_millis(),
+            })
+            .await?;
+        self.ensure_success(response)
     }
 
     fn ensure_success(&self, response: crate::raft::CommandResponse) -> crate::Result<()> {

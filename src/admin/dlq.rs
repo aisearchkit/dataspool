@@ -276,7 +276,19 @@ async fn create_federated_trust_rotation<S: KvStore + Clone>(
         .await
     {
         Ok(rotation) => Json(rotation).into_response(),
-        Err(error) => (StatusCode::CONFLICT, error.to_string()).into_response(),
+        Err(error) => {
+            audit_rotation_operation_failure(
+                &coordinator,
+                &request.rotation_id,
+                &request.request_id,
+                &request_actor(&headers),
+                "create",
+                "failed",
+                &error.to_string(),
+            )
+            .await;
+            (StatusCode::CONFLICT, error.to_string()).into_response()
+        }
     }
 }
 
@@ -362,7 +374,19 @@ async fn mark_trust_rotation_deployment_ready<S: KvStore + Clone>(
         .await
     {
         Ok(rotation) => Json(rotation).into_response(),
-        Err(error) => (StatusCode::CONFLICT, error.to_string()).into_response(),
+        Err(error) => {
+            audit_rotation_operation_failure(
+                &coordinator,
+                &rotation_id,
+                &request.request_id,
+                &request_actor(&headers),
+                "deployment_ready",
+                "failed",
+                &error.to_string(),
+            )
+            .await;
+            (StatusCode::CONFLICT, error.to_string()).into_response()
+        }
     }
 }
 
@@ -380,7 +404,19 @@ async fn authorize_trust_rotation_activation<S: KvStore + Clone>(
         .await
     {
         Ok(rotation) => Json(rotation).into_response(),
-        Err(error) => (StatusCode::CONFLICT, error.to_string()).into_response(),
+        Err(error) => {
+            audit_rotation_operation_failure(
+                &coordinator,
+                &rotation_id,
+                &request.request_id,
+                &request_actor(&headers),
+                "authorize_activation",
+                "failed",
+                &error.to_string(),
+            )
+            .await;
+            (StatusCode::CONFLICT, error.to_string()).into_response()
+        }
     }
 }
 
@@ -398,7 +434,19 @@ async fn activate_trust_rotation<S: KvStore + Clone>(
         .await
     {
         Ok(rotation) => Json(rotation).into_response(),
-        Err(error) => (StatusCode::CONFLICT, error.to_string()).into_response(),
+        Err(error) => {
+            audit_rotation_operation_failure(
+                &coordinator,
+                &rotation_id,
+                &request.request_id,
+                &request_actor(&headers),
+                "activate",
+                "failed",
+                &error.to_string(),
+            )
+            .await;
+            (StatusCode::CONFLICT, error.to_string()).into_response()
+        }
     }
 }
 
@@ -416,7 +464,19 @@ async fn retire_trust_rotation<S: KvStore + Clone>(
         .await
     {
         Ok(rotation) => Json(rotation).into_response(),
-        Err(error) => (StatusCode::CONFLICT, error.to_string()).into_response(),
+        Err(error) => {
+            audit_rotation_operation_failure(
+                &coordinator,
+                &rotation_id,
+                &request.request_id,
+                &request_actor(&headers),
+                "retire",
+                "failed",
+                &error.to_string(),
+            )
+            .await;
+            (StatusCode::CONFLICT, error.to_string()).into_response()
+        }
     }
 }
 
@@ -439,7 +499,19 @@ async fn rollback_trust_rotation<S: KvStore + Clone>(
         .await
     {
         Ok(rotation) => Json(rotation).into_response(),
-        Err(error) => (StatusCode::CONFLICT, error.to_string()).into_response(),
+        Err(error) => {
+            audit_rotation_operation_failure(
+                &coordinator,
+                &rotation_id,
+                &request.request_id,
+                &request_actor(&headers),
+                "rollback",
+                "failed",
+                &error.to_string(),
+            )
+            .await;
+            (StatusCode::CONFLICT, error.to_string()).into_response()
+        }
     }
 }
 
@@ -483,12 +555,34 @@ async fn recover_trust_rotation<S: KvStore + Clone>(
     };
     let before = match coordinator.inspect_bilateral(&rotation_id).await {
         Ok(diagnostics) => diagnostics,
-        Err(error) => return (StatusCode::BAD_GATEWAY, error.to_string()).into_response(),
+        Err(error) => {
+            audit_rotation_operation_failure(
+                &coordinator,
+                &rotation_id,
+                &request.request_id,
+                &request_actor(&headers),
+                "recover_diagnostics",
+                "failed",
+                &error.to_string(),
+            )
+            .await;
+            return (StatusCode::BAD_GATEWAY, error.to_string()).into_response();
+        }
     };
     if before.recommended_action != request.expected_action
         || !before.automated_recovery_safe
         || !before.safety_violations.is_empty()
     {
+        audit_rotation_operation_failure(
+            &coordinator,
+            &rotation_id,
+            &request.request_id,
+            &request_actor(&headers),
+            "recover",
+            "rejected",
+            "expected action is stale or bilateral diagnostics report unsafe recovery",
+        )
+        .await;
         return (
             StatusCode::CONFLICT,
             Json(ApiError::new(
@@ -515,7 +609,19 @@ async fn recover_trust_rotation<S: KvStore + Clone>(
             .into_response(),
             Err(error) => (StatusCode::BAD_GATEWAY, error.to_string()).into_response(),
         },
-        Err(error) => (StatusCode::CONFLICT, error.to_string()).into_response(),
+        Err(error) => {
+            audit_rotation_operation_failure(
+                &coordinator,
+                &rotation_id,
+                &request.request_id,
+                &request_actor(&headers),
+                "recover",
+                "failed",
+                &error.to_string(),
+            )
+            .await;
+            (StatusCode::CONFLICT, error.to_string()).into_response()
+        }
     }
 }
 
@@ -558,6 +664,23 @@ struct TransitionFederatedMigrationRequest {
     expected_generation: u64,
     request_id: String,
     error: Option<String>,
+}
+
+async fn audit_rotation_operation_failure(
+    coordinator: &FederatedTrustRotationCoordinator,
+    rotation_id: &str,
+    request_id: &str,
+    actor: &str,
+    action: &str,
+    outcome: &str,
+    details: &str,
+) {
+    if let Err(audit_error) = coordinator
+        .record_operation_outcome(rotation_id, request_id, actor, action, outcome, details)
+        .await
+    {
+        tracing::error!(rotation_id, action, %audit_error, "failed to persist trust rotation operation audit");
+    }
 }
 
 fn request_actor(headers: &axum::http::HeaderMap) -> String {
